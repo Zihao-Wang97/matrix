@@ -1,0 +1,51 @@
+mode: local
+
+data:
+  root: ./data
+  cache: ./cache
+
+model:
+  name: hawp_laq_base
+  model_id: facebook/opt-125m
+  backbone: resnet50
+  pretrained: null
+  torch_dtype: float32
+  load_in_4bit: false
+
+generation:
+  max_new_tokens: 32
+  do_sample: false
+  temperature: 1.0
+  top_p: 1.0
+  prompts:
+    - "Hello, my name is"
+    - "The capital of France is"
+
+calib:
+  nsamples: 2
+  seq_len: 64
+  output_dir: artifacts/calib
+  dataset: wikitext2
+
+projector:
+  rank: 64
+  r_k: 64
+  r_v: 64
+  lr: 0.001
+  n_steps: 100
+  orthogonalize_every: 10
+  target_layer: 0
+  w_logits: 1.0
+  w_attn: 1.0
+  w_value: 0.5
+  output_dir: artifacts/projectors
+
+train:
+  batch_size: 4
+  epochs: 100
+  lr: 1.0e-4
+  device: cpu
+
+log:
+  level: DEBUG
+  dir: ./logs

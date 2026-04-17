@@ -1,0 +1,77 @@
+mode: server
+
+data:
+  root: /data/hawp_laq
+  cache: /tmp/hawp_laq_cache
+
+model:
+  name: hawp_laq_base
+  model_id: meta-llama/Llama-2-7b-hf
+  backbone: resnet50
+  pretrained: /models/hawp_laq_base.pth
+  torch_dtype: float16
+  load_in_4bit: true
+
+generation:
+  max_new_tokens: 256
+  do_sample: true
+  temperature: 0.7
+  top_p: 0.9
+  prompts:
+    - "Once upon a time"
+
+calib:
+  nsamples: 128
+  seq_len: 2048
+  output_dir: /data/hawp_laq/artifacts/calib
+  dataset: wikitext2
+
+projector:
+  rank: 256
+  r_k: 256
+  r_v: 256
+  lr: 0.0005
+  n_steps: 500
+  orthogonalize_every: 20
+  target_layer: 0
+  w_logits: 1.0
+  w_attn: 1.0
+  w_value: 0.5
+  output_dir: /data/hawp_laq/artifacts/projectors
+
+quant:
+  k_group_size: 128
+  v_group_size: 128
+  use_rotation: false
+  outlier_threshold: null
+
+sched:
+  total_budget: 4096
+  recent_window: 64
+  high_ratio: 0.25
+  low_ratio: 0.60
+
+rank_search:
+  rank_candidates:
+    - 16
+    - 32
+    - 64
+    - 128
+    - 256
+  tolerance: 0.02
+  output_dir: /data/hawp_laq/artifacts/ranks
+
+train:
+  batch_size: 32
+  epochs: 100
+  lr: 1.0e-4
+  device: cuda
+
+log:
+  level: INFO
+  dir: /var/log/hawp_laq
+
+serving:
+  host: 0.0.0.0
+  port: 8080
+  workers: 4
