@@ -76,7 +76,7 @@ class TestHAWPAttentionConstruction:
     def test_from_attention_identity_projectors(self):
         model = AutoModelForCausalLM.from_pretrained(_MODEL_ID)
         orig = _get_first_attn(model)
-        hawp = HAWPAttention.from_llama_attention(orig, layer_idx=0)
+        hawp = HAWPAttention.from_llama_attention(orig, layer_idx=0, allow_default_full_rank=True)
         assert hawp.p_k.shape == (hawp.head_dim, hawp.head_dim)
         assert hawp.p_v.shape == (hawp.head_dim, hawp.head_dim)
         assert torch.allclose(hawp.p_k.float(), torch.eye(hawp.head_dim))
@@ -86,14 +86,14 @@ class TestHAWPAttentionConstruction:
     def test_weights_copied(self):
         model = AutoModelForCausalLM.from_pretrained(_MODEL_ID)
         orig = _get_first_attn(model)
-        hawp = HAWPAttention.from_llama_attention(orig, layer_idx=0)
+        hawp = HAWPAttention.from_llama_attention(orig, layer_idx=0, allow_default_full_rank=True)
         assert torch.equal(hawp.q_proj.weight.data, hawp._src_weights["q_proj"])
         assert torch.equal(hawp.o_proj.weight.data, hawp._src_weights["o_proj"])
 
     def test_forward_shape(self):
         model = AutoModelForCausalLM.from_pretrained(_MODEL_ID)
         orig = _get_first_attn(model)
-        hawp = HAWPAttention.from_llama_attention(orig, layer_idx=0)
+        hawp = HAWPAttention.from_llama_attention(orig, layer_idx=0, allow_default_full_rank=True)
         hawp.eval()
         dtype = hawp.q_proj.weight.dtype
         x = torch.randn(1, 4, hawp.hidden_size, dtype=dtype)
@@ -105,7 +105,7 @@ class TestHAWPAttentionConstruction:
     def test_from_attention_model_none(self):
         model = AutoModelForCausalLM.from_pretrained(_MODEL_ID)
         orig = _get_first_attn(model)
-        hawp = HAWPAttention.from_attention(orig, model=None, layer_idx=0)
+        hawp = HAWPAttention.from_attention(orig, model=None, layer_idx=0, allow_default_full_rank=True)
         assert hawp.hidden_size == 768
         assert hawp.num_heads == 12
         assert torch.allclose(hawp.p_k.float(), torch.eye(hawp.head_dim))
@@ -113,7 +113,7 @@ class TestHAWPAttentionConstruction:
     def test_from_attention_with_model(self):
         model = AutoModelForCausalLM.from_pretrained(_MODEL_ID)
         orig = _get_first_attn(model)
-        hawp = HAWPAttention.from_attention(orig, model=model, layer_idx=0)
+        hawp = HAWPAttention.from_attention(orig, model=model, layer_idx=0, allow_default_full_rank=True)
         assert hawp.hidden_size == 768
 
     def test_construct_without_real_attn(self):
@@ -122,7 +122,7 @@ class TestHAWPAttentionConstruction:
             max_position_embeddings=512, rope_theta=10000.0, model_type="",
             enable_bias=False, attention_dropout=0.0,
         )
-        hawp = HAWPAttention(cfg)
+        hawp = HAWPAttention(cfg, r_k=64, r_v=64)
         assert hawp.head_dim == 64
         assert hawp.r_k == 64
         assert hawp.r_v == 64
@@ -135,7 +135,7 @@ class TestFullRankForwardEquivalence:
         model_orig.eval()
 
         model_hawp = AutoModelForCausalLM.from_pretrained(_MODEL_ID, attn_implementation="eager")
-        model_hawp = convert_llama_to_hawp(model_hawp)
+        model_hawp = convert_llama_to_hawp(model_hawp, allow_default_full_rank=True)
         model_hawp.eval()
         return model_orig, model_hawp
 
@@ -169,12 +169,12 @@ class TestFullRankForwardEquivalence:
 class TestConversionMarks:
     def test_config_marked_after_conversion(self):
         model = AutoModelForCausalLM.from_pretrained(_MODEL_ID)
-        model = convert_llama_to_hawp(model)
+        model = convert_llama_to_hawp(model, allow_default_full_rank=True)
         assert model.config._hawp_converted is True
 
     def test_all_layers_replaced(self):
         model = AutoModelForCausalLM.from_pretrained(_MODEL_ID)
-        model = convert_llama_to_hawp(model)
+        model = convert_llama_to_hawp(model, allow_default_full_rank=True)
         from hawp_laq.offline.hooks import _find_attention_modules
         attns = _find_attention_modules(model)
         for _, attn in attns:

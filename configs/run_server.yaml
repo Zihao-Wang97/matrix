@@ -27,9 +27,9 @@ calib:
   dataset: wikitext2
 
 projector:
-  rank: 256
-  r_k: 256
-  r_v: 256
+  rank: null
+  r_k: 32
+  r_v: 32
   lr: 0.0005
   n_steps: 500
   orthogonalize_every: 20
@@ -40,9 +40,15 @@ projector:
   output_dir: /data/hawp_laq/artifacts/projectors
 
 quant:
+  enabled: true
+  k_method: turbo_prod
+  v_method: turbo_mse
+  k_bits: 4
+  v_bits: 8
+  use_rotation_for_k: true
+  use_rotation_for_v: true
   k_group_size: 128
   v_group_size: 128
-  use_rotation: false
   outlier_threshold: null
 
 sched:

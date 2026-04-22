@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
 import torch
 
+from hawp_laq.config import resolve_projector_ranks, ProjectorConfig
 from hawp_laq.modeling.attention_hawp import HAWPAttention
 from hawp_laq.utils.io import save_json, load_json
 
@@ -32,7 +34,7 @@ def save_projectors(model: torch.nn.Module, output_dir: str | Path) -> Path:
     return output_dir
 
 
-def load_projectors(model: torch.nn.Module, projector_dir: str | Path) -> None:
+def load_projectors(model: torch.nn.Module, projector_dir: str | Path, strict: bool = True) -> None:
     projector_dir = Path(projector_dir)
     for name, module in model.named_modules():
         if isinstance(module, HAWPAttention):
@@ -40,16 +42,7 @@ def load_projectors(model: torch.nn.Module, projector_dir: str | Path) -> None:
             if not pt_path.exists():
                 continue
             data = torch.load(pt_path, map_location="cpu", weights_only=True)
-            p_k = data["p_k"].to(module.p_k.device, module.p_k.dtype)
-            p_v = data["p_v"].to(module.p_v.device, module.p_v.dtype)
-            if p_k.shape == module.p_k.shape:
-                module.p_k.data.copy_(p_k)
-            if p_v.shape == module.p_v.shape:
-                module.p_v.data.copy_(p_v)
-            if "gamma" in data:
-                module.gamma.data.copy_(
-                    data["gamma"].to(module.gamma.device, module.gamma.dtype),
-                )
+            module.load_projector_data(data, strict=strict)
 
 
 def load_ranks(ranks_path: str | Path) -> dict[int, tuple[int, int]]:
@@ -59,14 +52,170 @@ def load_ranks(ranks_path: str | Path) -> dict[int, tuple[int, int]]:
     if not ranks_path.exists():
         return {}
     raw = load_json(ranks_path)
+    if "selected_ranks" in raw:
+        raw = raw["selected_ranks"]
     return {int(k): (v["r_k"], v["r_v"]) for k, v in raw.items()}
+
+
+def get_available_projector_layers(projector_dir: str | Path) -> set[int]:
+    """Return set of layer indices that have a projector.pt file."""
+    projector_dir = Path(projector_dir)
+    if not projector_dir.exists():
+        return set()
+    available: set[int] = set()
+    for d in sorted(projector_dir.iterdir()):
+        if d.is_dir() and d.name.startswith("layer_"):
+            pt_path = d / "projector.pt"
+            if pt_path.exists():
+                try:
+                    idx = int(d.name.split("_", 1)[1])
+                    available.add(idx)
+                except ValueError:
+                    pass
+    return available
+
+
+def _iter_layer_dirs(projector_dir: Path) -> list[tuple[int, Path]]:
+    """Return sorted (layer_idx, dir_path) pairs for layer_*/ directories."""
+    results = []
+    if not projector_dir.exists():
+        return results
+    for d in sorted(projector_dir.iterdir()):
+        if d.is_dir() and d.name.startswith("layer_"):
+            try:
+                idx = int(d.name.split("_", 1)[1])
+                results.append((idx, d))
+            except ValueError:
+                pass
+    return results
+
+
+def rebuild_ranks_json(projector_dir: str | Path) -> Path:
+    """Scan layer_*/projector.pt files and write ranks.json.
+
+    Skips files missing ``r_k`` / ``r_v`` keys and emits a warning for each.
+    Preserves existing entries in ranks.json for layers that do not yet have
+    a projector.pt file (e.g. from rank_search selected_ranks.json).
+    """
+    projector_dir = Path(projector_dir)
+    ranks_data: dict[str, dict[str, int]] = {}
+
+    existing_ranks = load_ranks(projector_dir)
+    for k, (rk, rv) in existing_ranks.items():
+        ranks_data[str(k)] = {"r_k": rk, "r_v": rv}
+
+    for layer_idx, layer_dir in _iter_layer_dirs(projector_dir):
+        pt_path = layer_dir / "projector.pt"
+        if not pt_path.exists():
+            continue
+        data = torch.load(pt_path, map_location="cpu", weights_only=False)
+        if "r_k" not in data or "r_v" not in data:
+            warnings.warn(
+                f"Layer {layer_idx} projector.pt is missing r_k/r_v keys; "
+                f"skipping this layer in ranks.json. "
+                f"This usually indicates a legacy-format projector file.",
+                UserWarning,
+                stacklevel=2,
+            )
+        else:
+            ranks_data[str(layer_idx)] = {"r_k": data["r_k"], "r_v": data["r_v"]}
+
+    if ranks_data:
+        save_json(ranks_data, projector_dir / "ranks.json")
+    return projector_dir / "ranks.json"
+
+
+def inspect_projector_dir(
+    projector_dir: str | Path,
+    expected_head_dim: int,
+    default_r_k: int,
+    default_r_v: int,
+    ranks_per_layer: dict[int, tuple[int, int]] | None = None,
+) -> dict:
+    """Scan projector directory and classify each layer file.
+
+    Returns a dict with keys:
+      valid_layers: list[int]           — files with compatible shapes
+      legacy_layers: list[int]          — files missing r_k/r_v (old format)
+      missing_rank_layers: list[int]    — files with r_k/r_v but shape mismatch
+      shape_mismatch_layers: list[int]  — files whose p_k/p_v shape is incompatible
+    """
+    projector_dir = Path(projector_dir)
+    result: dict[str, list[int]] = {
+        "valid_layers": [],
+        "legacy_layers": [],
+        "missing_rank_layers": [],
+        "shape_mismatch_layers": [],
+    }
+
+    for layer_idx, layer_dir in _iter_layer_dirs(projector_dir):
+        pt_path = layer_dir / "projector.pt"
+        if not pt_path.exists():
+            continue
+
+        try:
+            data = torch.load(pt_path, map_location="cpu", weights_only=False)
+        except Exception:
+            result["shape_mismatch_layers"].append(layer_idx)
+            continue
+
+        if "r_k" not in data or "r_v" not in data:
+            result["legacy_layers"].append(layer_idx)
+            continue
+
+        layer_r_k = data["r_k"]
+        layer_r_v = data["r_v"]
+
+        p_k = data.get("p_k")
+        p_v = data.get("p_v")
+
+        if p_k is None or p_v is None:
+            result["shape_mismatch_layers"].append(layer_idx)
+            continue
+
+        pk_ok = (
+            p_k.shape == (expected_head_dim, expected_head_dim)
+            or p_k.shape == (expected_head_dim, layer_r_k)
+        )
+        pv_ok = (
+            p_v.shape == (expected_head_dim, expected_head_dim)
+            or p_v.shape == (expected_head_dim, layer_r_v)
+        )
+
+        if pk_ok and pv_ok:
+            result["valid_layers"].append(layer_idx)
+        else:
+            result["shape_mismatch_layers"].append(layer_idx)
+
+    return result
+
+
+def _resolve_layer_ranks(
+    layer_idx: int,
+    head_dim: int,
+    r_k: int | None = None,
+    r_v: int | None = None,
+    rank: int | None = None,
+    ranks_per_layer: dict[int, tuple[int, int]] | None = None,
+) -> tuple[int, int]:
+    if ranks_per_layer and layer_idx in ranks_per_layer:
+        return ranks_per_layer[layer_idx]
+    if r_k is not None and r_v is not None:
+        return r_k, r_v
+    if rank is not None:
+        return rank, rank
+    raise ValueError(
+        f"layer {layer_idx}: must provide r_k/r_v, rank, or ranks_per_layer"
+    )
 
 
 def train_all_layers(
     calib_dir: str | Path,
     n_layers: int,
     n_heads: int,
-    rank: int = 64,
+    rank: int | None = None,
+    r_k: int | None = None,
+    r_v: int | None = None,
     ranks_per_layer: dict[int, tuple[int, int]] | None = None,
     lr: float = 1e-3,
     n_steps: int = 200,
@@ -95,39 +244,41 @@ def train_all_layers(
         k = data["k"].float()
         v = data["v"].float()
         d_model = q.shape[-1]
+        head_dim = d_model // n_heads
 
-        if ranks_per_layer and layer_idx in ranks_per_layer:
-            r_k, r_v = ranks_per_layer[layer_idx]
-        else:
-            r_k = rank
-            r_v = rank
+        layer_r_k, layer_r_v = _resolve_layer_ranks(
+            layer_idx, head_dim, r_k=r_k, r_v=r_v, rank=rank,
+            ranks_per_layer=ranks_per_layer,
+        )
 
-        print(f"[train] layer {layer_idx}: d_model={d_model} r_k={r_k} r_v={r_v}")
+        print(f"[train] layer {layer_idx}: d_model={d_model} r_k={layer_r_k} r_v={layer_r_v}")
 
         trainer_k = ProjectorTrainer(
-            d_model=d_model, rank=r_k, n_heads=n_heads,
+            d_model=d_model, rank_k=layer_r_k, rank_v=layer_r_v, n_heads=n_heads,
             lr=lr, orthogonalize_every=orthogonalize_every,
             w_logits=w_logits, w_attn=w_attn, w_value=w_value,
             device=device,
         )
-        result_k = trainer_k.train_one_group(q, k, v, n_steps=n_steps)
-
-        trainer_v = ProjectorTrainer(
-            d_model=d_model, rank=r_v, n_heads=n_heads,
-            lr=lr, orthogonalize_every=orthogonalize_every,
-            w_logits=w_logits, w_attn=w_attn, w_value=w_value,
-            device=device,
-        )
-        result_v = trainer_v.train_one_group(q, k, v, n_steps=n_steps)
+        result = trainer_k.train_one_group(q, k, v, n_steps=n_steps)
 
         combined = {
-            "p_k": result_k["p_k"],
-            "p_v": result_v["p_v"],
-            "gamma_k": result_k["gamma"],
-            "gamma_v": result_v["gamma"],
-            "r_k": r_k,
-            "r_v": r_v,
+            "p_k": result["p_k"],
+            "p_v": result["p_v"],
+            "gamma": result["gamma"],
+            "r_k": layer_r_k,
+            "r_v": layer_r_v,
         }
-        torch.save(combined, output_dir / f"layer_{layer_idx}" / "projector.pt")
+        layer_dir = output_dir / f"layer_{layer_idx}"
+        layer_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(combined, layer_dir / "projector.pt")
+
+    ranks_data = {}
+    for layer_idx in range(n_layers):
+        pt_path = output_dir / f"layer_{layer_idx}" / "projector.pt"
+        if pt_path.exists():
+            d = torch.load(pt_path, map_location="cpu", weights_only=False)
+            ranks_data[str(layer_idx)] = {"r_k": d["r_k"], "r_v": d["r_v"]}
+    if ranks_data:
+        save_json(ranks_data, output_dir / "ranks.json")
 
     return output_dir

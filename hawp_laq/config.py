@@ -40,7 +40,7 @@ class CalibConfig:
 
 @dataclass
 class ProjectorConfig:
-    rank: int = 64
+    rank: Optional[int] = None
     r_k: Optional[int] = None
     r_v: Optional[int] = None
     lr: float = 1e-3
@@ -55,9 +55,15 @@ class ProjectorConfig:
 
 @dataclass
 class QuantConfig:
+    enabled: bool = False
+    k_method: str = "turbo_prod"
+    v_method: str = "turbo_mse"
+    k_bits: int = 4
+    v_bits: int = 8
+    use_rotation_for_k: bool = True
+    use_rotation_for_v: bool = True
     k_group_size: int = 128
     v_group_size: int = 128
-    use_rotation: bool = False
     outlier_threshold: Optional[float] = None
 
 
@@ -67,13 +73,18 @@ class SchedConfig:
     recent_window: int = 64
     high_ratio: float = 0.25
     low_ratio: float = 0.60
+    drop_strategy: str = "position"
 
 
 @dataclass
 class RankSearchConfig:
-    rank_candidates: list = field(default_factory=lambda: [16, 32, 64, 128, 256])
+    rank_candidates: list = field(default_factory=lambda: [8, 16, 32, 64])
     tolerance: float = 0.02
     output_dir: Path = Path("artifacts/ranks")
+    n_steps: int = 1500
+    selection_metric: str = "attn_value_abs"
+    selection_value_weight: float = 0.25
+    selection_abs_tolerance: float = 0.04
 
 
 @dataclass
@@ -137,3 +148,150 @@ def load_config(path: str | Path) -> HAWPLAQConfig:
     with p.open("r", encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
     return _to_dataclass(HAWPLAQConfig, raw)
+
+
+_SUPPORTED_METHODS = ("turbo_mse", "turbo_prod")
+
+
+def _check_method(method: str) -> None:
+    if method not in _SUPPORTED_METHODS:
+        raise ValueError(
+            f"Unsupported quant method '{method}'. "
+            f"Supported: {_SUPPORTED_METHODS}"
+        )
+
+
+def build_k_quantizer(
+    cfg: HAWPLAQConfig,
+    r_k: int,
+    device: str | None = None,
+):
+    """Build the K quantizer from config.
+
+    Default method is ``turbo_prod`` (TurboQuantProd: MSE + 1-bit residual)
+    which preserves inner-product fidelity for attention score computation.
+
+    Args:
+        cfg: HAWP-LAQ configuration.
+        r_k: Latent key dimension.
+        device: Optional device override.
+
+    Returns:
+        A ``TurboQuantProd`` or ``TurboQuantMSE`` instance.
+
+    Raises:
+        ValueError: If ``cfg.quant.k_method`` is not supported.
+    """
+    _check_method(cfg.quant.k_method)
+    if cfg.quant.k_method == "turbo_prod":
+        from hawp_laq.runtime.turboquant import TurboQuantProd
+        return TurboQuantProd(
+            dim=r_k,
+            bits=cfg.quant.k_bits,
+            use_rotation=cfg.quant.use_rotation_for_k,
+            group_size=cfg.quant.k_group_size,
+            device=device,
+        )
+    from hawp_laq.runtime.turboquant import TurboQuantMSE
+    return TurboQuantMSE(
+        dim=r_k,
+        bits=cfg.quant.k_bits,
+        use_rotation=cfg.quant.use_rotation_for_k,
+        group_size=cfg.quant.k_group_size,
+        device=device,
+    )
+
+
+def build_v_quantizer(
+    cfg: HAWPLAQConfig,
+    r_v: int,
+    device: str | None = None,
+):
+    """Build the V quantizer from config.
+
+    Default method is ``turbo_mse`` (TurboQuantMSE) which minimizes
+    reconstruction MSE for value aggregation.
+
+    Args:
+        cfg: HAWP-LAQ configuration.
+        r_v: Latent value dimension.
+        device: Optional device override.
+
+    Returns:
+        A ``TurboQuantMSE`` or ``TurboQuantProd`` instance.
+
+    Raises:
+        ValueError: If ``cfg.quant.v_method`` is not supported.
+    """
+    _check_method(cfg.quant.v_method)
+    if cfg.quant.v_method == "turbo_prod":
+        from hawp_laq.runtime.turboquant import TurboQuantProd
+        return TurboQuantProd(
+            dim=r_v,
+            bits=cfg.quant.v_bits,
+            use_rotation=cfg.quant.use_rotation_for_v,
+            group_size=cfg.quant.v_group_size,
+            device=device,
+        )
+    from hawp_laq.runtime.turboquant import TurboQuantMSE
+    return TurboQuantMSE(
+        dim=r_v,
+        bits=cfg.quant.v_bits,
+        use_rotation=cfg.quant.use_rotation_for_v,
+        group_size=cfg.quant.v_group_size,
+        device=device,
+    )
+
+
+def resolve_projector_ranks(
+    projector_cfg: ProjectorConfig,
+    head_dim: int,
+    mode: str = "hawp_quant",
+) -> tuple[int, int]:
+    r_k = projector_cfg.r_k
+    r_v = projector_cfg.r_v
+    rank = projector_cfg.rank
+
+    has_partial = (r_k is not None) != (r_v is not None)
+    if has_partial:
+        raise ValueError(
+            f"Must provide both r_k and r_v together (or neither). "
+            f"Got: r_k={r_k}, r_v={r_v}"
+        )
+
+    if r_k is not None and r_v is not None:
+        pass
+    elif r_k is None and r_v is None and rank is not None:
+        r_k = rank
+        r_v = rank
+    elif mode == "quant_only":
+        r_k = head_dim
+        r_v = head_dim
+    else:
+        raise ValueError(
+            f"Cannot resolve projector ranks for mode '{mode}'. "
+            f"Set projector.r_k and projector.r_v (or projector.rank as alias), "
+            f"or use mode='quant_only' for explicit full-rank. "
+            f"Got: r_k={r_k}, r_v={r_v}, rank={rank}"
+        )
+
+    if not (1 <= r_k <= head_dim):
+        raise ValueError(
+            f"r_k must satisfy 1 <= r_k <= head_dim, got r_k={r_k}, head_dim={head_dim}"
+        )
+    if not (1 <= r_v <= head_dim):
+        raise ValueError(
+            f"r_v must satisfy 1 <= r_v <= head_dim, got r_v={r_v}, head_dim={head_dim}"
+        )
+
+    return r_k, r_v
+
+
+def load_projector_ranks_from_dir(projector_dir: str | Path) -> dict[int, tuple[int, int]]:
+    projector_dir = Path(projector_dir)
+    ranks_path = projector_dir / "ranks.json"
+    if not ranks_path.exists():
+        return {}
+    from hawp_laq.utils.io import load_json
+    raw = load_json(ranks_path)
+    return {int(k): (v["r_k"], v["r_v"]) for k, v in raw.items()}

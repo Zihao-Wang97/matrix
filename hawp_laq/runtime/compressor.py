@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
 import torch
@@ -20,7 +21,8 @@ class CompressorPackage:
         head_dim: int,
         k_group_size: int = 128,
         v_group_size: int = 128,
-        use_rotation: bool = False,
+        use_rotation_for_k: bool = True,
+        use_rotation_for_v: bool = True,
         outlier_threshold: float | None = None,
         total_budget: int = 4096,
         recent_window: int = 64,
@@ -33,7 +35,8 @@ class CompressorPackage:
         self.head_dim = head_dim
         self.k_group_size = k_group_size
         self.v_group_size = v_group_size
-        self.use_rotation = use_rotation
+        self.use_rotation_for_k = use_rotation_for_k
+        self.use_rotation_for_v = use_rotation_for_v
         self.outlier_threshold = outlier_threshold
         self.total_budget = total_budget
         self.recent_window = recent_window
@@ -49,6 +52,20 @@ class CompressorPackage:
             if pt_path.exists():
                 data = torch.load(pt_path, map_location="cpu", weights_only=True)
                 self._projectors[layer_idx] = data
+                missing = []
+                if "r_k" not in data:
+                    missing.append("r_k")
+                if "r_v" not in data:
+                    missing.append("r_v")
+                if missing:
+                    warnings.warn(
+                        f"Layer {layer_idx} projector file is missing rank key(s): "
+                        f"{', '.join(missing)}. Falling back to head_dim={self.head_dim} "
+                        f"for profiling estimation only. This does not reflect the true "
+                        f"low-rank configuration of the layer.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
 
     @property
     def ranks(self) -> dict[int, tuple[int, int]]:
@@ -66,9 +83,11 @@ class CompressorPackage:
             if proj is not None:
                 r_k = proj.get("r_k", self.head_dim)
                 r_v = proj.get("r_v", self.head_dim)
+                has_projector = True
             else:
                 r_k = self.head_dim
                 r_v = self.head_dim
+                has_projector = False
 
             n_kv_heads = self.n_heads
 
@@ -77,7 +96,7 @@ class CompressorPackage:
             if r_v != r_k:
                 latent_bytes = seq_len * n_kv_heads * r_k * 2 + seq_len * n_kv_heads * r_v * 2
 
-            k_quant = KQuantizer(group_size=self.k_group_size, use_rotation=self.use_rotation)
+            k_quant = KQuantizer(group_size=self.k_group_size, use_rotation=self.use_rotation_for_k)
             v_quant = VQuantizer(group_size=self.v_group_size, outlier_threshold=self.outlier_threshold)
 
             k_latent_per_token = n_kv_heads * r_k
@@ -97,6 +116,7 @@ class CompressorPackage:
                 "quant_bytes": quant_bytes,
                 "r_k": r_k,
                 "r_v": r_v,
+                "has_projector": has_projector,
                 "baseline_formatted": format_nbytes(baseline_bytes),
                 "latent_formatted": format_nbytes(latent_bytes),
                 "quant_formatted": format_nbytes(quant_bytes),
@@ -123,25 +143,8 @@ class CompressorPackage:
         }
 
     def apply_to_model(self, model: torch.nn.Module) -> None:
-        for name, module in model.named_modules():
-            if isinstance(module, HAWPAttention):
-                proj = self._projectors.get(module.layer_idx)
-                if proj is None:
-                    continue
-                p_k = proj["p_k"].to(module.p_k.device, module.p_k.dtype)
-                p_v = proj["p_v"].to(module.p_v.device, module.p_v.dtype)
-                if p_k.shape == module.p_k.shape:
-                    module.p_k.data.copy_(p_k)
-                if p_v.shape == module.p_v.shape:
-                    module.p_v.data.copy_(p_v)
-                if "gamma_k" in proj:
-                    module.gamma.data.copy_(
-                        proj["gamma_k"].to(module.gamma.device, module.gamma.dtype),
-                    )
-                elif "gamma" in proj:
-                    module.gamma.data.copy_(
-                        proj["gamma"].to(module.gamma.device, module.gamma.dtype),
-                    )
+        from hawp_laq.runtime.projector_bank import load_projectors
+        load_projectors(model, self.projector_dir, strict=True)
 
     def save(self, output_dir: str | Path) -> Path:
         output_dir = Path(output_dir)
@@ -153,7 +156,8 @@ class CompressorPackage:
             "head_dim": self.head_dim,
             "k_group_size": self.k_group_size,
             "v_group_size": self.v_group_size,
-            "use_rotation": self.use_rotation,
+            "use_rotation_for_k": self.use_rotation_for_k,
+            "use_rotation_for_v": self.use_rotation_for_v,
             "total_budget": self.total_budget,
             "recent_window": self.recent_window,
             "high_ratio": self.high_ratio,
@@ -186,7 +190,8 @@ class CompressorPackage:
             head_dim=meta.get("head_dim", 0),
             k_group_size=meta.get("k_group_size", 128),
             v_group_size=meta.get("v_group_size", 128),
-            use_rotation=meta.get("use_rotation", False),
+            use_rotation_for_k=meta.get("use_rotation_for_k", meta.get("use_rotation", True)),
+            use_rotation_for_v=meta.get("use_rotation_for_v", meta.get("use_rotation", True)),
             total_budget=meta.get("total_budget", 4096),
             recent_window=meta.get("recent_window", 64),
             high_ratio=meta.get("high_ratio", 0.25),

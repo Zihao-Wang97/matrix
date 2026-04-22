@@ -30,25 +30,23 @@ class TestRebalance:
         sched = TokenBudgetScheduler(total_budget=512)
         for _ in range(100):
             sched.on_new_token()
-        assert sched.rebalance() == []
+        d = sched.rebalance()
+        assert d.n_drop == 0
 
-    def test_drop_indices_returned(self):
+    def test_drop_count_returned(self):
         sched = TokenBudgetScheduler(total_budget=64, recent_window=8, high_ratio=0.125, low_ratio=0.5)
         for _ in range(128):
             sched.on_new_token()
-        drops = sched.rebalance()
-        assert len(drops) > 0
-        for idx in drops:
-            assert sched.get_state(idx) == TokenState.DROP
+        d = sched.rebalance()
+        assert d.n_drop > 0
 
     def test_recent_tokens_not_dropped(self):
         sched = TokenBudgetScheduler(total_budget=64, recent_window=16, high_ratio=0.25, low_ratio=0.5)
         for _ in range(200):
             sched.on_new_token()
-        drops = sched.rebalance()
-        recent_start = 200 - 16
-        for idx in drops:
-            assert idx < recent_start
+        d = sched.rebalance()
+        assert d.n_high == 16
+        assert d.n_high + d.n_low <= 64
 
 
 class TestReset:

@@ -1,138 +1,186 @@
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 
-from hawp_laq.runtime.quantizer import KQuantizer, VQuantizer, KQuantizeResult, VQuantizeResult
+from hawp_laq.runtime.turboquant import TurboQuantMSE, TurboQuantProd, TurboQuantizedTensor, TurboQuantProdResult
 from hawp_laq.utils.memory import tensor_nbytes
 
 
 class LayerKVCache:
+    """Per-layer KV cache with recent/archive tiers and TurboQuant compression.
+
+    * **Recent** tokens are stored as fp16 latent tensors.
+    * **Archive** tokens are compressed:
+        - K uses ``TurboQuantProd`` (MSE + 1-bit residual for inner-product fidelity)
+        - V uses ``TurboQuantMSE`` (MSE-optimised reconstruction)
+
+    Args:
+        n_heads: Number of KV heads.
+        head_dim: Dimension per head (latent dim = head_dim for full-rank,
+            or r_k/r_v for low-rank).
+        k_quantizer: TurboQuantProd instance for key compression.
+        v_quantizer: TurboQuantMSE instance for value compression.
+        dtype: Storage dtype for recent tokens.  Default float16.
+    """
+
     def __init__(
         self,
         n_heads: int,
         head_dim: int,
-        k_quantizer: KQuantizer,
-        v_quantizer: VQuantizer,
-    ):
+        k_quantizer: TurboQuantProd,
+        v_quantizer: TurboQuantMSE,
+        dtype: torch.dtype = torch.float16,
+    ) -> None:
         self.n_heads = n_heads
         self.head_dim = head_dim
         self.d_model = n_heads * head_dim
         self.k_quantizer = k_quantizer
         self.v_quantizer = v_quantizer
+        self.dtype = dtype
 
-        self._high_k: list[torch.Tensor] = []
-        self._high_v: list[torch.Tensor] = []
-        self._low_k: KQuantizeResult | None = None
-        self._low_v: VQuantizeResult | None = None
-        self._low_k_raw: torch.Tensor | None = None
-        self._low_v_raw: torch.Tensor | None = None
+        self._recent_k: list[torch.Tensor] = []
+        self._recent_v: list[torch.Tensor] = []
 
-    def append_high(self, k: torch.Tensor, v: torch.Tensor) -> None:
-        self._high_k.append(k.detach().cpu())
-        self._high_v.append(v.detach().cpu())
+        self._archive_k: TurboQuantProdResult | None = None
+        self._archive_v: TurboQuantizedTensor | None = None
+        self._archive_k_raw: torch.Tensor | None = None
+        self._archive_v_raw: torch.Tensor | None = None
 
-    def demote_to_low(self) -> None:
-        if not self._high_k:
+    # ------------------------------------------------------------------
+    # Append
+    # ------------------------------------------------------------------
+
+    def append_recent(self, k: torch.Tensor, v: torch.Tensor) -> None:
+        """Append a token's latent KV to the recent (uncompressed) tier.
+
+        Args:
+            k: Latent key, shape ``[r_k]`` or ``[1, r_k]``.
+            v: Latent value, shape ``[r_v]`` or ``[1, r_v]``.
+        """
+        if k.dim() == 1:
+            k = k.unsqueeze(0)
+        if v.dim() == 1:
+            v = v.unsqueeze(0)
+        self._recent_k.append(k.detach().to(self.dtype).cpu())
+        self._recent_v.append(v.detach().to(self.dtype).cpu())
+
+    # ------------------------------------------------------------------
+    # Demote recent → archive
+    # ------------------------------------------------------------------
+
+    def demote_to_archive(self) -> None:
+        """Move all recent tokens into the compressed archive tier."""
+        if not self._recent_k:
             return
-        high_k = torch.cat(self._high_k, dim=0)
-        high_v = torch.cat(self._high_v, dim=0)
-        self._high_k.clear()
-        self._high_v.clear()
 
-        if self._low_k_raw is not None:
-            high_k = torch.cat([self._low_k_raw, high_k], dim=0)
-            high_v = torch.cat([self._low_v_raw, high_v], dim=0)
+        recent_k = torch.cat(self._recent_k, dim=0).float()
+        recent_v = torch.cat(self._recent_v, dim=0).float()
+        self._recent_k.clear()
+        self._recent_v.clear()
 
-        self._low_k_raw = high_k
-        self._low_v_raw = high_v
-        self._low_k = self.k_quantizer.quantize(high_k)
-        self._low_v = self.v_quantizer.quantize(high_v)
+        if self._archive_k_raw is not None:
+            recent_k = torch.cat([self._archive_k_raw, recent_k], dim=0)
+            recent_v = torch.cat([self._archive_v_raw, recent_v], dim=0)
 
-    def drop_token(self, indices: list[int] | torch.Tensor) -> None:
-        if isinstance(indices, list):
-            indices = torch.tensor(indices, dtype=torch.long)
-        indices = indices.to(torch.long)
+        self._archive_k_raw = recent_k
+        self._archive_v_raw = recent_v
+        self._archive_k = self.k_quantizer.quantize(recent_k)
+        self._archive_v = self.v_quantizer.quantize(recent_v)
 
-        if self._high_k:
-            high_k = torch.cat(self._high_k, dim=0)
-            high_v = torch.cat(self._high_v, dim=0)
-            mask = torch.ones(high_k.shape[0], dtype=torch.bool)
-            valid = indices[indices < high_k.shape[0]]
-            mask[valid] = False
-            self._high_k = [high_k[mask]]
-            self._high_v = [high_v[mask]]
-            self._high_k_raw = None
-            self._high_v_raw = None
-
-        if self._low_k_raw is not None:
-            mask = torch.ones(self._low_k_raw.shape[0], dtype=torch.bool)
-            offset = self._high_k[0].shape[0] if self._high_k else 0
-            low_indices = indices - offset
-            valid = (low_indices >= 0) & (low_indices < self._low_k_raw.shape[0])
-            mask[low_indices[valid]] = False
-            self._low_k_raw = self._low_k_raw[mask]
-            self._low_v_raw = self._low_v_raw[mask]
-            if self._low_k_raw.shape[0] > 0:
-                self._low_k = self.k_quantizer.quantize(self._low_k_raw)
-                self._low_v = self.v_quantizer.quantize(self._low_v_raw)
-            else:
-                self._low_k = None
-                self._low_v = None
-                self._low_k_raw = None
-                self._low_v_raw = None
+    # ------------------------------------------------------------------
+    # Retrieve
+    # ------------------------------------------------------------------
 
     def get_all_k(self) -> torch.Tensor:
-        parts = []
-        if self._low_k is not None:
-            parts.append(KQuantizer.dequantize(self._low_k))
-        if self._high_k:
-            parts.append(torch.cat(self._high_k, dim=0))
+        """Return all latent keys, dequantizing the archive on the fly.
+
+        Returns:
+            Float tensor of shape ``[T, r_k]``.
+        """
+        parts: list[torch.Tensor] = []
+        if self._archive_k is not None:
+            parts.append(self.k_quantizer.dequantize(self._archive_k))
+        if self._recent_k:
+            parts.append(torch.cat(self._recent_k, dim=0).float())
         if not parts:
-            return torch.empty(0, self.d_model)
+            return torch.empty(0, self.k_quantizer.dim)
         return torch.cat(parts, dim=0)
 
     def get_all_v(self) -> torch.Tensor:
-        parts = []
-        if self._low_v is not None:
-            parts.append(VQuantizer.dequantize(self._low_v))
-        if self._high_v:
-            parts.append(torch.cat(self._high_v, dim=0))
+        """Return all latent values, dequantizing the archive on the fly.
+
+        Returns:
+            Float tensor of shape ``[T, r_v]``.
+        """
+        parts: list[torch.Tensor] = []
+        if self._archive_v is not None:
+            parts.append(self.v_quantizer.dequantize(self._archive_v))
+        if self._recent_v:
+            parts.append(torch.cat(self._recent_v, dim=0).float())
         if not parts:
-            return torch.empty(0, self.d_model)
+            return torch.empty(0, self.v_quantizer.dim)
         return torch.cat(parts, dim=0)
 
-    @property
-    def n_high(self) -> int:
-        if not self._high_k:
+    def drop_oldest(self, n: int) -> int:
+        if self._archive_k_raw is None:
             return 0
-        return sum(t.shape[0] for t in self._high_k)
+        T = self._archive_k_raw.shape[0]
+        drop_n = min(n, T)
+        if drop_n == 0:
+            return 0
+        self._archive_k_raw = self._archive_k_raw[drop_n:]
+        self._archive_v_raw = self._archive_v_raw[drop_n:]
+        if self._archive_k_raw.shape[0] > 0:
+            self._archive_k = self.k_quantizer.quantize(self._archive_k_raw)
+            self._archive_v = self.v_quantizer.quantize(self._archive_v_raw)
+        else:
+            self._archive_k_raw = None
+            self._archive_v_raw = None
+            self._archive_k = None
+            self._archive_v = None
+        return drop_n
+
+    # ------------------------------------------------------------------
+    # Token counts
+    # ------------------------------------------------------------------
 
     @property
-    def n_low(self) -> int:
-        if self._low_k_raw is None:
+    def n_recent(self) -> int:
+        if not self._recent_k:
             return 0
-        return self._low_k_raw.shape[0]
+        return sum(t.shape[0] for t in self._recent_k)
+
+    @property
+    def n_archive(self) -> int:
+        if self._archive_k_raw is None:
+            return 0
+        return self._archive_k_raw.shape[0]
 
     @property
     def total_tokens(self) -> int:
-        return self.n_high + self.n_low
+        return self.n_recent + self.n_archive
 
-    def nbytes_high(self) -> int:
+    # ------------------------------------------------------------------
+    # Memory estimation
+    # ------------------------------------------------------------------
+
+    def nbytes_recent(self) -> int:
         total = 0
-        for t in self._high_k:
+        for t in self._recent_k:
             total += tensor_nbytes(t)
-        for t in self._high_v:
+        for t in self._recent_v:
             total += tensor_nbytes(t)
         return total
 
-    def nbytes_low(self) -> int:
+    def nbytes_archive(self) -> int:
         total = 0
-        if self._low_k is not None:
-            total += tensor_nbytes(self._low_k.q) + tensor_nbytes(self._low_k.scale)
-            if self._low_k.rotation is not None:
-                total += tensor_nbytes(self._low_k.rotation)
-        if self._low_v is not None:
-            total += tensor_nbytes(self._low_v.q) + tensor_nbytes(self._low_v.scale) + tensor_nbytes(self._low_v.zero_point)
-            if self._low_v.residual is not None:
-                total += tensor_nbytes(self._low_v.residual)
+        if self._archive_k is not None:
+            total += self.k_quantizer.estimate_num_bytes(self._archive_k)
+        if self._archive_v is not None:
+            total += self.v_quantizer.estimate_num_bytes(self._archive_v)
         return total
+
+    def nbytes_total(self) -> int:
+        return self.nbytes_recent() + self.nbytes_archive()

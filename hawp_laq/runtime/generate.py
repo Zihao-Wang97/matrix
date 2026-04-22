@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from typing import Any
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from hawp_laq.config import HAWPLAQConfig, load_config
+from hawp_laq.config import HAWPLAQConfig, load_config, build_k_quantizer, build_v_quantizer, resolve_projector_ranks, load_projector_ranks_from_dir
+from hawp_laq.modeling.attention_hawp import HAWPAttention
 from hawp_laq.modeling.modeling_llama_hawp import convert_llama_to_hawp
 
 _DTYPE_MAP = {
@@ -74,6 +76,92 @@ def _resolve_device(device: str) -> str:
 
 
 @torch.inference_mode()
+def stepwise_greedy_generate(
+    model,
+    tokenizer,
+    prompts: list[str],
+    max_new_tokens: int,
+    coordinator=None,
+    reset_cache_fn=None,
+) -> list[str]:
+    """Unified stepwise greedy generation for fair correctness comparison.
+
+    Every mode (baseline, hawp_only, quant_*) goes through the same
+    prefill-then-decode loop with argmax selection, ensuring that token
+    choices differ only due to the model's KV quantization, not due to
+    different outer generation semantics.
+
+    Args:
+        model: The model (may be vanilla or HAWP-converted).
+        tokenizer: The tokenizer.
+        prompts: List of prompt strings.
+        max_new_tokens: Number of new tokens to generate per prompt.
+        coordinator: Optional ModelCacheCoordinator for sched mode.
+        reset_cache_fn: Optional callable to reset quant cache between prompts.
+    """
+    results = []
+
+    for prompt in prompts:
+        if reset_cache_fn is not None:
+            reset_cache_fn()
+        elif coordinator is not None:
+            for module in model.modules():
+                if isinstance(module, HAWPAttention) and module.use_cache_manager:
+                    module.reset_quant_cache()
+            coordinator.reset()
+
+        input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(model.device)
+        bsz, prompt_len = input_ids.shape
+
+        prefill_mask = torch.ones(
+            bsz, prompt_len, device=model.device, dtype=torch.long,
+        )
+        prefill_pos = torch.arange(
+            prompt_len, device=model.device, dtype=torch.long,
+        ).unsqueeze(0)
+
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=prefill_mask,
+            position_ids=prefill_pos,
+            use_cache=False,
+        )
+        next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+        generated_ids = next_token
+
+        if coordinator is not None:
+            coordinator.on_prefill(prompt_len)
+
+        cur_pos = prompt_len
+        for _ in range(max_new_tokens - 1):
+            attention_mask = torch.ones(
+                1, cur_pos + 1, device=model.device, dtype=torch.long,
+            )
+            position_ids = torch.tensor(
+                [[cur_pos]], device=model.device, dtype=torch.long,
+            )
+
+            outputs = model(
+                input_ids=next_token,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=False,
+            )
+            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+            generated_ids = torch.cat([generated_ids, next_token], dim=1)
+            cur_pos += 1
+
+            if coordinator is not None:
+                coordinator.on_new_token()
+
+        full_ids = torch.cat([input_ids, generated_ids], dim=1)
+        text = tokenizer.decode(full_ids[0], skip_special_tokens=True)
+        results.append(text)
+
+    return results
+
+
+@torch.inference_mode()
 def generate_text(model, tokenizer, prompts: list[str], cfg: HAWPLAQConfig) -> list[str]:
     gen_kw = {
         "max_new_tokens": cfg.generation.max_new_tokens,
@@ -90,11 +178,285 @@ def generate_text(model, tokenizer, prompts: list[str], cfg: HAWPLAQConfig) -> l
     return results
 
 
+@torch.inference_mode()
+def generate_hawp_quant(
+    model,
+    tokenizer,
+    prompts: list[str],
+    cfg: HAWPLAQConfig,
+    coordinator=None,
+) -> list[str]:
+    max_new_tokens = cfg.generation.max_new_tokens
+    results = []
+
+    for prompt in prompts:
+        for module in model.modules():
+            if isinstance(module, HAWPAttention) and module.use_cache_manager:
+                module.reset_quant_cache()
+
+        if coordinator is not None:
+            coordinator.reset()
+
+        input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(model.device)
+        bsz, prompt_len = input_ids.shape
+
+        prefill_mask = torch.ones(
+            bsz, prompt_len, device=model.device, dtype=torch.long,
+        )
+        prefill_pos = torch.arange(
+            prompt_len, device=model.device, dtype=torch.long,
+        ).unsqueeze(0)
+
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=prefill_mask,
+            position_ids=prefill_pos,
+            use_cache=False,
+        )
+        next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+        generated_ids = next_token
+
+        if coordinator is not None:
+            coordinator.on_prefill(prompt_len)
+
+        cur_pos = prompt_len
+        for _ in range(max_new_tokens - 1):
+            attention_mask = torch.ones(
+                1, cur_pos + 1, device=model.device, dtype=torch.long,
+            )
+            position_ids = torch.tensor([[cur_pos]], device=model.device, dtype=torch.long)
+
+            outputs = model(
+                input_ids=next_token,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=False,
+            )
+            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+            generated_ids = torch.cat([generated_ids, next_token], dim=1)
+            cur_pos += 1
+
+            if coordinator is not None:
+                coordinator.on_new_token()
+
+        full_ids = torch.cat([input_ids, generated_ids], dim=1)
+        text = tokenizer.decode(full_ids[0], skip_special_tokens=True)
+        results.append(text)
+
+    return results
+
+
 def _print_results(prompts: list[str], outputs: list[str]) -> None:
+    import sys
     for i, (p, o) in enumerate(zip(prompts, outputs)):
         print(f"\n--- prompt {i} ---")
         print(f"IN:  {p}")
-        print(f"OUT: {o}")
+        safe = o.encode(sys.stdout.encoding or 'utf-8', errors='replace').decode(sys.stdout.encoding or 'utf-8', errors='replace')
+        print(f"OUT: {safe}")
+
+
+def _resolve_head_dim_from_model_or_attn(model) -> int:
+    for _, mod in model.named_modules():
+        if isinstance(mod, HAWPAttention):
+            return mod.head_dim
+    from hawp_laq.modeling.attention_hawp import _get_attn_config
+    for _, mod in model.named_modules():
+        for attr in ("self_attn", "attention"):
+            if hasattr(mod, attr):
+                attn_config = _get_attn_config(getattr(mod, attr), model=model)
+                return attn_config.hidden_size // attn_config.num_attention_heads
+    raise ValueError("No attention module found in model")
+
+
+def _resolve_hawp_ranks(cfg: HAWPLAQConfig, model, mode: str) -> tuple[int, int, dict[int, tuple[int, int]] | None]:
+    head_dim = _resolve_head_dim_from_model_or_attn(model)
+    r_k, r_v = resolve_projector_ranks(cfg.projector, head_dim=head_dim, mode=mode)
+    ranks_per_layer = load_projector_ranks_from_dir(cfg.projector.output_dir)
+    if ranks_per_layer:
+        print(f"[{mode}] loaded per-layer ranks from {cfg.projector.output_dir / 'ranks.json'}")
+        for idx, (rk, rv) in sorted(ranks_per_layer.items()):
+            print(f"  layer {idx}: r_k={rk}  r_v={rv}")
+    return r_k, r_v, ranks_per_layer or None
+
+
+def _setup_quant_cache_per_layer(model, cfg: HAWPLAQConfig, recent_window: int) -> None:
+    for module in model.modules():
+        if isinstance(module, HAWPAttention):
+            k_q = build_k_quantizer(cfg, r_k=module.r_k)
+            v_q = build_v_quantizer(cfg, r_v=module.r_v)
+            module.setup_quant_cache(k_q, v_q, recent_window=recent_window)
+
+
+def _count_model_layers(model) -> int:
+    n = 0
+    for _, mod in model.named_modules():
+        cls_name = type(mod).__name__
+        if "DecoderLayer" in cls_name:
+            n += 1
+    return n
+
+
+def _read_ranks_from_projector_files(
+    projector_dir: Path, available_layers: set[int], head_dim: int
+) -> dict[int, tuple[int, int]]:
+    """Read r_k/r_v from each available projector.pt file.
+
+    Skips layers where r_k or r_v exceeds head_dim (incompatible artifact).
+    """
+    ranks_from_files: dict[int, tuple[int, int]] = {}
+    for layer_idx in available_layers:
+        pt_path = projector_dir / f"layer_{layer_idx}" / "projector.pt"
+        if pt_path.exists():
+            data = torch.load(pt_path, map_location="cpu", weights_only=False)
+            if "r_k" in data and "r_v" in data:
+                rk, rv = data["r_k"], data["r_v"]
+                if rk <= head_dim and rv <= head_dim:
+                    ranks_from_files[layer_idx] = (rk, rv)
+    return ranks_from_files
+
+
+def _convert_and_load_projectors(model, cfg, device, mode: str):
+    from hawp_laq.runtime.projector_bank import get_available_projector_layers
+
+    r_k, r_v, ranks_per_layer = _resolve_hawp_ranks(cfg, model, mode)
+    head_dim = _resolve_head_dim_from_model_or_attn(model)
+    allow_default = (mode == "quant_only")
+    projector_dir = cfg.projector.output_dir
+
+    effective_ranks_per_layer: dict[int, tuple[int, int]] | None = None
+    available_layers: set[int] = set()
+
+    if mode != "quant_only" and Path(projector_dir).exists():
+        available_layers = get_available_projector_layers(projector_dir)
+
+    if available_layers and mode != "quant_only":
+        n_layers = _count_model_layers(model)
+        n_layers = max(n_layers, max(available_layers) + 1)
+
+        ranks_from_files = _read_ranks_from_projector_files(
+            Path(projector_dir), available_layers, head_dim
+        )
+
+        compatible_layers = set(ranks_from_files.keys()) | (
+            set(ranks_per_layer.keys()) if ranks_per_layer else set()
+        )
+        compatible_layers &= available_layers
+
+        effective_ranks_per_layer = {}
+        for layer_idx in range(n_layers):
+            if layer_idx in compatible_layers:
+                if ranks_per_layer and layer_idx in ranks_per_layer:
+                    effective_ranks_per_layer[layer_idx] = ranks_per_layer[layer_idx]
+                elif layer_idx in ranks_from_files:
+                    effective_ranks_per_layer[layer_idx] = ranks_from_files[layer_idx]
+                else:
+                    effective_ranks_per_layer[layer_idx] = (r_k, r_v)
+            else:
+                effective_ranks_per_layer[layer_idx] = (head_dim, head_dim)
+
+        low_rank_count = sum(
+            1 for rk, rv in effective_ranks_per_layer.values()
+            if rk < head_dim or rv < head_dim
+        )
+        print(f"[{mode}] configured default r_k={r_k}  r_v={r_v}")
+        print(f"[{mode}] projector layers found: {sorted(available_layers)}")
+        if low_rank_count < len(effective_ranks_per_layer):
+            print(f"[{mode}] layers without projector fallback to full-rank")
+        print(f"[{mode}] effective low-rank layers: {low_rank_count} / {len(effective_ranks_per_layer)}")
+
+    model = convert_llama_to_hawp(
+        model, r_k=r_k, r_v=r_v,
+        ranks_per_layer=effective_ranks_per_layer,
+        allow_default_full_rank=allow_default,
+    )
+    model = model.to(device)
+    model.eval()
+
+    if mode != "quant_only":
+        from hawp_laq.runtime.projector_bank import load_projectors, inspect_projector_dir
+        if Path(projector_dir).exists():
+            ranks_json_path = Path(projector_dir) / "ranks.json"
+            has_pt_files = bool(available_layers)
+            if has_pt_files and not ranks_json_path.exists():
+                print(
+                    f"[{mode}] WARNING: projector_dir contains projector.pt files "
+                    f"but no ranks.json; this often means partial single_group "
+                    f"training or stale artifacts"
+                )
+
+            report = inspect_projector_dir(
+                projector_dir,
+                expected_head_dim=head_dim,
+                default_r_k=r_k,
+                default_r_v=r_v,
+                ranks_per_layer=ranks_per_layer,
+            )
+
+            if report["missing_rank_layers"]:
+                warnings.warn(
+                    f"[{mode}] Layers with missing r_k/r_v in projector.pt: "
+                    f"{report['missing_rank_layers']}. These layers will be skipped.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+            problem_layers = report["legacy_layers"] + report["shape_mismatch_layers"]
+            if report["legacy_layers"] or report["shape_mismatch_layers"]:
+                legacy_detail = (
+                    f"legacy (missing r_k/r_v): {report['legacy_layers']}"
+                    if report["legacy_layers"]
+                    else ""
+                )
+                mismatch_detail = (
+                    f"shape mismatch: {report['shape_mismatch_layers']}"
+                    if report["shape_mismatch_layers"]
+                    else ""
+                )
+                parts = [p for p in [legacy_detail, mismatch_detail] if p]
+                raise ValueError(
+                    f"Incompatible projector files found in {projector_dir}. "
+                    f"Problem layers: {'; '.join(parts)}. "
+                    f"Expected head_dim={head_dim}, default r_k={r_k}, r_v={r_v}. "
+                    f"Suggestions: (1) clear the projector output directory and retrain, "
+                    f"(2) use a new empty output_dir, or (3) retrain all layers."
+                )
+
+            load_projectors(model, projector_dir, strict=True)
+            print(f"[{mode}] loaded projectors from {projector_dir}")
+        else:
+            print(f"[{mode}] no projectors at {projector_dir}")
+
+    print(f"[{mode}] r_k={r_k}  r_v={r_v}"
+          + (f"  per-layer ranks: {len(ranks_per_layer)} layers" if ranks_per_layer else ""))
+
+    return model, r_k, r_v
+
+
+def _setup_hawp_quant_on_model(model, cfg, device):
+    model, r_k, r_v = _convert_and_load_projectors(model, cfg, device, "hawp_quant")
+    _setup_quant_cache_per_layer(model, cfg, recent_window=cfg.sched.recent_window)
+    print(f"[hawp_quant] recent_window={cfg.sched.recent_window}")
+    return model
+
+
+def _setup_hawp_quant_all_on_model(model, cfg, device):
+    model, r_k, r_v = _convert_and_load_projectors(model, cfg, device, "hawp_quant_all")
+    _setup_quant_cache_per_layer(model, cfg, recent_window=0)
+    print(f"[hawp_quant_all] recent_window=0 (all tokens quantized)")
+    return model
+
+
+def _setup_quant_only_on_model(model, cfg, device):
+    head_dim = _resolve_head_dim_from_model_or_attn(model)
+    model = convert_llama_to_hawp(model, r_k=head_dim, r_v=head_dim, allow_default_full_rank=True)
+    model = model.to(device)
+    model.eval()
+
+    _setup_quant_cache_per_layer(model, cfg, recent_window=cfg.sched.recent_window)
+
+    print(f"[quant_only] head_dim={head_dim}  recent_window={cfg.sched.recent_window}  (explicit full-rank, no low-rank projection)")
+
+    return model, head_dim
 
 
 def run_baseline(config_path: str | Path) -> None:
@@ -121,22 +483,9 @@ def run_hawp_only(config_path: str | Path) -> None:
     print("=" * 60)
 
     model, tokenizer, device = load_baseline_model(cfg)
+    model, r_k, r_v = _convert_and_load_projectors(model, cfg, device, "hawp_only")
 
-    r_k = cfg.projector.r_k
-    r_v = cfg.projector.r_v
-    model = convert_llama_to_hawp(model, r_k=r_k, r_v=r_v)
-    model = model.to(device)
-    model.eval()
-
-    from hawp_laq.runtime.projector_bank import load_projectors
-    projector_dir = cfg.projector.output_dir
-    if Path(projector_dir).exists():
-        load_projectors(model, projector_dir)
-        print(f"[hawp_only] loaded projectors from {projector_dir}")
-    else:
-        print(f"[hawp_only] no trained projectors at {projector_dir}, using identity")
-
-    print(f"[hawp_only] r_k={r_k}, r_v={r_v}")
+    print(f"[hawp_only] r_k={r_k}  r_v={r_v}")
     prompts = cfg.generation.prompts
     print(f"[hawp_only] running {len(prompts)} prompt(s) ...")
 
@@ -146,9 +495,6 @@ def run_hawp_only(config_path: str | Path) -> None:
 
 @torch.inference_mode()
 def run_hawp_quant(config_path: str | Path) -> None:
-    from hawp_laq.runtime.cache_manager import CacheManager
-    from hawp_laq.runtime.scheduler import TokenBudgetScheduler
-
     cfg = load_config(config_path)
     print("=" * 60)
     print("[mode] hawp_quant")
@@ -156,58 +502,81 @@ def run_hawp_quant(config_path: str | Path) -> None:
     print("=" * 60)
 
     model, tokenizer, device = load_baseline_model(cfg)
+    model = _setup_hawp_quant_on_model(model, cfg, device)
 
-    r_k = cfg.projector.r_k
-    r_v = cfg.projector.r_v
-    model = convert_llama_to_hawp(model, r_k=r_k, r_v=r_v)
-    model = model.to(device)
-    model.eval()
-
-    from hawp_laq.runtime.projector_bank import load_projectors
-    projector_dir = cfg.projector.output_dir
-    if Path(projector_dir).exists():
-        load_projectors(model, projector_dir)
-        print(f"[hawp_quant] loaded projectors from {projector_dir}")
-
-    n_layers = sum(1 for _, m in model.named_modules() if type(m).__name__ == "HAWPAttention")
-    head_dim = r_k if r_k is not None else 64
-
-    for name, module in model.named_modules():
-        if type(module).__name__ == "HAWPAttention":
-            head_dim = module.head_dim
-            break
-
-    scheduler = TokenBudgetScheduler(
-        total_budget=cfg.sched.total_budget,
-        recent_window=cfg.sched.recent_window,
-        high_ratio=cfg.sched.high_ratio,
-        low_ratio=cfg.sched.low_ratio,
-    )
-    cache_mgr = CacheManager(
-        n_layers=n_layers,
-        n_heads=cfg.model.num_attention_heads if hasattr(cfg.model, 'num_attention_heads') else 12,
-        head_dim=head_dim,
-        scheduler=scheduler,
-        k_group_size=cfg.quant.k_group_size,
-        v_group_size=cfg.quant.v_group_size,
-        use_rotation=cfg.quant.use_rotation,
-        outlier_threshold=cfg.quant.outlier_threshold,
-    )
-    print(f"[hawp_quant] cache_manager created  n_layers={n_layers}  k_group={cfg.quant.k_group_size}  v_group={cfg.quant.v_group_size}")
-
-    print(f"[hawp_quant] r_k={r_k}, r_v={r_v}")
+    r_k, r_v = _resolve_hawp_ranks(cfg, model, "hawp_quant")[:2]
+    recent_window = cfg.sched.recent_window
+    print(f"[hawp_quant] r_k={r_k}  r_v={r_v}  recent_window={recent_window}")
     prompts = cfg.generation.prompts
     print(f"[hawp_quant] running {len(prompts)} prompt(s) ...")
 
-    outputs = generate_text(model, tokenizer, prompts, cfg)
+    outputs = generate_hawp_quant(model, tokenizer, prompts, cfg)
     _print_results(prompts, outputs)
-    print(f"\n[hawp_quant] cache summary: {cache_mgr.summary()}")
+
+    print(f"\n[hawp_quant] --- cache summary ---")
+    for module in model.modules():
+        if isinstance(module, HAWPAttention) and module.use_cache_manager:
+            s = module.quant_cache_summary()
+            print(f"  layer {s['layer']:>2d}: recent={s['recent_tokens']}  archive={s['archive_tokens']}  "
+                  f"runtime={_fmt_bytes(s['total_runtime_bytes'])}  compressed={_fmt_bytes(s['compressed_storage_bytes'])}")
+
+
+@torch.inference_mode()
+def run_quant_only(config_path: str | Path) -> None:
+    cfg = load_config(config_path)
+    print("=" * 60)
+    print("[mode] quant_only")
+    print_device_info(cfg.train.device)
+    print("=" * 60)
+
+    model, tokenizer, device = load_baseline_model(cfg)
+    model, head_dim = _setup_quant_only_on_model(model, cfg, device)
+
+    recent_window = cfg.sched.recent_window
+    print(f"[quant_only] head_dim={head_dim}  recent_window={recent_window}  (no low-rank projection)")
+    prompts = cfg.generation.prompts
+    print(f"[quant_only] running {len(prompts)} prompt(s) ...")
+
+    outputs = generate_hawp_quant(model, tokenizer, prompts, cfg)
+    _print_results(prompts, outputs)
+
+    print(f"\n[quant_only] --- cache summary ---")
+    for module in model.modules():
+        if isinstance(module, HAWPAttention) and module.use_cache_manager:
+            s = module.quant_cache_summary()
+            print(f"  layer {s['layer']:>2d}: recent={s['recent_tokens']}  archive={s['archive_tokens']}  "
+                  f"runtime={_fmt_bytes(s['total_runtime_bytes'])}  compressed={_fmt_bytes(s['compressed_storage_bytes'])}")
+
+
+@torch.inference_mode()
+def run_hawp_quant_all(config_path: str | Path) -> None:
+    cfg = load_config(config_path)
+    print("=" * 60)
+    print("[mode] hawp_quant_all")
+    print_device_info(cfg.train.device)
+    print("=" * 60)
+
+    model, tokenizer, device = load_baseline_model(cfg)
+    model = _setup_hawp_quant_all_on_model(model, cfg, device)
+
+    r_k, r_v = _resolve_hawp_ranks(cfg, model, "hawp_quant_all")[:2]
+    print(f"[hawp_quant_all] r_k={r_k}  r_v={r_v}  recent_window=0 (all tokens quantized)")
+    prompts = cfg.generation.prompts
+    print(f"[hawp_quant_all] running {len(prompts)} prompt(s) ...")
+
+    outputs = generate_hawp_quant(model, tokenizer, prompts, cfg)
+    _print_results(prompts, outputs)
+
+    from hawp_laq.eval.metrics import collect_kv_metrics, format_kv_metrics
+    metrics = collect_kv_metrics(model)
+    print(f"\n[hawp_quant_all] --- cache summary ---")
+    print(format_kv_metrics(metrics))
 
 
 @torch.inference_mode()
 def run_hawp_quant_sched(config_path: str | Path) -> None:
-    from hawp_laq.runtime.cache_manager import CacheManager
     from hawp_laq.runtime.scheduler import TokenBudgetScheduler
+    from hawp_laq.runtime.cache_manager import ModelCacheCoordinator
 
     cfg = load_config(config_path)
     print("=" * 60)
@@ -216,53 +585,40 @@ def run_hawp_quant_sched(config_path: str | Path) -> None:
     print("=" * 60)
 
     model, tokenizer, device = load_baseline_model(cfg)
+    model = _setup_hawp_quant_on_model(model, cfg, device)
 
-    r_k = cfg.projector.r_k
-    r_v = cfg.projector.r_v
-    model = convert_llama_to_hawp(model, r_k=r_k, r_v=r_v)
-    model = model.to(device)
-    model.eval()
-
-    from hawp_laq.runtime.projector_bank import load_projectors
-    projector_dir = cfg.projector.output_dir
-    if Path(projector_dir).exists():
-        load_projectors(model, projector_dir)
-        print(f"[hawp_quant_sched] loaded projectors from {projector_dir}")
-
-    n_layers = sum(1 for _, m in model.named_modules() if type(m).__name__ == "HAWPAttention")
-    head_dim = 64
-    n_heads = 12
-    for name, module in model.named_modules():
-        if type(module).__name__ == "HAWPAttention":
-            head_dim = module.head_dim
-            n_heads = module.num_key_value_heads
-            break
+    r_k, r_v = _resolve_hawp_ranks(cfg, model, "hawp_quant_sched")[:2]
+    total_budget = cfg.sched.total_budget
+    recent_window = cfg.sched.recent_window
+    drop_strategy = getattr(cfg.sched, "drop_strategy", "position")
 
     scheduler = TokenBudgetScheduler(
-        total_budget=cfg.sched.total_budget,
-        recent_window=cfg.sched.recent_window,
+        total_budget=total_budget,
+        recent_window=recent_window,
         high_ratio=cfg.sched.high_ratio,
         low_ratio=cfg.sched.low_ratio,
+        drop_strategy=drop_strategy,
     )
-    cache_mgr = CacheManager(
-        n_layers=n_layers,
-        n_heads=n_heads,
-        head_dim=head_dim,
-        scheduler=scheduler,
-        k_group_size=cfg.quant.k_group_size,
-        v_group_size=cfg.quant.v_group_size,
-        use_rotation=cfg.quant.use_rotation,
-        outlier_threshold=cfg.quant.outlier_threshold,
+    coordinator = ModelCacheCoordinator.from_model(
+        model, scheduler, drop_strategy=drop_strategy,
     )
-    print(f"[hawp_quant_sched] cache_manager + scheduler ready  budget={cfg.sched.total_budget}")
 
-    print(f"[hawp_quant_sched] r_k={r_k}, r_v={r_v}")
+    print(f"[hawp_quant_sched] r_k={r_k}  r_v={r_v}  "
+          f"budget={total_budget}  recent_window={recent_window}  "
+          f"drop_strategy={drop_strategy}")
     prompts = cfg.generation.prompts
     print(f"[hawp_quant_sched] running {len(prompts)} prompt(s) ...")
 
-    outputs = generate_text(model, tokenizer, prompts, cfg)
+    outputs = generate_hawp_quant(model, tokenizer, prompts, cfg, coordinator=coordinator)
     _print_results(prompts, outputs)
 
-    drops = cache_mgr.apply_scheduler()
-    print(f"[hawp_quant_sched] scheduler dropped {len(drops)} tokens")
-    print(f"[hawp_quant_sched] cache summary: {cache_mgr.summary()}")
+    decision = scheduler.rebalance()
+    print(f"\n[hawp_quant_sched] --- scheduler decision ---")
+    print(f"  HIGH={decision.n_high}  LOW={decision.n_low}  DROP={decision.n_drop}")
+
+    print(f"\n[hawp_quant_sched] --- cache summary ---")
+    for module in model.modules():
+        if isinstance(module, HAWPAttention) and module.use_cache_manager:
+            s = module.quant_cache_summary()
+            print(f"  layer {s['layer']:>2d}: recent={s['recent_tokens']}  archive={s['archive_tokens']}  "
+                  f"dropped={decision.n_drop}  runtime={_fmt_bytes(s['total_runtime_bytes'])}  compressed={_fmt_bytes(s['compressed_storage_bytes'])}")

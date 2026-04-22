@@ -6,7 +6,7 @@ from pathlib import Path
 
 from transformers import AutoConfig
 
-from hawp_laq.config import load_config
+from hawp_laq.config import load_config, load_projector_ranks_from_dir
 from hawp_laq.runtime.compressor import CompressorPackage
 from hawp_laq.utils.io import load_pt, load_json
 
@@ -48,7 +48,8 @@ def main() -> None:
         head_dim=head_dim,
         k_group_size=cfg.quant.k_group_size,
         v_group_size=cfg.quant.v_group_size,
-        use_rotation=cfg.quant.use_rotation,
+        use_rotation_for_k=cfg.quant.use_rotation_for_k,
+        use_rotation_for_v=cfg.quant.use_rotation_for_v,
         outlier_threshold=cfg.quant.outlier_threshold,
         total_budget=cfg.sched.total_budget,
         recent_window=cfg.sched.recent_window,
@@ -60,8 +61,30 @@ def main() -> None:
     print(f"[compressor] loaded {len(ranks)} layer projectors")
     for idx, (r_k, r_v) in sorted(ranks.items()):
         print(f"  layer {idx}: r_k={r_k}  r_v={r_v}")
+    for layer_idx in range(n_layers):
+        if layer_idx not in ranks:
+            print(f"  layer {layer_idx}: has_projector=False  (full-rank in profile only, low-rank NOT active)")
+
+    per_layer_ranks = load_projector_ranks_from_dir(projector_dir)
+    if per_layer_ranks:
+        print(f"[compressor] per-layer ranks loaded from {projector_dir / 'ranks.json'}")
+        for idx, (rk, rv) in sorted(per_layer_ranks.items()):
+            print(f"  layer {idx}: r_k={rk}  r_v={rv}")
 
     saved_dir = pkg.save(output_dir)
+    print(f"\n[compressor] package saved to {saved_dir}")
+
+    missing_rank_layers = []
+    for idx, data in pkg._projectors.items():
+        if "r_k" not in data or "r_v" not in data:
+            missing_rank_layers.append(idx)
+    if missing_rank_layers:
+        print(
+            f"[compressor] NOTE: {len(missing_rank_layers)} layer(s) had missing r_k/r_v "
+            f"keys in projector files; profiled with head_dim fallback. "
+            f"Missing-rank fallback in compressor profiling is warning-backed "
+            f"and profile-only, not reflecting actual low-rank configuration."
+        )
     print(f"\n[compressor] package saved to {saved_dir}")
     print(f"[compressor] contents:")
     for f in sorted(saved_dir.rglob("*")):

@@ -14,12 +14,16 @@ def _find_attention_modules(model: nn.Module) -> list[tuple[int, nn.Module]]:
         "Attention",
         "SdpaAttention",
         "OPTAttention",
+        "OPTSdpaAttention",
         "LlamaAttention",
+        "LlamaSdpaAttention",
         "MistralAttention",
+        "MistralSdpaAttention",
         "GPTNeoXAttention",
         "BloomAttention",
         "Phi3Attention",
         "Qwen2Attention",
+        "Qwen2SdpaAttention",
     }
     results: list[tuple[int, nn.Module]] = []
     idx = 0

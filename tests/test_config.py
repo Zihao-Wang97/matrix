@@ -8,7 +8,7 @@ def test_load_dev_local():
     assert cfg.mode == "local"
     assert isinstance(cfg.data, DataConfig)
     assert isinstance(cfg.model, ModelConfig)
-    assert cfg.train.device == "cpu"
+    assert cfg.train.device == "cuda"
     assert isinstance(cfg.data.root, Path)
 
 
