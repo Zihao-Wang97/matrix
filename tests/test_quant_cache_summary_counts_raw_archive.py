@@ -1,0 +1,71 @@
+from __future__ import annotations
+
+import pytest
+import torch
+
+from hawp_laq.modeling.attention_hawp import HAWPAttention
+
+
+def _make_hawp_quant_all(n_heads=4, head_dim=16, r_k=8, r_v=8):
+    from types import SimpleNamespace
+    from hawp_laq.runtime.turboquant import TurboQuantMSE
+
+    config = SimpleNamespace(
+        hidden_size=n_heads * head_dim,
+        num_attention_heads=n_heads,
+        num_key_value_heads=n_heads,
+        max_position_embeddings=2048,
+        rope_theta=10000.0,
+        model_type="opt",
+        enable_bias=False,
+        attention_dropout=0.0,
+    )
+    attn = HAWPAttention(config, r_k=r_k, r_v=r_v)
+    k_q = TurboQuantMSE(dim=r_k, bits=4, group_size=16, use_rotation=False)
+    v_q = TurboQuantMSE(dim=r_v, bits=4, group_size=16, use_rotation=False)
+    attn.setup_quant_cache(k_q, v_q, recent_window=0)
+    return attn
+
+
+def test_quant_cache_summary_counts_raw_archive():
+    attn = _make_hawp_quant_all(n_heads=2, head_dim=16, r_k=8, r_v=8)
+
+    nkv, seq, rk, rv = 2, 10, 8, 8
+    k_lat = torch.randn(1, nkv, seq, rk)
+    v_lat = torch.randn(1, nkv, seq, rv)
+
+    s0 = attn.quant_cache_summary()
+    assert s0["recent_fp_bytes"] == 0
+    assert s0["archive_raw_bytes"] == 0
+    assert s0["archive_quant_bytes"] == 0
+    assert s0["total_runtime_bytes"] == 0
+    assert s0["compressed_storage_bytes"] == 0
+
+    attn._quant_cache_append_to_archive(k_lat, v_lat)
+    s1 = attn.quant_cache_summary()
+
+    expected_raw = nkv * seq * rk * 4 + nkv * seq * rv * 4
+    assert s1["archive_raw_bytes"] == expected_raw
+
+    assert s1["archive_quant_bytes"] > 0
+    assert s1["archive_quant_bytes"] < expected_raw
+
+    assert s1["recent_fp_bytes"] == 0
+    assert s1["total_runtime_bytes"] == s1["recent_fp_bytes"] + s1["archive_raw_bytes"] + s1["archive_quant_bytes"]
+    assert s1["compressed_storage_bytes"] == s1["archive_quant_bytes"]
+
+    k_lat_2 = torch.randn(1, nkv, 5, rk)
+    v_lat_2 = torch.randn(1, nkv, 5, rv)
+    attn._quant_cache_append_to_archive(k_lat_2, v_lat_2)
+    s2 = attn.quant_cache_summary()
+
+    expected_raw_2 = nkv * 15 * rk * 4 + nkv * 15 * rv * 4
+    assert s2["archive_raw_bytes"] == expected_raw_2
+    assert s2["archive_quant_bytes"] > 0
+    assert s2["archive_quant_bytes"] < expected_raw_2
+    assert s2["total_runtime_bytes"] == s2["recent_fp_bytes"] + s2["archive_raw_bytes"] + s2["archive_quant_bytes"]
+    assert s2["compressed_storage_bytes"] == s2["archive_quant_bytes"]
+
+    assert "total_bytes" not in s2
+    assert "recent_bytes" not in s2
+    assert "archive_bytes" not in s2
