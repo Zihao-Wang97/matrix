@@ -96,6 +96,11 @@ def test_real_hawp_attention_matches_baseline_in_identity_mode():
     v = v.view(1, 4, 4, d).transpose(1, 2)
 
     logits = torch.matmul(q, k.transpose(2, 3))
+    causal_mask = torch.triu(
+        torch.full((4, 4), float("-inf"), dtype=logits.dtype, device=logits.device),
+        diagonal=1,
+    ).unsqueeze(0).unsqueeze(0)
+    logits = logits + causal_mask
     weights = F.softmax(logits, dim=-1, dtype=torch.float32).to(q.dtype)
     attn_out = (weights @ v).transpose(1, 2).reshape(1, 4, 256)
     baseline_out = attn.o_proj(attn_out)

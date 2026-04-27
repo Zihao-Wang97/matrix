@@ -70,7 +70,7 @@ class TestPrefillIsCausal:
         x = torch.randn(1, seq_len, 256)
 
         with torch.no_grad():
-            out = attn(x, attention_mask=None, use_cache=False)[0]
+            out = attn(x, attention_mask=None, use_cache=True)[0]
         assert out.shape == (1, seq_len, 256), "Output shape mismatch"
 
     def test_prefill_no_mask_future_tokens_zero_attention(self):
@@ -81,7 +81,7 @@ class TestPrefillIsCausal:
         x = torch.randn(1, seq_len, 256)
 
         with torch.no_grad():
-            _, attn_weights, _ = attn(x, attention_mask=None, use_cache=False)
+            _, attn_weights, _ = attn(x, attention_mask=None, use_cache=True)
 
         assert attn_weights is not None, "attention weights should be returned"
         assert attn_weights.shape[-2:] == (seq_len, seq_len)
@@ -103,13 +103,13 @@ class TestPrefillIsCausal:
         causal_mask = _make_causal_mask(seq_len, seq_len, x.device, x.dtype)
 
         with torch.no_grad():
-            out_auto = attn(x, attention_mask=None, use_cache=False)[0]
+            out_auto = attn(x, attention_mask=None, use_cache=True)[0]
 
         attn.reset_quant_cache()
         _setup_quant_cache(attn, recent_window=64)
 
         with torch.no_grad():
-            out_explicit = attn(x, attention_mask=causal_mask, use_cache=False)[0]
+            out_explicit = attn(x, attention_mask=causal_mask, use_cache=True)[0]
 
         assert torch.allclose(out_auto, out_explicit, atol=1e-5), (
             "Auto causal mask should produce same output as explicit causal mask"
@@ -121,11 +121,11 @@ class TestPrefillIsCausal:
 
         x_prefill = torch.randn(1, 4, 256)
         with torch.no_grad():
-            attn(x_prefill, attention_mask=None, use_cache=False)
+            attn(x_prefill, attention_mask=None, use_cache=True)
 
         x_decode = torch.randn(1, 1, 256)
         with torch.no_grad():
-            _, weights, _ = attn(x_decode, attention_mask=None, use_cache=False)
+            _, weights, _ = attn(x_decode, attention_mask=None, use_cache=True)
         assert weights is not None
 
 
@@ -154,10 +154,10 @@ class TestQuantAllReadsBackArchiveOnFirstPrefill:
             return result
 
         with torch.no_grad():
-            out = attn(x, attention_mask=None, use_cache=False)[0]
+            out = attn(x, attention_mask=None, use_cache=True)[0]
         assert out.shape == (1, seq_len, 256)
 
-        assert attn._quant_archive_k_qx is not None, (
+        assert bool(attn._quant_archive_chunks), (
             "Archive should contain quantized data after first prefill"
         )
         assert attn._quant_recent_k is None, (
@@ -185,7 +185,7 @@ class TestQuantAllReadsBackArchiveOnFirstPrefill:
         v_lat_raw = (v @ pv_down).clone()
 
         with torch.no_grad():
-            attn(x, attention_mask=None, use_cache=False)
+            attn(x, attention_mask=None, use_cache=True)
 
         k_cached, v_cached = attn._quant_cache_get_kv()
         assert k_cached is not None, "Archive should have data after first forward"
@@ -217,10 +217,10 @@ class TestQuantAllReadsBackArchiveOnFirstPrefill:
         x = torch.randn(1, 4, 256)
 
         with torch.no_grad():
-            attn_all(x, attention_mask=None, use_cache=False)
-            attn_win(x, attention_mask=None, use_cache=False)
+            attn_all(x, attention_mask=None, use_cache=True)
+            attn_win(x, attention_mask=None, use_cache=True)
 
-        assert attn_all._quant_archive_k_qx is not None, (
+        assert bool(attn_all._quant_archive_chunks), (
             "quant_all: archive must be populated after first forward"
         )
         assert attn_all._quant_recent_k is None, (
@@ -230,6 +230,6 @@ class TestQuantAllReadsBackArchiveOnFirstPrefill:
         assert attn_win._quant_recent_k is not None, (
             "quant (window>0): recent should be populated after first forward"
         )
-        assert attn_win._quant_archive_k_qx is None, (
+        assert not attn_win._quant_archive_chunks, (
             "quant (window>0): archive should still be empty (tokens within window)"
         )

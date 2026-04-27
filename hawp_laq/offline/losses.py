@@ -17,7 +17,11 @@ def compute_logits_hat(q: torch.Tensor, k: torch.Tensor, p_k: torch.Tensor, scal
     return (q @ k_recon.transpose(-2, -1)) * scale
 
 
-def logits_mse_loss(logits_fp: torch.Tensor, logits_hat: torch.Tensor) -> torch.Tensor:
+def logits_mse_loss(logits_fp: torch.Tensor, logits_hat: torch.Tensor, valid_mask: torch.Tensor | None = None) -> torch.Tensor:
+    if valid_mask is not None:
+        diff = (logits_hat - logits_fp) ** 2
+        valid_mask = valid_mask.expand_as(diff)
+        return diff[valid_mask].mean()
     return F.mse_loss(logits_hat, logits_fp)
 
 
@@ -43,8 +47,9 @@ def total_projector_loss(
     w_logits: float = 1.0,
     w_attn: float = 1.0,
     w_value: float = 0.5,
+    valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    l_logits = logits_mse_loss(logits_fp, logits_hat)
+    l_logits = logits_mse_loss(logits_fp, logits_hat, valid_mask=valid_mask)
     l_attn = attention_output_mse_loss(attn_out, attn_out_hat)
     l_val = value_reconstruction_loss(v, p_v, gamma)
     return w_logits * l_logits + w_attn * l_attn + w_value * l_val

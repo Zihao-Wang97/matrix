@@ -1,5 +1,12 @@
 #!/usr/bin/env python
-"""KV memory profiling: per-layer and total KV bytes for each mode.
+"""KV memory profiling: peak GPU memory for each mode.
+
+All modes use the same real generation path (profile_generate_by_mode),
+the same prompt / max_new_tokens, and the same measurement:
+  torch.cuda.reset_peak_memory_stats() -> run -> torch.cuda.max_memory_allocated()
+
+Returns unified CacheStats with derived metrics:
+  kv_compression_ratio, model_bytes_per_token, recent_ratio, archive_ratio.
 
 Usage:
   python scripts/06_profile_kv_memory.py configs/dev_local.yaml --mode hawp_quant
@@ -16,70 +23,28 @@ from hawp_laq.config import load_config
 from hawp_laq.runtime.generate import (
     load_baseline_model,
     _resolve_device,
-    _setup_hawp_quant_on_model,
-    _setup_quant_only_on_model,
-    generate_hawp_quant,
 )
-from hawp_laq.modeling.attention_hawp import HAWPAttention
-from hawp_laq.modeling.modeling_llama_hawp import convert_llama_to_hawp
-from hawp_laq.eval.metrics import collect_kv_metrics, format_kv_metrics
+from hawp_laq.runtime.mode_runner import setup_mode, make_reset_fn, profile_generate_by_mode
 from hawp_laq.utils.memory import format_nbytes
 from hawp_laq.utils.io import save_json
 
 
-def _setup_mode(model, cfg, device, mode: str):
-    if mode == "baseline":
-        return model, None
-    if mode == "hawp_only":
-        r_k, r_v = cfg.projector.r_k, cfg.projector.r_v
-        model = convert_llama_to_hawp(model, r_k=r_k, r_v=r_v)
-        model = model.to(device).eval()
-        return model, None
-    if mode == "quant_only":
-        model, _ = _setup_quant_only_on_model(model, cfg, device)
-        return model, "quant"
-    if mode in ("hawp_quant", "hawp_quant_all", "hawp_quant_sched"):
-        if mode == "hawp_quant_all":
-            from hawp_laq.runtime.generate import _setup_hawp_quant_all_on_model
-            model = _setup_hawp_quant_all_on_model(model, cfg, device)
-        else:
-            model = _setup_hawp_quant_on_model(model, cfg, device)
-        coordinator = None
-        if mode == "hawp_quant_sched":
-            from hawp_laq.runtime.scheduler import TokenBudgetScheduler
-            from hawp_laq.runtime.cache_manager import ModelCacheCoordinator
-            sched = TokenBudgetScheduler(
-                total_budget=cfg.sched.total_budget,
-                recent_window=cfg.sched.recent_window,
-                high_ratio=cfg.sched.high_ratio,
-                low_ratio=cfg.sched.low_ratio,
-                drop_strategy=getattr(cfg.sched, "drop_strategy", "position"),
-            )
-            coordinator = ModelCacheCoordinator.from_model(
-                model, sched, drop_strategy=getattr(cfg.sched, "drop_strategy", "position"),
-            )
-        return model, coordinator
-    raise ValueError(f"Unknown mode: {mode}")
+def _build_prompt_for_profile(tokenizer, target_seq_len: int) -> tuple[str, int]:
+    """Build a text prompt and report the token length actually profiled.
 
-
-def _compute_baseline_kv(model_cfg, seq_len: int) -> dict:
-    n_layers = getattr(model_cfg, "num_hidden_layers", 12)
-    n_heads = getattr(model_cfg, "num_attention_heads", 12)
-    n_kv_heads = getattr(model_cfg, "num_key_value_heads", n_heads)
-    head_dim = getattr(model_cfg, "hidden_size", 768) // n_heads
-
-    per_layer = seq_len * n_kv_heads * head_dim * 2 * 2
-    baseline_total = n_layers * per_layer
-
-    return {
-        "n_layers": n_layers,
-        "n_kv_heads": n_kv_heads,
-        "head_dim": head_dim,
-        "baseline_per_layer_bytes": per_layer,
-        "baseline_total_bytes": baseline_total,
-        "baseline_per_layer_formatted": format_nbytes(per_layer),
-        "baseline_total_formatted": format_nbytes(baseline_total),
-    }
+    The profiler accepts text prompts, so we decode token ids and then measure
+    the length after the same re-tokenization path used by profile_generate_by_mode.
+    """
+    seed_text = "The " * target_seq_len
+    enc = tokenizer(seed_text, return_tensors="pt")
+    prompt_ids = enc["input_ids"][0][:target_seq_len]
+    prompt = tokenizer.decode(
+        prompt_ids,
+        skip_special_tokens=False,
+        clean_up_tokenization_spaces=False,
+    )
+    actual_len = tokenizer(prompt, return_tensors="pt").input_ids.shape[1]
+    return prompt, actual_len
 
 
 @torch.inference_mode()
@@ -87,7 +52,7 @@ def main():
     parser = argparse.ArgumentParser(description="HAWP-LAQ KV memory profiling")
     parser.add_argument("config", nargs="?", default=None)
     parser.add_argument("--mode",
-                        choices=["baseline", "hawp_only", "quant_only", "hawp_quant", "hawp_quant_all", "hawp_quant_sched"],
+                        choices=["baseline", "hawp_only", "quant_only", "hawp_quant", "hawp_quant_all", "hawp_quant_sched", "pure_quant_only"],
                         default="baseline")
     parser.add_argument("--seq-lens", nargs="+", type=int,
                         default=[512, 1024, 2048, 4096])
@@ -100,98 +65,87 @@ def main():
     cfg = load_config(args.config)
     device = _resolve_device(cfg.train.device)
 
-    model_cfg = AutoConfig.from_pretrained(cfg.model.model_id)
-    baseline_info = _compute_baseline_kv(model_cfg, 0)
+    model_cfg = AutoConfig.from_pretrained(cfg.model.model_id, local_files_only=Path(cfg.model.model_id).expanduser().is_dir())
+    n_layers = getattr(model_cfg, "num_hidden_layers", 12)
+    n_heads = getattr(model_cfg, "num_attention_heads", 12)
+    n_kv_heads = getattr(model_cfg, "num_key_value_heads", n_heads)
+    head_dim = getattr(model_cfg, "hidden_size", 768) // n_heads
 
     print("=" * 60)
     print(f"[profile] mode={args.mode}  model={cfg.model.model_id}")
-    print(f"[profile] n_layers={baseline_info['n_layers']}  "
-          f"n_kv_heads={baseline_info['n_kv_heads']}  head_dim={baseline_info['head_dim']}")
+    print(f"[profile] n_layers={n_layers}  n_kv_heads={n_kv_heads}  head_dim={head_dim}")
+    print(f"[profile] metric = peak_gpu_bytes + cache_runtime_bytes (real measurement)")
     print("=" * 60)
+
+    model, tokenizer, _ = load_baseline_model(cfg)
+    model, coordinator, kv_manager = setup_mode(model, cfg, device, args.mode)
+    model.eval()
+    reset_fn = make_reset_fn(model, coordinator, kv_manager)
 
     all_results = []
 
-    if args.mode in ("quant_only", "hawp_quant", "hawp_quant_all", "hawp_quant_sched"):
-        model, tokenizer, _ = load_baseline_model(cfg)
-        model, coordinator = _setup_mode(model, cfg, device, args.mode)
-        model.eval()
+    for requested_seq_len in args.seq_lens:
+        prompt, actual_seq_len = _build_prompt_for_profile(tokenizer, requested_seq_len)
 
-        for seq_len in args.seq_lens:
-            for mod in model.modules():
-                if isinstance(mod, HAWPAttention) and mod.use_cache_manager:
-                    mod.reset_quant_cache()
-            if coordinator is not None:
-                coordinator.reset()
+        _, stats, _ = profile_generate_by_mode(
+            model, tokenizer, [prompt], cfg, args.mode,
+            coordinator=coordinator, kv_manager=kv_manager, reset_fn=reset_fn,
+        )
 
-            seed_text = "The " * seq_len
-            enc = tokenizer(seed_text, return_tensors="pt")
-            input_ids = enc["input_ids"][:, :seq_len].to(device)
+        entry = {
+            "requested_seq_len": requested_seq_len,
+            "seq_len": actual_seq_len,
+            "mode": args.mode,
+            "cache_tokens_total": stats.cache_tokens_total,
+            "cache_runtime_bytes": stats.cache_runtime_bytes,
+            "cache_runtime_formatted": format_nbytes(stats.cache_runtime_bytes),
+            "cache_compressed_bytes": stats.cache_compressed_bytes,
+            "cache_compressed_formatted": format_nbytes(stats.cache_compressed_bytes),
+            "archive_quant_bytes": stats.cache_compressed_bytes,
+            "archive_quant_formatted": format_nbytes(stats.cache_compressed_bytes),
+            "baseline_kv_bytes": stats.baseline_kv_bytes,
+            "baseline_kv_formatted": format_nbytes(stats.baseline_kv_bytes),
+            "kv_compression_ratio": round(stats.kv_compression_ratio, 2),
+            "bytes_per_token": round(stats.bytes_per_token, 1),
+            "model_bytes_per_token": round(stats.bytes_per_token, 1),
+            "recent_tokens": stats.recent_tokens,
+            "recent_ratio": round(stats.recent_ratio, 3),
+            "archive_tokens": stats.archive_tokens,
+            "archive_ratio": round(stats.archive_ratio, 3),
+            "peak_gpu_bytes": stats.peak_gpu_bytes,
+            "peak_gpu_formatted": format_nbytes(stats.peak_gpu_bytes),
+            "memory_overhead_ratio": round(stats.memory_overhead_ratio, 2),
+            "impl": stats.impl,
+        }
+        all_results.append(entry)
 
-            outputs = model(input_ids=input_ids, use_cache=False)
-            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+        len_note = f"actual_seq_len={actual_seq_len}"
+        if actual_seq_len != requested_seq_len:
+            len_note += f" (requested={requested_seq_len})"
+        print(f"\n--- {len_note} ---")
+        print(f"  peak_gpu: {entry['peak_gpu_formatted']}  "
+              f"cache_runtime: {entry['cache_runtime_formatted']}  "
+              f"baseline_kv: {entry['baseline_kv_formatted']}")
+        if stats.kv_compression_ratio > 0:
+            print(f"  kv_compression_ratio={stats.kv_compression_ratio:.1f}x  "
+                  f"model_bytes_per_token={stats.bytes_per_token:.1f} B  "
+                  f"memory_overhead={stats.memory_overhead_ratio:.1f}x")
+        if stats.recent_tokens > 0 or stats.archive_tokens > 0:
+            print(f"  recent={stats.recent_tokens} ({stats.recent_ratio:.1%})  "
+                  f"archive={stats.archive_tokens} ({stats.archive_ratio:.1%})  "
+                  f"archive_quant={entry['archive_quant_formatted']}  impl={stats.impl}")
 
-            for _ in range(min(31, seq_len)):
-                attention_mask = torch.ones(1, input_ids.shape[1] + 1, device=device, dtype=torch.long)
-                position_ids = torch.tensor([[input_ids.shape[1]]], device=device, dtype=torch.long)
-                outputs = model(input_ids=next_token, attention_mask=attention_mask,
-                                position_ids=position_ids, use_cache=False)
-                next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
-                if coordinator is not None:
-                    coordinator.on_new_token()
-
-            metrics = collect_kv_metrics(model)
-            bl = _compute_baseline_kv(model_cfg, seq_len + 32)
-
-            entry = {
-                "seq_len": seq_len,
-                "mode": args.mode,
-                "baseline_total_bytes": bl["baseline_total_bytes"],
-                "baseline_formatted": bl["baseline_total_formatted"],
-                "total_runtime_bytes": metrics["total_runtime_bytes"],
-                "compressed_storage_bytes": metrics["compressed_storage_bytes"],
-                "runtime_formatted": format_nbytes(metrics["total_runtime_bytes"]),
-                "compressed_formatted": format_nbytes(metrics["compressed_storage_bytes"]),
-                "runtime_saving_ratio": metrics["runtime_saving_ratio"],
-                "compressed_saving_ratio": metrics["compressed_saving_ratio"],
-                "recent_tokens": metrics["total_recent_tokens"],
-                "archive_tokens": metrics["total_archive_tokens"],
-                "per_layer": metrics["per_layer"],
-            }
-            all_results.append(entry)
-
-            print(f"\n--- seq_len={seq_len} ---")
-            print(f"  baseline: {entry['baseline_formatted']}")
-            print(f"  [runtime]  {entry['runtime_formatted']}  saving={entry['runtime_saving_ratio']:.1%}")
-            print(f"  [compressed storage]  {entry['compressed_formatted']}  saving={entry['compressed_saving_ratio']:.1%}")
-            print(f"  recent={entry['recent_tokens']}  archive={entry['archive_tokens']}")
-    else:
-        for seq_len in args.seq_lens:
-            bl = _compute_baseline_kv(model_cfg, seq_len)
-            entry = {
-                "seq_len": seq_len,
-                "mode": args.mode,
-                "baseline_total_bytes": bl["baseline_total_bytes"],
-                "baseline_formatted": bl["baseline_total_formatted"],
-                "kv_total_bytes": bl["baseline_total_bytes"],
-                "kv_formatted": bl["baseline_total_formatted"],
-                "saving_ratio": 0.0,
-                "recent_tokens": seq_len,
-                "archive_tokens": 0,
-                "per_layer": [],
-            }
-            all_results.append(entry)
-            print(f"  seq_len={seq_len}: baseline={entry['baseline_formatted']}  (no compression)")
-
-    print(f"\n{'='*60}")
-    print(f"{'seq_len':>8} {'mode':>18} {'baseline':>12} {'runtime':>12} {'compressed':>12} {'rt_save':>8} {'cmp_save':>8}")
-    print("-" * 82)
+    print(f"\n{'='*100}")
+    print(f"{'seq_len':>8} {'mode':>18} {'KV_ratio':>8} {'model_B/tok':>12} {'Overhead':>9} {'cache_rt':>12} {'peak_gpu':>12} {'recent%':>8} {'archive%':>8}")
+    print("-" * 100)
     for r in all_results:
-        rt_fmt = r.get('runtime_formatted', format_nbytes(r.get('kv_total_bytes', 0)))
-        cmp_fmt = r.get('compressed_formatted', rt_fmt)
-        rt_save = r.get('runtime_saving_ratio', r.get('saving_ratio', 0.0))
-        cmp_save = r.get('compressed_saving_ratio', 0.0)
-        print(f"{r['seq_len']:>8d} {r['mode']:>18} {r['baseline_formatted']:>12} "
-              f"{rt_fmt:>12} {cmp_fmt:>12} {rt_save:>7.1%} {cmp_save:>7.1%}")
+        cr = f"{r['kv_compression_ratio']:.1f}x" if r['kv_compression_ratio'] > 0 else "N/A"
+        bpt = f"{r['model_bytes_per_token']:.1f}" if r['model_bytes_per_token'] > 0 else "N/A"
+        oh = f"{r['memory_overhead_ratio']:.1f}x" if r['memory_overhead_ratio'] > 0 else "N/A"
+        rr = f"{r['recent_ratio']:.0%}" if r['recent_ratio'] > 0 else "-"
+        ar = f"{r['archive_ratio']:.0%}" if r['archive_ratio'] > 0 else "-"
+        print(f"{r['seq_len']:>8d} {r['mode']:>18} {cr:>8} {bpt:>12} {oh:>9} "
+              f"{r['cache_runtime_formatted']:>12} {r['peak_gpu_formatted']:>12} {rr:>8} {ar:>8}")
 
     if args.output:
         out_path = Path(args.output)

@@ -65,7 +65,8 @@ def test_gamma_on_logits_differs_from_gamma_on_output():
 def test_real_attention_path_uses_gamma_in_logits_if_accessible():
     d, r_k, r_v = 64, 16, 16
 
-    attn = HAWPAttention(_make_config(), layer_idx=0, r_k=r_k, r_v=r_v)
+    attn = HAWPAttention(_make_config(), layer_idx=0, r_k=r_k, r_v=r_v,
+                         gamma_mode="fixed", gamma_value=None)
     torch.manual_seed(99)
     P = orthogonalize(torch.randn(d, d))
     attn.p_k.data.copy_(P)

@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import json
 import random
-from pathlib import Path
+from typing import Callable, Optional
 
 import torch
 
@@ -63,7 +62,19 @@ def run_needle_test(
     needle: str = "7294",
     device: str = "cpu",
     max_new_tokens: int = 32,
+    generate_fn: Optional[Callable[[str], str]] = None,
+    reset_fn: Optional[Callable[[], None]] = None,
 ) -> list[dict]:
+    """Run needle-in-a-haystack test.
+
+    Args:
+        generate_fn: If provided, called as ``generate_fn(prompt) -> str``
+            to produce model output.  This allows the caller to use any
+            mode-specific generation path (hawp_quant, sched, etc.).
+            If *None*, falls back to ``model.generate()`` (baseline only).
+        reset_fn: If provided, called before each test case to reset
+            any internal caches (quant cache, coordinator, kv_manager).
+    """
     if context_lens is None:
         context_lens = [512, 1024, 2048]
     if depths is None:
@@ -72,17 +83,24 @@ def run_needle_test(
     results = []
     for ctx_len in context_lens:
         for depth in depths:
+            if reset_fn is not None:
+                reset_fn()
+
             prompt, needle_text = _make_needle_haystack(
                 needle, ctx_len, depth, tokenizer,
             )
-            input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
 
-            outputs = model.generate(
-                input_ids=input_ids,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-            )
-            generated = tokenizer.decode(outputs[0][input_ids.shape[1]:], skip_special_tokens=True)
+            if generate_fn is not None:
+                generated = generate_fn(prompt)
+            else:
+                input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+                outputs = model.generate(
+                    input_ids=input_ids,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                )
+                generated = tokenizer.decode(outputs[0][input_ids.shape[1]:], skip_special_tokens=True)
+
             found = needle in generated
 
             results.append({

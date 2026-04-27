@@ -27,7 +27,7 @@ def _make_hawp_quant_all(n_heads=4, head_dim=16, r_k=8, r_v=8):
     return attn
 
 
-def test_quant_cache_summary_counts_raw_archive():
+def test_quant_cache_summary_counts_quant_archive():
     attn = _make_hawp_quant_all(n_heads=2, head_dim=16, r_k=8, r_v=8)
 
     nkv, seq, rk, rv = 2, 10, 8, 8
@@ -36,22 +36,20 @@ def test_quant_cache_summary_counts_raw_archive():
 
     s0 = attn.quant_cache_summary()
     assert s0["recent_fp_bytes"] == 0
-    assert s0["archive_raw_bytes"] == 0
     assert s0["archive_quant_bytes"] == 0
+    assert s0["archive_meta_bytes"] == 0
     assert s0["total_runtime_bytes"] == 0
     assert s0["compressed_storage_bytes"] == 0
+    assert "archive_raw_bytes" not in s0
 
     attn._quant_cache_append_to_archive(k_lat, v_lat)
     s1 = attn.quant_cache_summary()
 
-    expected_raw = nkv * seq * rk * 4 + nkv * seq * rv * 4
-    assert s1["archive_raw_bytes"] == expected_raw
-
     assert s1["archive_quant_bytes"] > 0
-    assert s1["archive_quant_bytes"] < expected_raw
+    assert s1["archive_meta_bytes"] > 0
 
     assert s1["recent_fp_bytes"] == 0
-    assert s1["total_runtime_bytes"] == s1["recent_fp_bytes"] + s1["archive_raw_bytes"] + s1["archive_quant_bytes"]
+    assert s1["total_runtime_bytes"] == s1["recent_fp_bytes"] + s1["archive_quant_bytes"] + s1["archive_meta_bytes"]
     assert s1["compressed_storage_bytes"] == s1["archive_quant_bytes"]
 
     k_lat_2 = torch.randn(1, nkv, 5, rk)
@@ -59,13 +57,12 @@ def test_quant_cache_summary_counts_raw_archive():
     attn._quant_cache_append_to_archive(k_lat_2, v_lat_2)
     s2 = attn.quant_cache_summary()
 
-    expected_raw_2 = nkv * 15 * rk * 4 + nkv * 15 * rv * 4
-    assert s2["archive_raw_bytes"] == expected_raw_2
     assert s2["archive_quant_bytes"] > 0
-    assert s2["archive_quant_bytes"] < expected_raw_2
-    assert s2["total_runtime_bytes"] == s2["recent_fp_bytes"] + s2["archive_raw_bytes"] + s2["archive_quant_bytes"]
+    assert s2["archive_meta_bytes"] > 0
+    assert s2["total_runtime_bytes"] == s2["recent_fp_bytes"] + s2["archive_quant_bytes"] + s2["archive_meta_bytes"]
     assert s2["compressed_storage_bytes"] == s2["archive_quant_bytes"]
 
+    assert "archive_raw_bytes" not in s2
     assert "total_bytes" not in s2
     assert "recent_bytes" not in s2
     assert "archive_bytes" not in s2

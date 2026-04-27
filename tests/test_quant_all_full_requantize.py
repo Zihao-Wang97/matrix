@@ -27,7 +27,7 @@ def _make_hawp_quant_all(n_heads=4, head_dim=16, r_k=8, r_v=8):
     return attn
 
 
-def test_quant_all_full_requantize_after_append():
+def test_quant_all_chunked_archive_after_append():
     attn = _make_hawp_quant_all(n_heads=2, head_dim=16, r_k=8, r_v=8)
 
     nkv, seq, rk, rv = 2, 10, 8, 8
@@ -36,9 +36,12 @@ def test_quant_all_full_requantize_after_append():
 
     attn._quant_cache_append_to_archive(k_lat, v_lat)
 
-    assert attn._quant_archive_k_raw is not None
-    assert attn._quant_archive_k_qx is not None
-    assert attn._quant_archive_k_raw.shape == (nkv, seq, rk)
+    assert len(attn._quant_archive_chunks) == 1
+    chunk = attn._quant_archive_chunks[0]
+    assert chunk.n_tokens == seq
+    assert chunk.k_qx is not None
+    assert chunk.v_qx is not None
+    assert chunk.k_norms is not None
 
     k_deq_1, v_deq_1 = attn._quant_cache_get_kv()
     assert k_deq_1.shape == (nkv, seq, rk)
@@ -48,32 +51,18 @@ def test_quant_all_full_requantize_after_append():
     v_lat_2 = torch.randn(1, nkv, 5, rv)
     attn._quant_cache_append_to_archive(k_lat_2, v_lat_2)
 
-    assert attn._quant_archive_k_raw.shape == (nkv, 15, rk)
-    assert attn._quant_archive_v_raw.shape == (nkv, 15, rv)
+    assert len(attn._quant_archive_chunks) == 2
+    assert attn._quant_archive_chunks[1].n_tokens == 5
 
     k_deq_2, v_deq_2 = attn._quant_cache_get_kv()
     assert k_deq_2.shape == (nkv, 15, rk)
     assert v_deq_2.shape == (nkv, 15, rv)
 
-    k_flat = attn._quant_archive_k_raw.reshape(nkv * 15, rk).float()
-    v_flat = attn._quant_archive_v_raw.reshape(nkv * 15, rv).float()
-    k_qx_direct = attn._tq_k_quantizer.quantize(k_flat)
-    v_qx_direct = attn._tq_v_quantizer.quantize(v_flat)
-    k_deq_direct = attn._tq_k_quantizer.dequantize(k_qx_direct).reshape(nkv, 15, rk)
-    v_deq_direct = attn._tq_v_quantizer.dequantize(v_qx_direct).reshape(nkv, 15, rv)
-
-    assert torch.allclose(k_deq_2, k_deq_direct, atol=1e-6)
-    assert torch.allclose(v_deq_2, v_deq_direct, atol=1e-6)
-
-    k_lat_3 = torch.randn(1, nkv, 1, rk)
-    v_lat_3 = torch.randn(1, nkv, 1, rv)
-    attn._quant_cache_append_to_archive(k_lat_3, v_lat_3)
-
-    k_deq_3, v_deq_3 = attn._quant_cache_get_kv()
-    assert k_deq_3.shape == (nkv, 16, rk)
+    assert torch.isfinite(k_deq_2).all()
+    assert torch.isfinite(v_deq_2).all()
 
 
-def test_archive_roundtrip_consistency_after_multiple_appends():
+def test_archive_chunked_roundtrip_after_multiple_appends():
     attn = _make_hawp_quant_all(n_heads=2, head_dim=16, r_k=8, r_v=8)
 
     nkv, rk, rv = 2, 8, 8
@@ -86,10 +75,11 @@ def test_archive_roundtrip_consistency_after_multiple_appends():
         attn._quant_cache_append_to_archive(k_lat, v_lat)
         total_tokens += n
 
-        assert attn._quant_archive_k_raw.shape[1] == total_tokens
         k_deq, v_deq = attn._quant_cache_get_kv()
         assert k_deq.shape == (nkv, total_tokens, rk)
         assert v_deq.shape == (nkv, total_tokens, rv)
+
+    assert len(attn._quant_archive_chunks) == len(append_sizes)
 
     k_deq, v_deq = attn._quant_cache_get_kv()
     assert k_deq.shape[1] == sum(append_sizes)

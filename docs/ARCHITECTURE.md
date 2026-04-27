@@ -322,7 +322,7 @@ hooks + collector    projector_trainer      compressor
 | `QuantConfig` | `k_method`(turbo_prod), `v_method`(turbo_mse), `k_bits`(4), `v_bits`(8), `use_rotation` |
 | `SchedConfig` | `total_budget`, `recent_window`, `high_ratio`, `low_ratio`, `drop_strategy`(position/norm) |
 | `CalibConfig` | `nsamples`, `seq_len`, `dataset` |
-| `RankSearchConfig` | `rank_candidates`, `tolerance` |
+| `RankSearchConfig` | `rank_candidates`, `relative_tolerance` |
 
 **工厂函数：**
 

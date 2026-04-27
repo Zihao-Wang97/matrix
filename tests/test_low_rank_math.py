@@ -68,6 +68,9 @@ class TestLowRankProjectionReconstructionFormula:
 class TestGammaAppliedOnLogitsNotOutput:
     def test_gamma_does_not_multiply_output(self):
         attn = _make_attn(r_k=16, r_v=16)
+        attn.logit_scale_mode = "rk"
+        attn.gamma_mode = "fixed"
+        attn.gamma_value = None
         attn.p_k.data.normal_()
         attn.p_v.data.normal_()
         attn.gamma.data.fill_(2.5)
@@ -87,6 +90,9 @@ class TestGammaAppliedOnLogitsNotOutput:
 
     def test_gamma_scales_logits_not_value_path(self):
         attn = _make_attn(r_k=16, r_v=16)
+        attn.logit_scale_mode = "rk"
+        attn.gamma_mode = "fixed"
+        attn.gamma_value = None
         attn.p_k.data.normal_()
         attn.p_v.data.normal_()
         attn.eval()
@@ -118,6 +124,9 @@ class TestGammaAppliedOnLogitsNotOutput:
 class TestLowRankScalingUsesRk:
     def test_logits_scaled_by_sqrt_rk_not_head_dim(self):
         attn = _make_attn(r_k=16, r_v=16)
+        attn.logit_scale_mode = "rk"
+        attn.gamma_mode = "fixed"
+        attn.gamma_value = None
         attn.p_k.data.normal_()
         attn.p_v.data.normal_()
         attn.gamma.data.fill_(1.0)
@@ -199,6 +208,11 @@ class TestFullRankIdentityEquivalence:
         v = v.view(1, 4, 4, 64).transpose(1, 2)
 
         logits = q @ k.transpose(2, 3)
+        causal_mask = torch.triu(
+            torch.full((4, 4), float("-inf"), dtype=logits.dtype, device=logits.device),
+            diagonal=1,
+        ).unsqueeze(0).unsqueeze(0)
+        logits = logits + causal_mask
         weights = torch.softmax(logits, dim=-1)
         attn_out = (weights @ v).transpose(1, 2).reshape(1, 4, 256)
         baseline_out = attn.o_proj(attn_out)

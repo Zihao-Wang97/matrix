@@ -57,7 +57,8 @@ def test_low_rank_logits_use_sqrt_rk_not_head_dim():
 def test_real_low_rank_logits_scaling_matches_rk_if_accessible():
     d, r_k, r_v = 64, 16, 16
 
-    attn = HAWPAttention(_make_config(), layer_idx=0, r_k=r_k, r_v=r_v)
+    attn = HAWPAttention(_make_config(), layer_idx=0, r_k=r_k, r_v=r_v,
+                         logit_scale_mode="rk", gamma_mode="fixed", gamma_value=None)
     torch.manual_seed(7)
     P_k = orthogonalize(torch.randn(d, d))
     P_v = orthogonalize(torch.randn(d, d))

@@ -79,7 +79,7 @@ def test_hawp_prefill_attention_is_causal():
     x = torch.randn(1, seq_len, 256)
 
     with torch.no_grad():
-        _, attn_weights, _ = attn(x, attention_mask=None, use_cache=False)
+        _, attn_weights, _ = attn(x, attention_mask=None, use_cache=True)
 
     assert attn_weights is not None
     assert attn_weights.shape[-2:] == (seq_len, seq_len)
@@ -104,13 +104,13 @@ def test_hawp_prefill_with_explicit_mask_matches_auto_mask():
     causal_mask = _make_causal_mask(seq_len, seq_len, x.device, x.dtype)
 
     with torch.no_grad():
-        out_auto = attn(x, attention_mask=None, use_cache=False)[0].clone()
+        out_auto = attn(x, attention_mask=None, use_cache=True)[0].clone()
 
     attn.reset_quant_cache()
     _setup_quant_cache(attn, recent_window=64)
 
     with torch.no_grad():
-        out_explicit = attn(x, attention_mask=causal_mask, use_cache=False)[0].clone()
+        out_explicit = attn(x, attention_mask=causal_mask, use_cache=True)[0].clone()
 
     assert torch.allclose(out_auto, out_explicit, atol=1e-5), (
         "Auto causal mask should produce same result as explicit causal mask"
@@ -126,7 +126,7 @@ def test_hawp_prefill_no_mask_differs_from_bidirectional():
     x = torch.randn(1, seq_len, 256)
 
     with torch.no_grad():
-        out_causal, weights_causal, _ = attn(x, attention_mask=None, use_cache=False)
+        out_causal, weights_causal, _ = attn(x, attention_mask=None, use_cache=True)
 
     n_heads = attn.num_heads
     head_dim = attn.head_dim
@@ -169,11 +169,11 @@ def test_hawp_decode_single_token_path_is_valid():
     torch.manual_seed(3)
     x_prefill = torch.randn(1, 4, 256)
     with torch.no_grad():
-        attn(x_prefill, attention_mask=None, use_cache=False)
+        attn(x_prefill, attention_mask=None, use_cache=True)
 
     x_decode = torch.randn(1, 1, 256)
     with torch.no_grad():
-        out, weights, _ = attn(x_decode, attention_mask=None, use_cache=False)
+        out, weights, _ = attn(x_decode, attention_mask=None, use_cache=True)
 
     assert out.shape == (1, 1, 256), f"Decode output shape should be (1,1,256), got {out.shape}"
     assert weights.shape[-2] == 1, f"Decode should have q_len=1, got {weights.shape[-2]}"
@@ -194,7 +194,7 @@ def test_hawp_builds_causal_mask_when_needed_if_accessible():
         wraps=_make_causal_mask,
     ) as mock_mask:
         with torch.no_grad():
-            attn(x, attention_mask=None, use_cache=False)
+            attn(x, attention_mask=None, use_cache=True)
         mock_mask.assert_called_once_with(
             seq_len, seq_len, torch.device("cpu"), torch.float32,
         )

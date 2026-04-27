@@ -45,14 +45,15 @@ def test_profile_reports_runtime_and_compressed_bytes():
 
     assert "total_runtime_bytes" in metrics
     assert "compressed_storage_bytes" in metrics
-    assert "archive_raw_bytes" in metrics
     assert "archive_quant_bytes" in metrics
+    assert "archive_meta_bytes" in metrics
     assert "recent_fp_bytes" in metrics
     assert "runtime_saving_ratio" in metrics
     assert "compressed_saving_ratio" in metrics
     assert metrics["total_runtime_bytes"] > 0
     assert metrics["compressed_storage_bytes"] > 0
     assert metrics["compressed_storage_bytes"] <= metrics["total_runtime_bytes"]
+    assert "archive_raw_bytes" not in metrics
 
     assert "total_bytes" not in metrics
     assert "recent_bytes" not in metrics

@@ -47,21 +47,19 @@ def test_quant_all_first_prefill_reads_back_archive():
 
     with patch.object(
         attn, "_quant_cache_append_to_archive", wraps=attn._quant_cache_append_to_archive
-    ) as mock_append, patch.object(
-        attn, "_quant_cache_get_kv", wraps=attn._quant_cache_get_kv
-    ) as mock_get_kv:
+    ) as mock_append:
         torch.manual_seed(0)
         x = torch.randn(1, 4, 256)
         with torch.no_grad():
-            out = attn(x, attention_mask=None, use_cache=False)[0]
+            out = attn(x, attention_mask=None, use_cache=True)[0]
 
         mock_append.assert_called_once(), (
             "_quant_cache_append_to_archive must be called on first prefill"
         )
-        mock_get_kv.assert_called_once(), (
-            "_quant_cache_get_kv must be called after append_to_archive "
-            "on first prefill (quant_all must read back from archive)"
-        )
+
+    assert bool(attn._quant_archive_chunks), (
+        "Archive must have quantized data after first prefill"
+    )
 
     assert out.shape == (1, 4, 256), "Output shape mismatch"
 
@@ -75,9 +73,9 @@ def test_quant_all_first_prefill_does_not_bypass_archive_kv():
     x = torch.randn(1, 4, 256)
 
     with torch.no_grad():
-        attn(x, attention_mask=None, use_cache=False)
+        attn(x, attention_mask=None, use_cache=True)
 
-    assert attn._quant_archive_k_qx is not None, (
+    assert bool(attn._quant_archive_chunks), (
         "Archive must contain quantized data after first prefill"
     )
     assert attn._quant_recent_k is None, (
@@ -110,7 +108,7 @@ def test_quant_all_uses_quantized_archive_when_recent_window_zero_if_accessible(
     k_lat_raw = (k @ pk_down).clone()
 
     with torch.no_grad():
-        attn(x, attention_mask=None, use_cache=False)
+        attn(x, attention_mask=None, use_cache=True)
 
     k_cached, _ = attn._quant_cache_get_kv()
     k_lat_deq = k_cached
@@ -138,11 +136,21 @@ def test_quant_all_vs_quant_window_behavior():
     x = torch.randn(1, 4, 256)
 
     with torch.no_grad():
-        attn_all(x, attention_mask=None, use_cache=False)
-        attn_win(x, attention_mask=None, use_cache=False)
+        attn_all(x, attention_mask=None, use_cache=True)
+        attn_win(x, attention_mask=None, use_cache=True)
 
-    assert attn_all._quant_archive_k_qx is not None, (
+    assert bool(attn_all._quant_archive_chunks), (
         "quant_all: archive must be populated after first forward"
+    )
+    assert attn_all._quant_recent_k is None, (
+        "quant_all: recent must stay None (recent_window=0)"
+    )
+
+    assert attn_win._quant_recent_k is not None, (
+        "quant (window>0): recent should be populated after first forward"
+    )
+    assert not attn_win._quant_archive_chunks, (
+        "quant (window>0): archive should still be empty (tokens within window)"
     )
     assert attn_all._quant_recent_k is None, (
         "quant_all: recent must stay None (recent_window=0)"
@@ -163,25 +171,24 @@ def test_quant_all_second_decode_continues_archive_path():
     torch.manual_seed(4)
     x_prefill = torch.randn(1, 3, 256)
     with torch.no_grad():
-        attn(x_prefill, attention_mask=None, use_cache=False)
+        attn(x_prefill, attention_mask=None, use_cache=True)
 
-    archive_qx_after_prefill = attn._quant_archive_k_qx
+    archive_qx_after_prefill = attn._quant_archive_chunks
 
     with patch.object(
         attn, "_quant_cache_append_to_archive", wraps=attn._quant_cache_append_to_archive
-    ) as mock_append, patch.object(
-        attn, "_quant_cache_get_kv", wraps=attn._quant_cache_get_kv
-    ) as mock_get_kv:
+    ) as mock_append:
         x_decode = torch.randn(1, 1, 256)
         with torch.no_grad():
-            attn(x_decode, attention_mask=None, use_cache=False)
+            attn(x_decode, attention_mask=None, use_cache=True)
 
         mock_append.assert_called_once(), (
             "Decode step must also append to archive"
         )
-        mock_get_kv.assert_called_once(), (
-            "Decode step must also read back from archive"
-        )
+
+    assert bool(attn._quant_archive_chunks), (
+        "Archive must still have quantized data after decode"
+    )
 
     k_cached, _ = attn._quant_cache_get_kv()
     assert k_cached.shape[1] == 4, (

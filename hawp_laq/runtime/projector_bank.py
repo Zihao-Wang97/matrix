@@ -42,6 +42,15 @@ def load_projectors(model: torch.nn.Module, projector_dir: str | Path, strict: b
             if not pt_path.exists():
                 continue
             data = torch.load(pt_path, map_location="cpu", weights_only=True)
+            if module.gamma_mode == "learned" and not data.get("causal_mask", False):
+                import warnings
+                warnings.warn(
+                    f"Layer {module.layer_idx}: projector was trained without causal mask "
+                    f"but gamma_mode='learned' will apply gamma during inference. "
+                    f"This may cause quality regression. Consider retraining projectors.",
+                    UserWarning,
+                    stacklevel=2,
+                )
             module.load_projector_data(data, strict=strict)
 
 

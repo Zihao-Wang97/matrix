@@ -30,7 +30,7 @@ class TestTurboQuantProdQuantize:
         x = torch.randn(20, 32)
         qx = tq.quantize(x)
         assert isinstance(qx, TurboQuantProdResult)
-        assert qx.residual_sign.shape == (20, 32)
+        assert qx.residual_sign.shape == (20, 4)
         assert qx.residual_norm.shape == (20,)
         assert qx.shape_orig == (20, 32)
 
@@ -39,18 +39,18 @@ class TestTurboQuantProdQuantize:
         x = torch.randn(2, 10, 32)
         qx = tq.quantize(x)
         assert qx.shape_orig == (2, 10, 32)
-        assert qx.residual_sign.shape == (20, 32)
+        assert qx.residual_sign.shape == (20, 4)
 
     def test_dim_mismatch_raises(self):
         tq = TurboQuantProd(dim=32, bits=4)
         with pytest.raises(ValueError, match="last dim"):
             tq.quantize(torch.randn(10, 16))
 
-    def test_residual_sign_is_bool(self):
+    def test_residual_sign_is_packed(self):
         tq = TurboQuantProd(dim=32, bits=4, use_rotation=False)
         x = torch.randn(10, 32)
         qx = tq.quantize(x)
-        assert qx.residual_sign.dtype == torch.bool
+        assert qx.residual_sign.dtype == torch.uint8
 
     def test_residual_norm_nonnegative(self):
         tq = TurboQuantProd(dim=32, bits=4, use_rotation=False)

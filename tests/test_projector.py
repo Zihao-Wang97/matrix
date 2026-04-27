@@ -12,10 +12,11 @@ class TestProjectorModule:
         q = torch.randn(2, 8, d_model)
         k = torch.randn(2, 8, d_model)
         v = torch.randn(2, 8, d_model)
-        logits_fp, logits_hat, attn_out, attn_out_hat, k_recon, v_recon = mod(q, k, v)
+        logits_fp, logits_hat, causal_valid, attn_out, attn_out_hat, k_recon, v_recon = mod(q, k, v)
         head_dim = d_model // n_heads
         assert logits_fp.shape == (2, n_heads, 8, 8)
         assert logits_hat.shape == (2, n_heads, 8, 8)
+        assert causal_valid.shape == (1, 1, 8, 8)
         assert attn_out.shape == (2, n_heads, 8, head_dim)
         assert attn_out_hat.shape == (2, n_heads, 8, head_dim)
         assert k_recon.shape == (2, 8, d_model)
@@ -33,8 +34,9 @@ class TestProjectorModule:
         q = torch.randn(1, 4, 32)
         k = torch.randn(1, 4, 32)
         v = torch.randn(1, 4, 32)
-        logits_fp, logits_hat, attn_out, attn_out_hat, k_recon, v_recon = mod(q, k, v)
-        loss = F.mse_loss(logits_hat, logits_fp) + F.mse_loss(attn_out_hat, attn_out) + F.mse_loss(v_recon, v)
+        logits_fp, logits_hat, causal_valid, attn_out, attn_out_hat, k_recon, v_recon = mod(q, k, v)
+        mask = causal_valid.expand_as(logits_hat)
+        loss = F.mse_loss(logits_hat[mask], logits_fp[mask]) + F.mse_loss(attn_out_hat, attn_out) + F.mse_loss(v_recon, v)
         loss.backward()
         assert mod.p_k_basis.grad is not None
         assert mod.p_v_basis.grad is not None
@@ -49,13 +51,13 @@ class TestProjectorModule:
         q = torch.randn(1, 4, d_model)
         k = torch.randn(1, 4, d_model)
         v = torch.randn(1, 4, d_model)
-        logits_fp, logits_hat, attn_out, attn_out_hat, k_recon, v_recon = mod(q, k, v)
+        logits_fp, logits_hat, causal_valid, attn_out, attn_out_hat, k_recon, v_recon = mod(q, k, v)
         assert logits_hat.shape == logits_fp.shape
         assert attn_out_hat.shape == attn_out.shape
 
 
 class TestProjectorTrainer:
-    def test_train_one_group_loss_decreases(self):
+    def test_train_one_group_converges(self):
         torch.manual_seed(42)
         d_model, rank_k, rank_v, n_heads = 32, 8, 8, 4
         q = torch.randn(2, 8, d_model)
@@ -64,7 +66,7 @@ class TestProjectorTrainer:
         trainer = ProjectorTrainer(d_model, rank_k, rank_v, n_heads, lr=1e-2, orthogonalize_every=5, device="cpu")
         result = trainer.train_one_group(q, k, v, n_steps=50)
         losses = result["metrics"]["total"]
-        assert losses[-1] < losses[0], f"loss did not decrease: {losses[0]:.6f} -> {losses[-1]:.6f}"
+        assert losses[-1] < 1e-3, f"loss did not converge: {losses[-1]:.6f}"
 
     def test_result_keys_and_shapes(self):
         d_model, rank_k, rank_v, n_heads = 32, 8, 6, 4

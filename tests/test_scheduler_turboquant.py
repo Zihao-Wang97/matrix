@@ -55,19 +55,32 @@ class TestComputeDropCount:
 
         sched.on_new_token()
         assert sched.compute_drop_count() == 1
+        sched.acknowledge_drop(1)
 
         sched.on_new_token()
         assert sched.compute_drop_count() == 1
+        sched.acknowledge_drop(1)
+
+    def test_incremental_drop_partial_ack(self):
+        sched = TokenBudgetScheduler(total_budget=20, recent_window=4)
+        sched.on_tokens(22)
+        assert sched.compute_drop_count() == 2
+        sched.acknowledge_drop(1)
+        assert sched.compute_drop_count() == 1
+        sched.acknowledge_drop(1)
+        assert sched.compute_drop_count() == 0
 
     def test_batch_on_tokens(self):
         sched = TokenBudgetScheduler(total_budget=20, recent_window=4)
         sched.on_tokens(30)
         assert sched.compute_drop_count() == 10
+        sched.acknowledge_drop(10)
 
     def test_reset_clears_drop_tracking(self):
         sched = TokenBudgetScheduler(total_budget=10, recent_window=2)
         sched.on_tokens(20)
         _ = sched.compute_drop_count()
+        sched.acknowledge_drop(10)
         sched.reset()
         assert sched.seq_len == 0
         sched.on_tokens(5)
@@ -126,48 +139,33 @@ class TestDropOldestFromArchive:
     def test_drop_from_archive(self):
         attn = _make_hawp_attn(recent_window=4)
         nkv = 8
-        k_raw = torch.randn(nkv, 10, 8)
-        v_raw = torch.randn(nkv, 10, 8)
-        attn._quant_archive_k_raw = k_raw
-        attn._quant_archive_v_raw = v_raw
-        from hawp_laq.runtime.turboquant import TurboQuantProd, TurboQuantMSE
-        k_flat = k_raw.reshape(nkv * 10, 8).float()
-        v_flat = v_raw.reshape(nkv * 10, 8).float()
-        attn._quant_archive_k_qx = attn._tq_k_quantizer.quantize(k_flat)
-        attn._quant_archive_v_qx = attn._tq_v_quantizer.quantize(v_flat)
+        k_lat = torch.randn(1, nkv, 10, 8)
+        v_lat = torch.randn(1, nkv, 10, 8)
+        attn._quant_cache_append_to_archive(k_lat, v_lat)
 
         dropped = attn.drop_oldest_from_archive(3)
         assert dropped == 3
-        assert attn._quant_archive_k_raw.shape[1] == 7
-        assert attn._quant_archive_v_raw.shape[1] == 7
-        assert attn._quant_archive_k_qx is not None
+        remaining = sum(c.n_tokens for c in attn._quant_archive_chunks)
+        assert remaining == 7
+        assert bool(attn._quant_archive_chunks)
 
     def test_drop_more_than_archive(self):
         attn = _make_hawp_attn(recent_window=4)
         nkv = 8
-        k_raw = torch.randn(nkv, 5, 8)
-        v_raw = torch.randn(nkv, 5, 8)
-        attn._quant_archive_k_raw = k_raw
-        attn._quant_archive_v_raw = v_raw
+        k_lat = torch.randn(1, nkv, 5, 8)
+        v_lat = torch.randn(1, nkv, 5, 8)
+        attn._quant_cache_append_to_archive(k_lat, v_lat)
 
         dropped = attn.drop_oldest_from_archive(10)
         assert dropped == 5
-        assert attn._quant_archive_k_raw is None
-        assert attn._quant_archive_v_raw is None
-        assert attn._quant_archive_k_qx is None
-        assert attn._quant_archive_v_qx is None
+        assert not attn._quant_archive_chunks
 
     def test_drop_then_get_kv(self):
         attn = _make_hawp_attn(recent_window=4)
         nkv = 8
-        k_raw = torch.randn(nkv, 10, 8)
-        v_raw = torch.randn(nkv, 10, 8)
-        attn._quant_archive_k_raw = k_raw
-        attn._quant_archive_v_raw = v_raw
-        k_flat = k_raw.reshape(nkv * 10, 8).float()
-        v_flat = v_raw.reshape(nkv * 10, 8).float()
-        attn._quant_archive_k_qx = attn._tq_k_quantizer.quantize(k_flat)
-        attn._quant_archive_v_qx = attn._tq_v_quantizer.quantize(v_flat)
+        k_lat = torch.randn(1, nkv, 10, 8)
+        v_lat = torch.randn(1, nkv, 10, 8)
+        attn._quant_cache_append_to_archive(k_lat, v_lat)
 
         attn.drop_oldest_from_archive(4)
 
@@ -189,20 +187,16 @@ class TestDropLeastImportantFromArchive:
     def test_drop_by_norm(self):
         attn = _make_hawp_attn(recent_window=4)
         nkv = 8
-        k_raw = torch.randn(nkv, 10, 8)
-        v_raw = torch.randn(nkv, 10, 8)
-        k_raw[:, 0, :] = 0.001
-        k_raw[:, 1, :] = 0.001
-        attn._quant_archive_k_raw = k_raw
-        attn._quant_archive_v_raw = v_raw
-        k_flat = k_raw.reshape(nkv * 10, 8).float()
-        v_flat = v_raw.reshape(nkv * 10, 8).float()
-        attn._quant_archive_k_qx = attn._tq_k_quantizer.quantize(k_flat)
-        attn._quant_archive_v_qx = attn._tq_v_quantizer.quantize(v_flat)
+        k_lat = torch.randn(1, nkv, 10, 8)
+        v_lat = torch.randn(1, nkv, 10, 8)
+        k_lat[0, :, 0, :] = 0.001
+        k_lat[0, :, 1, :] = 0.001
+        attn._quant_cache_append_to_archive(k_lat, v_lat)
 
         dropped = attn.drop_least_important_from_archive(2)
         assert dropped == 2
-        assert attn._quant_archive_k_raw.shape[1] == 8
+        remaining = sum(c.n_tokens for c in attn._quant_archive_chunks)
+        assert remaining == 8
 
 
 # ======================================================================
@@ -255,12 +249,9 @@ class TestModelCacheCoordinator:
         attn.setup_quant_cache(kq, vq, recent_window=4)
 
         nkv = 8
-        attn._quant_archive_k_raw = torch.randn(nkv, 30, 8)
-        attn._quant_archive_v_raw = torch.randn(nkv, 30, 8)
-        k_flat = attn._quant_archive_k_raw.reshape(nkv * 30, 8).float()
-        v_flat = attn._quant_archive_v_raw.reshape(nkv * 30, 8).float()
-        attn._quant_archive_k_qx = attn._tq_k_quantizer.quantize(k_flat)
-        attn._quant_archive_v_qx = attn._tq_v_quantizer.quantize(v_flat)
+        k_lat = torch.randn(1, nkv, 30, 8)
+        v_lat = torch.randn(1, nkv, 30, 8)
+        attn._quant_cache_append_to_archive(k_lat, v_lat)
 
         class _FakeModel(torch.nn.Module):
             def __init__(self, attn):
@@ -275,8 +266,101 @@ class TestModelCacheCoordinator:
         coord.on_prefill(50)
         d = sched.rebalance()
         assert d.n_drop > 0
-        remaining_archive = attn._quant_archive_k_raw.shape[1] if attn._quant_archive_k_raw is not None else 0
+        remaining_archive = sum(c.n_tokens for c in attn._quant_archive_chunks)
         assert remaining_archive <= d.n_low
+
+    def test_deficit_carried_when_archive_empty(self):
+        from types import SimpleNamespace
+        config = SimpleNamespace(
+            hidden_size=64,
+            num_attention_heads=8,
+            num_key_value_heads=8,
+            max_position_embeddings=2048,
+            rope_theta=10000.0,
+            model_type="",
+            enable_bias=False,
+            attention_dropout=0.0,
+        )
+        attn = HAWPAttention(config, layer_idx=0, r_k=8, r_v=8)
+
+        from hawp_laq.runtime.turboquant import TurboQuantProd, TurboQuantMSE
+        kq = TurboQuantProd(dim=8, bits=4, use_rotation=False, group_size=8)
+        vq = TurboQuantMSE(dim=8, bits=4, use_rotation=False, group_size=8)
+        attn.setup_quant_cache(kq, vq, recent_window=4)
+
+        class _FakeModel(torch.nn.Module):
+            def __init__(self, attn):
+                super().__init__()
+                self.attn = attn
+
+        sched = TokenBudgetScheduler(total_budget=10, recent_window=4)
+        coord = ModelCacheCoordinator.from_model(
+            _FakeModel(attn), sched, drop_strategy="position",
+        )
+
+        sched.on_tokens(30)
+        coord._apply_drop()
+        assert sched._prev_n_drop == 0
+        assert sched.compute_drop_count() == 20
+
+        nkv = 8
+        k_lat = torch.randn(1, nkv, 10, 8)
+        v_lat = torch.randn(1, nkv, 10, 8)
+        attn._quant_cache_append_to_archive(k_lat, v_lat)
+
+        coord._apply_drop()
+        assert sched._prev_n_drop == 10
+        remaining_archive = sum(c.n_tokens for c in attn._quant_archive_chunks)
+        assert remaining_archive == 0
+
+    def test_no_over_drop_with_asymmetric_archives(self):
+        from types import SimpleNamespace
+        config = SimpleNamespace(
+            hidden_size=64,
+            num_attention_heads=8,
+            num_key_value_heads=8,
+            max_position_embeddings=2048,
+            rope_theta=10000.0,
+            model_type="",
+            enable_bias=False,
+            attention_dropout=0.0,
+        )
+        attn0 = HAWPAttention(config, layer_idx=0, r_k=8, r_v=8)
+        attn1 = HAWPAttention(config, layer_idx=1, r_k=8, r_v=8)
+
+        from hawp_laq.runtime.turboquant import TurboQuantProd, TurboQuantMSE
+        kq = TurboQuantProd(dim=8, bits=4, use_rotation=False, group_size=8)
+        vq = TurboQuantMSE(dim=8, bits=4, use_rotation=False, group_size=8)
+        attn0.setup_quant_cache(kq, vq, recent_window=4)
+        attn1.setup_quant_cache(kq, vq, recent_window=4)
+
+        nkv = 8
+        attn0._quant_cache_append_to_archive(
+            torch.randn(1, nkv, 20, 8), torch.randn(1, nkv, 20, 8),
+        )
+        attn1._quant_cache_append_to_archive(
+            torch.randn(1, nkv, 5, 8), torch.randn(1, nkv, 5, 8),
+        )
+
+        class _FakeModel(torch.nn.Module):
+            def __init__(self, a0, a1):
+                super().__init__()
+                self.attn0 = a0
+                self.attn1 = a1
+
+        sched = TokenBudgetScheduler(total_budget=10, recent_window=4)
+        coord = ModelCacheCoordinator.from_model(
+            _FakeModel(attn0, attn1), sched, drop_strategy="position",
+        )
+
+        sched.on_tokens(50)
+        coord._apply_drop()
+
+        remaining0 = sum(c.n_tokens for c in attn0._quant_archive_chunks)
+        remaining1 = sum(c.n_tokens for c in attn1._quant_archive_chunks)
+        assert remaining1 == 0
+        assert remaining0 == 20 - 5
+        assert sched._prev_n_drop == 5
 
     def test_invalid_drop_strategy_raises(self):
         sched = TokenBudgetScheduler(total_budget=20)
@@ -331,7 +415,7 @@ class TestEndToEnd:
         prompt = "Hello, my name is"
         input_ids = tokenizer(prompt, return_tensors="pt").input_ids
 
-        outputs = model(input_ids=input_ids, use_cache=False)
+        outputs = model(input_ids=input_ids, use_cache=True)
         next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
         coord.on_prefill(input_ids.shape[1])
 
@@ -339,7 +423,7 @@ class TestEndToEnd:
         for _ in range(30):
             attention_mask = torch.ones(1, input_ids.shape[1] + len(generated), dtype=torch.long)
             position_ids = torch.tensor([[input_ids.shape[1] + len(generated) - 1]], dtype=torch.long)
-            outputs = model(input_ids=next_token, attention_mask=attention_mask, position_ids=position_ids, use_cache=False)
+            outputs = model(input_ids=next_token, attention_mask=attention_mask, position_ids=position_ids, use_cache=True)
             next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
             generated.append(next_token)
             coord.on_new_token()

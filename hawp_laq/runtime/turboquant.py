@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import torch
 
 from hawp_laq.utils.math_utils import orthogonalize
+from hawp_laq.utils.packbits import pack_uint4, unpack_uint4, pack_uint2, unpack_uint2, pack_bool, unpack_bool
 
 
 @dataclass
@@ -23,7 +24,11 @@ class TurboQuantizedTensor:
     """Container for a tensor quantized by TurboQuantMSE.
 
     Attributes:
-        q: Quantized integers, shape [N, D], dtype uint8.
+        q: Stored quantized integers, dtype uint8. For bits < 8 this
+            tensor is packed rather than [N, D]: 4-bit uses
+            [N, ceil(D / 2)], 2-bit uses [N, ceil(D / 4)], and 3-bit
+            currently uses the 4-bit nibble packing format. 8-bit keeps
+            shape [N, D].
         scale: Per-group scale, shape [N, n_groups], dtype float32.
         zero_point: Per-group zero-point, shape [N, n_groups], dtype uint8.
         rotation: Orthogonal rotation matrix [D, D] or None.
@@ -54,6 +59,9 @@ class TurboQuantMSE:
     Args:
         dim: Last dimension of tensors to be quantized.
         bits: Bits per element. Supported: 2, 3, 4, 8.
+            Note: 3-bit values are currently stored with the 4-bit nibble
+            packing format, so storage is 4-bit packed while the value range
+            remains 3-bit.
         use_rotation: Whether to apply random orthogonal rotation before
             quantization.  Default True.
         group_size: Number of consecutive elements per quantization group.
@@ -210,8 +218,20 @@ class TurboQuantMSE:
         scale_out = scale.squeeze(-1)  # [N, n_groups]
         zero_point_out = zero_point.squeeze(-1).to(torch.uint8)  # [N, n_groups]
 
+        if self.bits == 4:
+            q_out = pack_uint4(q_flat)
+        elif self.bits == 2:
+            q_out = pack_uint2(q_flat)
+        elif self.bits == 3:
+            # 3-bit values are currently stored in 4-bit nibbles. This keeps
+            # the implementation simple and makes estimate_num_bytes reflect
+            # the actual stored tensor payload rather than ideal 3-bit packing.
+            q_out = pack_uint4(q_flat)
+        else:
+            q_out = q_flat
+
         return TurboQuantizedTensor(
-            q=q_flat,
+            q=q_out,
             scale=scale_out,
             zero_point=zero_point_out,
             rotation=rotation.detach().clone() if rotation is not None else None,
@@ -233,15 +253,27 @@ class TurboQuantMSE:
         Returns:
             Float tensor with the same shape as the original input.
         """
-        N, D = qx.q.shape
+        D = qx.shape_orig[-1]
+        N = qx.q.shape[0]
+
+        if qx.bits == 4:
+            q_unpacked = unpack_uint4(qx.q, D)
+        elif qx.bits == 2:
+            q_unpacked = unpack_uint2(qx.q, D)
+        elif qx.bits == 3:
+            # See quantize(): 3-bit values are stored in 4-bit nibbles.
+            q_unpacked = unpack_uint4(qx.q, D)
+        else:
+            q_unpacked = qx.q
+
         gs = qx.group_size
 
         # Pad to match the group structure used during quantization
         pad_len = (gs - D % gs) % gs
         if pad_len > 0:
-            q_pad = torch.nn.functional.pad(qx.q, (0, pad_len))
+            q_pad = torch.nn.functional.pad(q_unpacked, (0, pad_len))
         else:
-            q_pad = qx.q
+            q_pad = q_unpacked
 
         D_padded = q_pad.shape[-1]
         n_groups = D_padded // gs
@@ -265,11 +297,14 @@ class TurboQuantMSE:
     # ------------------------------------------------------------------
 
     def estimate_num_bytes(self, qx: TurboQuantizedTensor) -> int:
-        """Estimate the storage size in bytes for a quantized tensor.
+        """Estimate the stored tensor payload size in bytes.
 
-        The estimate assumes ideal bit-packing for the quantized integers,
-        float32 scales, uint8 zero-points, and (if present) a single
-        shared float32 rotation matrix.
+        The quantized integer payload is counted from the actual stored
+        ``qx.q`` tensor (``nelement() * element_size()``), so 4-bit and
+        2-bit use their packed representation, 8-bit uses one byte per
+        element, and 3-bit reflects the current 4-bit nibble storage.
+        Scale tensors are counted as float32, zero-points as uint8, and
+        rotation as one shared float32 matrix when present.
 
         Args:
             qx: A :class:`TurboQuantizedTensor`.
@@ -277,11 +312,12 @@ class TurboQuantMSE:
         Returns:
             Estimated number of bytes.
         """
-        N, D = qx.q.shape
+        N = qx.q.shape[0]
+        D = qx.shape_orig[-1]
         gs = qx.group_size
 
-        # q: ideally bit-packed
-        q_bytes = (N * D * qx.bits + 7) // 8
+        # q: bit-packed
+        q_bytes = qx.q.nelement() * qx.q.element_size()
 
         # Per-group overhead
         pad_len = (gs - D % gs) % gs
@@ -421,11 +457,12 @@ class TurboQuantProd:
         # Stage 2: 1-bit residual
         residual = x_flat - x_hat_flat
         residual_sign = residual >= 0  # bool [N, D]
+        residual_sign_packed = pack_bool(residual_sign)
         residual_norm = residual.norm(dim=-1)  # [N]
 
         return TurboQuantProdResult(
             mse=mse_result,
-            residual_sign=residual_sign,
+            residual_sign=residual_sign_packed,
             residual_norm=residual_norm,
             shape_orig=shape_orig,
             dim=self.dim,
@@ -448,8 +485,8 @@ class TurboQuantProd:
         x_hat = self._mse_quantizer.dequantize(qx.mse)
         x_hat_flat = x_hat.reshape(-1, qx.dim)
 
-        # Reconstruct residual: sign → {-1, +1}, scaled by norm/sqrt(D)
-        sign_float = qx.residual_sign.float() * 2.0 - 1.0  # {-1, +1}
+        sign_unpacked = unpack_bool(qx.residual_sign, qx.dim)
+        sign_float = sign_unpacked.float() * 2.0 - 1.0  # {-1, +1}
         scale = (qx.residual_norm / (qx.dim ** 0.5)).unsqueeze(-1)  # [N, 1]
         r_hat = scale * sign_float
 
@@ -486,7 +523,8 @@ class TurboQuantProd:
         mse_ip = q_2d @ x_hat_2d.T  # [Q, N]
 
         # Part 2: Residual contribution — 1-bit sign dot product
-        sign_float = qx.residual_sign.float() * 2.0 - 1.0  # [N, D]
+        sign_unpacked = unpack_bool(qx.residual_sign, qx.dim)
+        sign_float = sign_unpacked.float() * 2.0 - 1.0  # [N, D]
         scale = qx.residual_norm / (qx.dim ** 0.5)  # [N]
         sign_ip = q_2d @ sign_float.T * scale.unsqueeze(0)  # [Q, N]
 
@@ -511,7 +549,7 @@ class TurboQuantProd:
             Estimated number of bytes.
         """
         mse_bytes = self._mse_quantizer.estimate_num_bytes(qx.mse)
-        N, D = qx.residual_sign.shape
-        sign_bytes = (N * D + 7) // 8
+        sign_bytes = qx.residual_sign.nelement() * qx.residual_sign.element_size()
+        N = qx.residual_norm.shape[0]
         norm_bytes = N * 4  # float32
         return mse_bytes + sign_bytes + norm_bytes

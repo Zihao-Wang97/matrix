@@ -43,14 +43,14 @@ class TestRopeUtils:
 
 class TestGetAttnConfig:
     def test_from_attn_module_config(self):
-        model = AutoModelForCausalLM.from_pretrained(_MODEL_ID)
+        model = AutoModelForCausalLM.from_pretrained(_MODEL_ID, attn_implementation="eager")
         orig = _get_first_attn(model)
         cfg = _get_attn_config(orig, model=None)
         assert cfg.hidden_size == 768
         assert cfg.num_attention_heads == 12
 
     def test_from_model_config(self):
-        model = AutoModelForCausalLM.from_pretrained(_MODEL_ID)
+        model = AutoModelForCausalLM.from_pretrained(_MODEL_ID, attn_implementation="eager")
         cfg = _get_attn_config(None, model=model)
         assert cfg.hidden_size == 768
 
@@ -74,7 +74,7 @@ class TestGetAttnConfig:
 
 class TestHAWPAttentionConstruction:
     def test_from_attention_identity_projectors(self):
-        model = AutoModelForCausalLM.from_pretrained(_MODEL_ID)
+        model = AutoModelForCausalLM.from_pretrained(_MODEL_ID, attn_implementation="eager")
         orig = _get_first_attn(model)
         hawp = HAWPAttention.from_llama_attention(orig, layer_idx=0, allow_default_full_rank=True)
         assert hawp.p_k.shape == (hawp.head_dim, hawp.head_dim)
@@ -83,15 +83,17 @@ class TestHAWPAttentionConstruction:
         assert torch.allclose(hawp.p_v.float(), torch.eye(hawp.head_dim))
         assert hawp.gamma.item() == pytest.approx(1.0)
 
-    def test_weights_copied(self):
-        model = AutoModelForCausalLM.from_pretrained(_MODEL_ID)
+    def test_weights_reused(self):
+        model = AutoModelForCausalLM.from_pretrained(_MODEL_ID, attn_implementation="eager")
         orig = _get_first_attn(model)
+        orig_q_weight = orig.q_proj.weight.data.clone()
+        orig_o_weight = orig.out_proj.weight.data.clone()
         hawp = HAWPAttention.from_llama_attention(orig, layer_idx=0, allow_default_full_rank=True)
-        assert torch.equal(hawp.q_proj.weight.data, hawp._src_weights["q_proj"])
-        assert torch.equal(hawp.o_proj.weight.data, hawp._src_weights["o_proj"])
+        assert torch.equal(hawp.q_proj.weight.data, orig_q_weight)
+        assert torch.equal(hawp.o_proj.weight.data, orig_o_weight)
 
     def test_forward_shape(self):
-        model = AutoModelForCausalLM.from_pretrained(_MODEL_ID)
+        model = AutoModelForCausalLM.from_pretrained(_MODEL_ID, attn_implementation="eager")
         orig = _get_first_attn(model)
         hawp = HAWPAttention.from_llama_attention(orig, layer_idx=0, allow_default_full_rank=True)
         hawp.eval()
@@ -103,7 +105,7 @@ class TestHAWPAttentionConstruction:
         assert attn_out.shape == (1, 4, hawp.hidden_size)
 
     def test_from_attention_model_none(self):
-        model = AutoModelForCausalLM.from_pretrained(_MODEL_ID)
+        model = AutoModelForCausalLM.from_pretrained(_MODEL_ID, attn_implementation="eager")
         orig = _get_first_attn(model)
         hawp = HAWPAttention.from_attention(orig, model=None, layer_idx=0, allow_default_full_rank=True)
         assert hawp.hidden_size == 768
@@ -111,7 +113,7 @@ class TestHAWPAttentionConstruction:
         assert torch.allclose(hawp.p_k.float(), torch.eye(hawp.head_dim))
 
     def test_from_attention_with_model(self):
-        model = AutoModelForCausalLM.from_pretrained(_MODEL_ID)
+        model = AutoModelForCausalLM.from_pretrained(_MODEL_ID, attn_implementation="eager")
         orig = _get_first_attn(model)
         hawp = HAWPAttention.from_attention(orig, model=model, layer_idx=0, allow_default_full_rank=True)
         assert hawp.hidden_size == 768
@@ -168,12 +170,12 @@ class TestFullRankForwardEquivalence:
 
 class TestConversionMarks:
     def test_config_marked_after_conversion(self):
-        model = AutoModelForCausalLM.from_pretrained(_MODEL_ID)
+        model = AutoModelForCausalLM.from_pretrained(_MODEL_ID, attn_implementation="eager")
         model = convert_llama_to_hawp(model, allow_default_full_rank=True)
         assert model.config._hawp_converted is True
 
     def test_all_layers_replaced(self):
-        model = AutoModelForCausalLM.from_pretrained(_MODEL_ID)
+        model = AutoModelForCausalLM.from_pretrained(_MODEL_ID, attn_implementation="eager")
         model = convert_llama_to_hawp(model, allow_default_full_rank=True)
         from hawp_laq.offline.hooks import _find_attention_modules
         attns = _find_attention_modules(model)

@@ -43,7 +43,9 @@ def _complete_to_orthonormal_basis(basis: torch.Tensor, dim: int) -> torch.Tenso
 
 
 class ProjectorModule(nn.Module):
-    def __init__(self, d_model: int, rank_k: int, rank_v: int, n_heads: int):
+    def __init__(self, d_model: int, rank_k: int, rank_v: int, n_heads: int,
+                 init_p_k: torch.Tensor | None = None,
+                 init_p_v: torch.Tensor | None = None):
         super().__init__()
         self.d_model = d_model
         self.rank_k = rank_k
@@ -61,12 +63,18 @@ class ProjectorModule(nn.Module):
                 f"rank_v={rank_v} must satisfy 1 <= rank_v <= head_dim={self.head_dim} "
                 f"(d_model={d_model}, n_heads={n_heads})"
             )
-        self.p_k_basis = nn.Parameter(
-            torch.randn(self.head_dim, rank_k) * (rank_k ** -0.5)
-        )
-        self.p_v_basis = nn.Parameter(
-            torch.randn(self.head_dim, rank_v) * (rank_v ** -0.5)
-        )
+        if init_p_k is not None:
+            self.p_k_basis = nn.Parameter(init_p_k.clone())
+        else:
+            self.p_k_basis = nn.Parameter(
+                torch.randn(self.head_dim, rank_k) * (rank_k ** -0.5)
+            )
+        if init_p_v is not None:
+            self.p_v_basis = nn.Parameter(init_p_v.clone())
+        else:
+            self.p_v_basis = nn.Parameter(
+                torch.randn(self.head_dim, rank_v) * (rank_v ** -0.5)
+            )
         self.gamma = nn.Parameter(torch.ones(1))
 
     def orthogonalize_projectors(self) -> None:
@@ -77,6 +85,12 @@ class ProjectorModule(nn.Module):
     def _reshape_mh(self, x: torch.Tensor) -> torch.Tensor:
         b, s, _ = x.shape
         return x.view(b, s, self.n_heads, self.head_dim).transpose(1, 2)
+
+    @staticmethod
+    def _make_causal_mask(q_len: int, kv_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        mask = torch.full((q_len, kv_len), float("-inf"), device=device, dtype=dtype)
+        mask = torch.triu(mask, diagonal=kv_len - q_len + 1)
+        return mask.unsqueeze(0).unsqueeze(0)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         q_mh = self._reshape_mh(q)
@@ -91,8 +105,16 @@ class ProjectorModule(nn.Module):
         logits_fp = (q_mh @ k_mh.transpose(-2, -1)) * (self.head_dim ** -0.5)
         logits_hat = (q_lat @ k_lat.transpose(-2, -1)) * lr_scale
 
-        attn_probs = torch.softmax(logits_fp, dim=-1)
-        attn_probs_hat = torch.softmax(logits_hat, dim=-1)
+        q_len = q_mh.shape[2]
+        kv_len = k_mh.shape[2]
+        assert q_len == kv_len, f"ProjectorModule requires q_len == kv_len, got {q_len} vs {kv_len}"
+        causal_mask = self._make_causal_mask(q_len, kv_len, q_mh.device, q_mh.dtype)
+
+        logits_fp_masked = logits_fp + causal_mask
+        logits_hat_masked = logits_hat + causal_mask
+
+        attn_probs = torch.softmax(logits_fp_masked, dim=-1)
+        attn_probs_hat = torch.softmax(logits_hat_masked, dim=-1)
 
         attn_out = attn_probs @ v_mh
         attn_out_hat_lat = attn_probs_hat @ v_lat
@@ -103,7 +125,8 @@ class ProjectorModule(nn.Module):
         k_recon = k_recon_mh.transpose(1, 2).contiguous().view(*k.shape)
         v_recon = v_recon_mh.transpose(1, 2).contiguous().view(*v.shape)
 
-        return logits_fp, logits_hat, attn_out, attn_out_hat, k_recon, v_recon
+        valid = causal_mask == 0
+        return logits_fp, logits_hat, valid, attn_out, attn_out_hat, k_recon, v_recon
 
 
 class ProjectorTrainer:
@@ -143,6 +166,15 @@ class ProjectorTrainer:
                 f"(d_model={d_model}, n_heads={n_heads})"
             )
 
+    @staticmethod
+    def _svd_init_basis(x: torch.Tensor, n_heads: int, rank: int) -> torch.Tensor:
+        b, s, d_model = x.shape
+        head_dim = d_model // n_heads
+        x_mh = x.view(b, s, n_heads, head_dim).transpose(1, 2)
+        x_flat = x_mh.reshape(-1, head_dim)
+        _, _, Vh = torch.linalg.svd(x_flat, full_matrices=False)
+        return Vh[:rank].T
+
     def train_one_group(
         self,
         q: torch.Tensor,
@@ -150,14 +182,16 @@ class ProjectorTrainer:
         v: torch.Tensor,
         n_steps: int = 200,
     ) -> dict:
-        module = ProjectorModule(
-            self.d_model, self.rank_k, self.rank_v, self.n_heads
-        ).to(self.device)
-        optimizer = torch.optim.Adam(module.parameters(), lr=self.lr)
-
         q = q.to(self.device).float()
         k = k.to(self.device).float()
         v = v.to(self.device).float()
+
+        module = ProjectorModule(
+            self.d_model, self.rank_k, self.rank_v, self.n_heads,
+            init_p_k=self._svd_init_basis(k, self.n_heads, self.rank_k),
+            init_p_v=self._svd_init_basis(v, self.n_heads, self.rank_v),
+        ).to(self.device)
+        optimizer = torch.optim.Adam(module.parameters(), lr=self.lr)
 
         metrics: dict[str, list] = {
             "total": [],
@@ -168,9 +202,9 @@ class ProjectorTrainer:
 
         for step in range(1, n_steps + 1):
             optimizer.zero_grad()
-            logits_fp, logits_hat, attn_out, attn_out_hat, k_recon, v_recon = module(q, k, v)
+            logits_fp, logits_hat, causal_valid, attn_out, attn_out_hat, k_recon, v_recon = module(q, k, v)
 
-            l_logits = logits_mse_loss(logits_fp, logits_hat)
+            l_logits = logits_mse_loss(logits_fp, logits_hat, valid_mask=causal_valid)
             l_attn = attention_output_mse_loss(attn_out, attn_out_hat)
             l_val = F.mse_loss(v_recon, v)
             loss = (
@@ -209,6 +243,7 @@ class ProjectorTrainer:
             "r_k": self.rank_k,
             "r_v": self.rank_v,
             "metrics": metrics,
+            "causal_mask": True,
         }
 
     @staticmethod

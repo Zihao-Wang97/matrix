@@ -15,7 +15,7 @@ def _make_cache(n_layers=3, n_heads=4, head_dim=16):
     sched = TokenBudgetScheduler(total_budget=999999)
     return CacheManager(
         n_layers=n_layers, n_heads=n_heads, head_dim=head_dim,
-        scheduler=sched, k_quantizer=kq, v_quantizer=vq,
+        dtype=torch.float32, scheduler=sched, k_quantizer=kq, v_quantizer=vq,
     )
 
 
@@ -23,14 +23,14 @@ class TestLayerKVCache:
     def test_append_recent(self):
         kq = TurboQuantProd(dim=16, bits=4, use_rotation=True)
         vq = TurboQuantMSE(dim=16, bits=8, use_rotation=True)
-        cache = LayerKVCache(4, 16, kq, vq)
+        cache = LayerKVCache(4, 16, kq, vq, dtype=torch.float32)
         cache.append_recent(torch.randn(16), torch.randn(16))
         assert cache.n_recent == 1
 
     def test_get_all_empty(self):
         kq = TurboQuantProd(dim=16, bits=4, use_rotation=True)
         vq = TurboQuantMSE(dim=16, bits=8, use_rotation=True)
-        cache = LayerKVCache(4, 16, kq, vq)
+        cache = LayerKVCache(4, 16, kq, vq, dtype=torch.float32)
         k = cache.get_all_k()
         v = cache.get_all_v()
         assert k.shape == (0, 16)
@@ -39,7 +39,7 @@ class TestLayerKVCache:
     def test_recent_only(self):
         kq = TurboQuantProd(dim=16, bits=4, use_rotation=True)
         vq = TurboQuantMSE(dim=16, bits=8, use_rotation=True)
-        cache = LayerKVCache(4, 16, kq, vq)
+        cache = LayerKVCache(4, 16, kq, vq, dtype=torch.float32)
         for _ in range(5):
             cache.append_recent(torch.randn(16), torch.randn(16))
         k = cache.get_all_k()
@@ -50,7 +50,7 @@ class TestLayerKVCache:
     def test_demote_to_archive(self):
         kq = TurboQuantProd(dim=16, bits=4, use_rotation=True)
         vq = TurboQuantMSE(dim=16, bits=8, use_rotation=True)
-        cache = LayerKVCache(4, 16, kq, vq)
+        cache = LayerKVCache(4, 16, kq, vq, dtype=torch.float32)
         for _ in range(10):
             cache.append_recent(torch.randn(16), torch.randn(16))
         cache.demote_to_archive()
@@ -60,7 +60,7 @@ class TestLayerKVCache:
     def test_archive_dequant_shape(self):
         kq = TurboQuantProd(dim=16, bits=4, use_rotation=True)
         vq = TurboQuantMSE(dim=16, bits=8, use_rotation=True)
-        cache = LayerKVCache(4, 16, kq, vq)
+        cache = LayerKVCache(4, 16, kq, vq, dtype=torch.float32)
         for _ in range(10):
             cache.append_recent(torch.randn(16), torch.randn(16))
         cache.demote_to_archive()
@@ -72,7 +72,7 @@ class TestLayerKVCache:
     def test_recent_plus_archive(self):
         kq = TurboQuantProd(dim=16, bits=4, use_rotation=True)
         vq = TurboQuantMSE(dim=16, bits=8, use_rotation=True)
-        cache = LayerKVCache(4, 16, kq, vq)
+        cache = LayerKVCache(4, 16, kq, vq, dtype=torch.float32)
         for _ in range(8):
             cache.append_recent(torch.randn(16), torch.randn(16))
         cache.demote_to_archive()
@@ -88,7 +88,7 @@ class TestLayerKVCache:
     def test_nbytes_recent(self):
         kq = TurboQuantProd(dim=16, bits=4, use_rotation=True)
         vq = TurboQuantMSE(dim=16, bits=8, use_rotation=True)
-        cache = LayerKVCache(4, 16, kq, vq)
+        cache = LayerKVCache(4, 16, kq, vq, dtype=torch.float32)
         for _ in range(5):
             cache.append_recent(torch.randn(16), torch.randn(16))
         assert cache.nbytes_recent() > 0
@@ -96,7 +96,7 @@ class TestLayerKVCache:
     def test_nbytes_archive(self):
         kq = TurboQuantProd(dim=16, bits=4, use_rotation=True)
         vq = TurboQuantMSE(dim=16, bits=8, use_rotation=True)
-        cache = LayerKVCache(4, 16, kq, vq)
+        cache = LayerKVCache(4, 16, kq, vq, dtype=torch.float32)
         for _ in range(5):
             cache.append_recent(torch.randn(16), torch.randn(16))
         cache.demote_to_archive()
@@ -105,7 +105,7 @@ class TestLayerKVCache:
     def test_archive_smaller_than_fp16(self):
         kq = TurboQuantProd(dim=16, bits=4, use_rotation=False)
         vq = TurboQuantMSE(dim=16, bits=4, use_rotation=False)
-        cache = LayerKVCache(4, 16, kq, vq)
+        cache = LayerKVCache(4, 16, kq, vq, dtype=torch.float32)
         for _ in range(50):
             cache.append_recent(torch.randn(16), torch.randn(16))
         fp16_bytes = cache.nbytes_recent()
@@ -116,7 +116,7 @@ class TestLayerKVCache:
     def test_incremental_demote(self):
         kq = TurboQuantProd(dim=16, bits=4, use_rotation=True)
         vq = TurboQuantMSE(dim=16, bits=8, use_rotation=True)
-        cache = LayerKVCache(4, 16, kq, vq)
+        cache = LayerKVCache(4, 16, kq, vq, dtype=torch.float32)
         for _ in range(5):
             cache.append_recent(torch.randn(16), torch.randn(16))
         cache.demote_to_archive()
@@ -180,6 +180,7 @@ class TestCacheManager:
         vq = TurboQuantMSE(dim=16, bits=4, use_rotation=False)
         cm = CacheManager(
             n_layers=1, n_heads=4, head_dim=16,
+            dtype=torch.float32,
             scheduler=TokenBudgetScheduler(total_budget=999999),
             k_quantizer=kq, v_quantizer=vq,
         )
@@ -210,7 +211,7 @@ class TestCacheManager:
         sched = TokenBudgetScheduler(total_budget=999999)
         cm = CacheManager(
             n_layers=2, n_heads=4, head_dim=16,
-            scheduler=sched, cfg=cfg,
+            dtype=torch.float32, scheduler=sched, cfg=cfg,
         )
         assert isinstance(cm._caches[0].k_quantizer, TurboQuantProd)
         assert isinstance(cm._caches[0].v_quantizer, TurboQuantMSE)

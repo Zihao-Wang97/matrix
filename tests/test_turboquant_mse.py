@@ -42,14 +42,14 @@ class TestTurboQuantShape:
         tq = TurboQuantMSE(dim=32, bits=4, use_rotation=False)
         x = torch.randn(10, 32)
         qx = tq.quantize(x)
-        assert qx.q.shape == (10, 32)
+        assert qx.q.shape == (10, 16)
         assert qx.shape_orig == (10, 32)
 
     def test_quantize_3d_q_shape(self):
         tq = TurboQuantMSE(dim=32, bits=4, use_rotation=False)
         x = torch.randn(2, 10, 32)
         qx = tq.quantize(x)
-        assert qx.q.shape == (20, 32)
+        assert qx.q.shape == (20, 16)
         assert qx.shape_orig == (2, 10, 32)
 
     def test_dequantize_2d_shape(self):

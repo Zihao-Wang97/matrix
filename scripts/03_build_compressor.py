@@ -4,6 +4,7 @@
 import argparse
 from pathlib import Path
 
+import torch
 from transformers import AutoConfig
 
 from hawp_laq.config import load_config, load_projector_ranks_from_dir
@@ -36,10 +37,12 @@ def main() -> None:
     print(f"[compressor] output_dir    = {output_dir}")
     print("=" * 60)
 
-    model_cfg = AutoConfig.from_pretrained(cfg.model.model_id)
+    model_cfg = AutoConfig.from_pretrained(cfg.model.model_id, local_files_only=Path(cfg.model.model_id).expanduser().is_dir())
     n_layers = getattr(model_cfg, "num_hidden_layers", 12)
     n_heads = getattr(model_cfg, "num_attention_heads", 12)
     head_dim = getattr(model_cfg, "hidden_size", 768) // n_heads
+    torch_dtype = getattr(model_cfg, "torch_dtype", torch.float16)
+    kv_elem_size = torch_dtype.itemsize if isinstance(torch_dtype, torch.dtype) else 2
 
     pkg = CompressorPackage(
         projector_dir=projector_dir,
@@ -55,6 +58,7 @@ def main() -> None:
         recent_window=cfg.sched.recent_window,
         high_ratio=cfg.sched.high_ratio,
         low_ratio=cfg.sched.low_ratio,
+        kv_elem_size=kv_elem_size,
     )
 
     ranks = pkg.ranks

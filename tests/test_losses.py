@@ -53,6 +53,22 @@ class TestLogitsMseLoss:
         b = torch.ones(2, 4, 4, 4)
         assert logits_mse_loss(a, b).item() == pytest.approx(1.0)
 
+    def test_valid_mask_selects_positions(self):
+        a = torch.zeros(1, 1, 3, 3)
+        b = torch.ones(1, 1, 3, 3)
+        mask = torch.tensor([[[[True, False, False],
+                               [True, True, False],
+                               [True, True, True]]]])
+        loss = logits_mse_loss(a, b, valid_mask=mask)
+        n_valid = mask.sum().item()
+        assert loss.item() == pytest.approx(1.0, abs=1e-6)
+        assert n_valid == 6
+
+    def test_valid_mask_none_equals_no_mask(self):
+        a = torch.randn(2, 4, 4, 4)
+        b = torch.randn(2, 4, 4, 4)
+        assert torch.isclose(logits_mse_loss(a, b), logits_mse_loss(a, b, valid_mask=None))
+
 
 class TestAttentionOutputMseLoss:
     def test_zero_loss(self):

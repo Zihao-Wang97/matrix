@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from hawp_laq.offline.rank_search import (
-    _selection_score,
+    _component_pass,
     search_rank_per_layer,
 )
 from hawp_laq.utils.io import save_pt
@@ -30,63 +30,79 @@ def _make_calib_dir(tmp_path, n_layers=1, n_heads=4, d_model=64):
     return calib_dir
 
 
-def test_rank_search_selection_uses_attn_value_score_not_total_loss():
-    result_small = {
-        "final_attn_loss": 0.05,
-        "final_value_loss": 0.10,
-        "final_loss": 1.0,
-        "final_logits_loss": 0.925,
-    }
-    result_large = {
-        "final_attn_loss": 0.005,
-        "final_value_loss": 0.01,
-        "final_loss": 0.5,
-        "final_logits_loss": 0.485,
-    }
-    value_weight = 0.25
-    score_small = _selection_score(result_small, value_weight)
-    score_large = _selection_score(result_large, value_weight)
-
-    assert result_small["final_loss"] > result_large["final_loss"]
-    assert score_small > score_large
-
-    baseline = score_large
-    abs_tol = 0.04
-    assert score_small > baseline + abs_tol
-
-    result_medium = {
-        "final_attn_loss": 0.008,
-        "final_value_loss": 0.015,
-        "final_loss": 0.8,
-        "final_logits_loss": 0.777,
-    }
-    score_medium = _selection_score(result_medium, value_weight)
-    assert score_medium <= baseline + abs_tol
-    assert result_medium["final_loss"] > result_large["final_loss"]
+def test_component_pass_relative_mode():
+    assert _component_pass(0.011, 0.01, 0.10, 1e-6) is True
+    assert _component_pass(0.012, 0.01, 0.10, 1e-6) is False
 
 
-def test_rank_search_absolute_tolerance_with_near_zero_baseline(tmp_path):
+def test_component_pass_absolute_mode():
+    assert _component_pass(5e-7, 0.0, 0.10, 1e-6) is True
+    assert _component_pass(5e-6, 0.0, 0.10, 1e-6) is False
+
+
+def test_component_pass_near_zero_baseline():
+    assert _component_pass(5e-7, 1e-9, 0.10, 1e-6) is True
+    assert _component_pass(5e-6, 1e-9, 0.10, 1e-6) is False
+
+
+def test_rank_search_constraint_selection(tmp_path):
     calib_dir = _make_calib_dir(tmp_path, d_model=64, n_heads=4)
-    head_dim = 16
+    output_dir = tmp_path / "rank_search_out"
 
     with warnings.catch_warnings(record=True):
         warnings.simplefilter("always")
         result = search_rank_per_layer(
             calib_dir=calib_dir,
-            rank_candidates=[8, head_dim],
+            rank_candidates=[8, 16],
             n_steps=2,
             device="cpu",
-            selection_abs_tolerance=0.04,
+            relative_tolerance=0.10,
+            output_dir=output_dir,
         )
 
     assert 0 in result
     chosen = result[0][0]
-    assert chosen <= head_dim
+    assert chosen in (8, 16)
 
-    if chosen < head_dim:
-        pass
-    else:
-        assert chosen == head_dim
+    json_path = output_dir / "layer_0_rank_search.json"
+    assert json_path.exists()
+    with open(json_path) as f:
+        data = json.load(f)
+
+    assert data["selection_method"] == "constraint"
+    for r in data["results"]:
+        assert "logits_pass" in r
+        assert "attn_pass" in r
+        assert "value_pass" in r
+        assert "all_pass" in r
+
+
+def test_rank_search_near_zero_baseline_uses_abs_tolerance(tmp_path):
+    calib_dir = _make_calib_dir(tmp_path, d_model=64, n_heads=4)
+    output_dir = tmp_path / "rank_search_out"
+
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        result = search_rank_per_layer(
+            calib_dir=calib_dir,
+            rank_candidates=[8, 16],
+            n_steps=2,
+            device="cpu",
+            relative_tolerance=0.10,
+            logits_abs_tolerance=1e-6,
+            attn_abs_tolerance=1e-5,
+            value_abs_tolerance=1e-4,
+            output_dir=output_dir,
+        )
+
+    assert 0 in result
+    json_path = output_dir / "layer_0_rank_search.json"
+    with open(json_path) as f:
+        data = json.load(f)
+
+    assert data["logits_abs_tolerance"] == 1e-6
+    assert data["attn_abs_tolerance"] == 1e-5
+    assert data["value_abs_tolerance"] == 1e-4
 
 
 def test_rank_search_prefers_rank_search_n_steps_over_projector_n_steps(tmp_path):
@@ -134,7 +150,7 @@ def test_rank_search_prefers_rank_search_n_steps_over_projector_n_steps(tmp_path
         rs_mod._evaluate_rank = original
 
 
-def test_rank_search_json_contains_selection_fields(tmp_path):
+def test_rank_search_json_no_stale_fields(tmp_path):
     calib_dir = _make_calib_dir(tmp_path, d_model=64, n_heads=4)
     output_dir = tmp_path / "rank_search_out"
 
@@ -145,8 +161,7 @@ def test_rank_search_json_contains_selection_fields(tmp_path):
             rank_candidates=[8, 16],
             n_steps=2,
             device="cpu",
-            selection_value_weight=0.25,
-            selection_abs_tolerance=0.04,
+            relative_tolerance=0.10,
             output_dir=output_dir,
         )
 
@@ -155,25 +170,42 @@ def test_rank_search_json_contains_selection_fields(tmp_path):
     with open(json_path) as f:
         data = json.load(f)
 
-    assert "selection_metric" in data
-    assert data["selection_metric"] == "attn_value_abs"
-    assert "selection_value_weight" in data
-    assert data["selection_value_weight"] == 0.25
-    assert "selection_abs_tolerance" in data
-    assert data["selection_abs_tolerance"] == 0.04
-    assert "baseline_selection_score" in data
-    for r in data["results"]:
-        assert "selection_score" in r
+    assert "tolerance" not in data
+    assert "selection_score" not in data["results"][0]
+    assert "baseline_score" not in data
+    assert "threshold" not in data
 
 
-def test_rank_search_rejects_unsupported_selection_metric(tmp_path):
-    calib_dir = _make_calib_dir(tmp_path, d_model=64, n_heads=4)
+def test_rank_search_all_pass_selects_smallest_rank(tmp_path):
+    import hawp_laq.offline.rank_search as rs_mod
+    original = rs_mod._evaluate_rank
 
-    with pytest.raises(ValueError, match="Unsupported selection_metric='total_relative'"):
-        search_rank_per_layer(
-            calib_dir=calib_dir,
-            rank_candidates=[8, 16],
-            n_steps=2,
-            device="cpu",
-            selection_metric="total_relative",
-        )
+    def _mock_evaluate(q, k, v, rank_k, rank_v, d_model, n_heads,
+                       n_steps, lr, orthogonalize_every, w_logits, w_attn,
+                       w_value, device):
+        return {
+            "rank_k": rank_k,
+            "rank_v": rank_v,
+            "final_loss": 0.01,
+            "final_logits_loss": 0.008,
+            "final_attn_loss": 0.001,
+            "final_value_loss": 0.001,
+            "p_k_shape": (16, rank_k),
+            "p_v_shape": (16, rank_v),
+        }
+
+    rs_mod._evaluate_rank = _mock_evaluate
+    try:
+        calib_dir = _make_calib_dir(tmp_path, d_model=64, n_heads=4)
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            result = search_rank_per_layer(
+                calib_dir=calib_dir,
+                rank_candidates=[8, 16, 32, 64],
+                n_steps=2,
+                device="cpu",
+                relative_tolerance=0.10,
+            )
+        assert result[0] == (8, 8)
+    finally:
+        rs_mod._evaluate_rank = original

@@ -54,6 +54,35 @@ class TestStepwiseGreedyGenerate:
         assert len(results) == 1
         assert isinstance(results[0], str)
 
+    def test_full_recompute_passes_full_sequence(self):
+        from unittest.mock import MagicMock, call
+        from types import SimpleNamespace
+
+        n_vocab = 50
+        seq_len = 3
+        max_new = 2
+
+        model = MagicMock()
+        logits = torch.zeros(1, 1, n_vocab)
+        logits[0, 0, 0] = 1.0
+        model.device = torch.device("cpu")
+        model.return_value = MagicMock(logits=logits)
+
+        tokenizer = MagicMock()
+        tokenizer.return_value = SimpleNamespace(
+            input_ids=torch.ones(1, seq_len, dtype=torch.long)
+        )
+        tokenizer.decode.return_value = "out"
+
+        stepwise_greedy_generate(model, tokenizer, ["test"], max_new, full_recompute=True)
+
+        all_calls = model.call_args_list
+        assert len(all_calls) >= 2
+        prefill_ids = all_calls[0].kwargs.get("input_ids", all_calls[0][1].get("input_ids"))
+        decode_ids = all_calls[1].kwargs.get("input_ids", all_calls[1][1].get("input_ids"))
+        assert prefill_ids.shape[1] == seq_len
+        assert decode_ids.shape[1] == seq_len + 1
+
     def test_reset_cache_fn_called_between_prompts(self):
         from unittest.mock import MagicMock
         from types import SimpleNamespace
@@ -78,6 +107,7 @@ class TestStepwiseGreedyGenerate:
 class TestCompareScriptSeparatesCorrectnessAndSpeed:
     def test_correctness_and_speed_helpers_exist(self):
         import importlib.util
+        import inspect
         spec = importlib.util.spec_from_file_location(
             "compare", "scripts/08_compare_modes.py",
         )
@@ -85,7 +115,8 @@ class TestCompareScriptSeparatesCorrectnessAndSpeed:
         spec.loader.exec_module(mod)
 
         assert hasattr(mod, "_run_correctness")
-        assert hasattr(mod, "_run_speed")
+        source = inspect.getsource(mod.main)
+        assert "profile_generate_by_mode" in source
 
     def test_correctness_uses_stepwise_greedy(self):
         import importlib.util
@@ -108,8 +139,8 @@ class TestCompareScriptSeparatesCorrectnessAndSpeed:
         spec.loader.exec_module(mod)
 
         import inspect
-        source = inspect.getsource(mod._run_speed)
-        assert "generate_text" in source or "generate_hawp_quant" in source
+        source = inspect.getsource(mod.main)
+        assert "profile_generate_by_mode" in source
 
     def test_output_has_correctness_and_speed_labels(self):
         import importlib.util
@@ -122,4 +153,17 @@ class TestCompareScriptSeparatesCorrectnessAndSpeed:
         import inspect
         source = inspect.getsource(mod.main)
         assert "CORRECTNESS COMPARISON" in source
-        assert "SPEED COMPARISON" in source
+        assert "SPEED + CACHE + PEAK GPU" in source
+
+    def test_correctness_baseline_uses_stepwise_greedy(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "compare", "scripts/08_compare_modes.py",
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        import inspect
+        source = inspect.getsource(mod._run_correctness)
+        assert "stepwise_greedy_generate" in source
+        assert 'mode in ("baseline", "hawp_only")' in source

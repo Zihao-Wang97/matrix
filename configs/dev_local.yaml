@@ -5,10 +5,7 @@ data:
   cache: ./cache
 
 model:
-  name: hawp_laq_base
   model_id: facebook/opt-125m
-  backbone: resnet50
-  pretrained: null
   torch_dtype: float32
   load_in_4bit: false
 
@@ -22,27 +19,30 @@ generation:
     - "The capital of France is"
 
 calib:
-  nsamples: 2
-  seq_len: 64
+  nsamples: 128
+  seq_len: 128
   output_dir: artifacts/calib
   dataset: wikitext2
 
 projector:
   rank: null
-  r_k: 32
-  r_v: 45
-  lr: 0.002
-  n_steps: 2500
+  r_k: 48
+  r_v: 64
+  lr: 0.0015
+  n_steps: 600
   orthogonalize_every: 10
   target_layer: 0
   w_logits: 1.0
-  w_attn: 1.0
-  w_value: 0.5
+  w_attn: 2.0
+  w_value: 0.25
   output_dir: artifacts/projectors
 
 rank_search:
   n_steps: 1500
-  selection_abs_tolerance: 0.01
+  relative_tolerance: 0.10
+  logits_abs_tolerance: 1.0e-6
+  attn_abs_tolerance: 1.0e-5
+  value_abs_tolerance: 1.0e-4
   output_dir: artifacts/ranks
 
 quant:
@@ -51,8 +51,8 @@ quant:
   v_method: turbo_mse
   k_bits: 4
   v_bits: 8
-  use_rotation_for_k: true
-  use_rotation_for_v: true
+  use_rotation_for_k: false
+  use_rotation_for_v: false
   k_group_size: 128
   v_group_size: 128
   outlier_threshold: null
@@ -73,3 +73,9 @@ sched:
 log:
   level: DEBUG
   dir: ./logs
+
+hawp:
+  logit_scale_mode: "rk"
+  gamma_mode: "learned"
+  gamma_value: null
+  use_archive_k_ip_approx: true

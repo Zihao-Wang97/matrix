@@ -4,3 +4,5 @@ accelerate>=0.25
 bitsandbytes>=0.41
 numpy>=1.24
 pyyaml>=6.0
+datasets>=2.14
+sentencepiece>=0.1.99

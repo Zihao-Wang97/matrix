@@ -11,9 +11,10 @@ def test_gamma_receives_gradient_from_logits_path():
     q = torch.randn(1, 4, 64)
     k = torch.randn(1, 4, 64)
     v = torch.randn(1, 4, 64)
-    logits_fp, logits_hat, attn_out, attn_out_hat, k_recon, v_recon = mod(q, k, v)
+    logits_fp, logits_hat, causal_valid, attn_out, attn_out_hat, k_recon, v_recon = mod(q, k, v)
     import torch.nn.functional as F
-    loss = F.mse_loss(logits_hat, logits_fp)
+    mask = causal_valid.expand_as(logits_hat)
+    loss = F.mse_loss(logits_hat[mask], logits_fp[mask])
     loss.backward()
     assert mod.gamma.grad is not None, "gamma must receive gradient from logits path"
     assert mod.gamma.grad.abs().sum() > 0, "gamma gradient must be nonzero"

@@ -39,8 +39,8 @@ class TestQuantizeKVLatents:
         v_lat = torch.randn(20, 48)
         qkv = quantize_kv_latents(k_lat, v_lat, kq, vq)
         assert isinstance(qkv, QuantizedLatentKV)
-        assert qkv.k_q.q.shape == (20, 32)
-        assert qkv.v_q.q.shape == (20, 48)
+        assert qkv.k_q.q.shape == (20, 16)
+        assert qkv.v_q.q.shape == (20, 24)
 
     def test_3d_input(self):
         kq, vq = create_kv_quantizers(r_k=32, r_v=48, use_rotation=False)

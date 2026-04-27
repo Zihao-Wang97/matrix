@@ -51,14 +51,21 @@ def _evaluate_rank(
     }
 
 
-def _selection_score(result: dict, value_weight: float) -> float:
-    return result["final_attn_loss"] + value_weight * result["final_value_loss"]
+def _component_pass(
+    result_loss: float,
+    baseline_loss: float,
+    relative_tolerance: float,
+    abs_tolerance: float,
+    eps: float = 1e-8,
+) -> bool:
+    if baseline_loss >= eps:
+        return result_loss <= baseline_loss * (1.0 + relative_tolerance)
+    return result_loss <= abs_tolerance
 
 
 def search_rank_per_layer(
     calib_dir: str | Path,
     rank_candidates: list[int],
-    tolerance: float = 0.02,
     n_steps: int = 1500,
     lr: float = 1e-3,
     orthogonalize_every: int = 10,
@@ -67,15 +74,11 @@ def search_rank_per_layer(
     w_value: float = 0.5,
     device: str = "cpu",
     output_dir: str | Path | None = None,
-    selection_value_weight: float = 0.25,
-    selection_abs_tolerance: float = 0.04,
-    selection_metric: str = "attn_value_abs",
+    relative_tolerance: float = 0.10,
+    logits_abs_tolerance: float = 1e-6,
+    attn_abs_tolerance: float = 1e-5,
+    value_abs_tolerance: float = 1e-4,
 ) -> dict[int, tuple[int, int]]:
-    if selection_metric != "attn_value_abs":
-        raise ValueError(
-            f"Unsupported selection_metric='{selection_metric}'. "
-            f"Currently only 'attn_value_abs' is implemented."
-        )
 
     calib_dir = Path(calib_dir)
     meta = load_pt(calib_dir / "meta.pt")
@@ -130,9 +133,11 @@ def search_rank_per_layer(
         print(
             f"[rank_search]   candidates={valid_candidates}"
             f"  n_steps={n_steps}"
-            f"  selection=attn_value_abs"
-            f"  value_weight={selection_value_weight}"
-            f"  abs_tol={selection_abs_tolerance}"
+            f"  selection=constraint"
+            f"  rel_tol={relative_tolerance}"
+            f"  logits_abs_tol={logits_abs_tolerance}"
+            f"  attn_abs_tol={attn_abs_tolerance}"
+            f"  value_abs_tol={value_abs_tolerance}"
         )
 
         sorted_candidates = sorted(valid_candidates)
@@ -145,7 +150,6 @@ def search_rank_per_layer(
                 n_steps, lr, orthogonalize_every,
                 w_logits, w_attn, w_value, device,
             )
-            r["selection_score"] = _selection_score(r, selection_value_weight)
             results.append(r)
             print(
                 f"  rank=({rank},{rank})"
@@ -153,7 +157,6 @@ def search_rank_per_layer(
                 f"  logits={r['final_logits_loss']:.6f}"
                 f"  attn={r['final_attn_loss']:.6f}"
                 f"  value={r['final_value_loss']:.6f}"
-                f"  select={r['selection_score']:.6f}"
             )
 
             if rank == sorted_candidates[-1]:
@@ -162,18 +165,49 @@ def search_rank_per_layer(
         if baseline_result is None:
             continue
 
-        baseline_selection_score = baseline_result["selection_score"]
+        for r in results:
+            r["logits_pass"] = _component_pass(
+                r["final_logits_loss"], baseline_result["final_logits_loss"],
+                relative_tolerance, logits_abs_tolerance,
+            )
+            r["attn_pass"] = _component_pass(
+                r["final_attn_loss"], baseline_result["final_attn_loss"],
+                relative_tolerance, attn_abs_tolerance,
+            )
+            r["value_pass"] = _component_pass(
+                r["final_value_loss"], baseline_result["final_value_loss"],
+                relative_tolerance, value_abs_tolerance,
+            )
+            r["all_pass"] = r["logits_pass"] and r["attn_pass"] and r["value_pass"]
+
+        print(f"\n  --- constraint check (rel_tol={relative_tolerance}) ---")
+        print(
+            f"  {'rank':>10}"
+            f"  {'logits':>10}"
+            f"  {'attn':>10}"
+            f"  {'value':>10}"
+            f"  {'result':>8}"
+        )
+        for r in results:
+            tag = "PASS" if r["all_pass"] else "REJECT"
+            print(
+                f"  ({r['rank_k']},{r['rank_v']:>2})"
+                f"  {'PASS' if r['logits_pass'] else 'FAIL':>10}"
+                f"  {'PASS' if r['attn_pass'] else 'FAIL':>10}"
+                f"  {'PASS' if r['value_pass'] else 'FAIL':>10}"
+                f"  {tag:>8}"
+            )
+
         chosen = sorted_candidates[-1]
         for r in results:
-            if r["selection_score"] <= baseline_selection_score + selection_abs_tolerance:
+            if r["all_pass"]:
                 chosen = r["rank_k"]
                 break
 
         selected_ranks[layer_idx] = (chosen, chosen)
         print(
             f"[rank_search] layer {layer_idx}: selected (r_k, r_v)=({chosen}, {chosen})"
-            f"  (baseline_select={baseline_selection_score:.6f}"
-            f"  abs_tol={selection_abs_tolerance})"
+            f"  (rel_tol={relative_tolerance})"
         )
 
         if output_dir is not None:
@@ -184,11 +218,11 @@ def search_rank_per_layer(
                     "layer_idx": layer_idx,
                     "selected_r_k": chosen,
                     "selected_r_v": chosen,
-                    "baseline_selection_score": baseline_selection_score,
-                    "selection_metric": "attn_value_abs",
-                    "selection_value_weight": selection_value_weight,
-                    "selection_abs_tolerance": selection_abs_tolerance,
-                    "tolerance": tolerance,
+                    "selection_method": "constraint",
+                    "relative_tolerance": relative_tolerance,
+                    "logits_abs_tolerance": logits_abs_tolerance,
+                    "attn_abs_tolerance": attn_abs_tolerance,
+                    "value_abs_tolerance": value_abs_tolerance,
                     "candidates": sorted_candidates,
                     "results": results,
                 },
@@ -210,7 +244,6 @@ def run_rank_search_from_config(config) -> dict[int, tuple[int, int]]:
     return search_rank_per_layer(
         calib_dir=calib_dir,
         rank_candidates=config.rank_search.rank_candidates,
-        tolerance=config.rank_search.tolerance,
         n_steps=n_steps,
         lr=config.projector.lr,
         orthogonalize_every=config.projector.orthogonalize_every,
@@ -219,7 +252,8 @@ def run_rank_search_from_config(config) -> dict[int, tuple[int, int]]:
         w_value=config.projector.w_value,
         device=config.train.device,
         output_dir=output_dir,
-        selection_value_weight=config.rank_search.selection_value_weight,
-        selection_abs_tolerance=config.rank_search.selection_abs_tolerance,
-        selection_metric=config.rank_search.selection_metric,
+        relative_tolerance=config.rank_search.relative_tolerance,
+        logits_abs_tolerance=config.rank_search.logits_abs_tolerance,
+        attn_abs_tolerance=config.rank_search.attn_abs_tolerance,
+        value_abs_tolerance=config.rank_search.value_abs_tolerance,
     )

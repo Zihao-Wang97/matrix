@@ -70,8 +70,10 @@ class TokenBudgetScheduler:
     def compute_drop_count(self) -> int:
         decision = self.rebalance()
         new_drop = max(0, decision.n_drop - self._prev_n_drop)
-        self._prev_n_drop = decision.n_drop
         return new_drop
+
+    def acknowledge_drop(self, actually_dropped: int) -> None:
+        self._prev_n_drop += actually_dropped
 
     def reset(self) -> None:
         self._current_seq_len = 0

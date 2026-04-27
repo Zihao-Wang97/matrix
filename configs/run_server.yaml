@@ -5,10 +5,7 @@ data:
   cache: /tmp/hawp_laq_cache
 
 model:
-  name: hawp_laq_base
-  model_id: meta-llama/Llama-2-7b-hf
-  backbone: resnet50
-  pretrained: /models/hawp_laq_base.pth
+  model_id: /data/models/Llama-2-7b-hf
   torch_dtype: float16
   load_in_4bit: true
 
@@ -64,7 +61,6 @@ rank_search:
     - 64
     - 128
     - 256
-  tolerance: 0.02
   output_dir: /data/hawp_laq/artifacts/ranks
 
 train:
@@ -76,6 +72,12 @@ train:
 log:
   level: INFO
   dir: /var/log/hawp_laq
+
+hawp:
+  logit_scale_mode: "rk"
+  gamma_mode: "learned"
+  gamma_value: null
+  use_archive_k_ip_approx: true
 
 serving:
   host: 0.0.0.0

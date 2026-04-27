@@ -47,8 +47,8 @@ class TestQuantConfigFromYaml:
         assert cfg.quant.v_method == "turbo_mse"
         assert cfg.quant.k_bits == 4
         assert cfg.quant.v_bits == 8
-        assert cfg.quant.use_rotation_for_k is True
-        assert cfg.quant.use_rotation_for_v is True
+        assert cfg.quant.use_rotation_for_k is False
+        assert cfg.quant.use_rotation_for_v is False
 
     def test_run_server(self):
         script_dir = Path(__file__).resolve().parent.parent / "configs"

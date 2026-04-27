@@ -9,13 +9,25 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from hawp_laq.config import HAWPLAQConfig, load_config, build_k_quantizer, build_v_quantizer, resolve_projector_ranks, load_projector_ranks_from_dir
 from hawp_laq.modeling.attention_hawp import HAWPAttention
-from hawp_laq.modeling.modeling_llama_hawp import convert_llama_to_hawp
+from hawp_laq.modeling.modeling_llama_hawp import convert_llama_to_hawp, _align_hawp_params_device_dtype
+from hawp_laq.runtime.pure_quant_hook import PureQuantKVManager, install_pure_quant_hooks
 
 _DTYPE_MAP = {
     "float32": torch.float32,
     "float16": torch.float16,
     "bfloat16": torch.bfloat16,
 }
+
+
+def _has_real_past_key_values(past_kv) -> bool:
+    if past_kv is None:
+        return False
+    if isinstance(past_kv, (tuple, list)):
+        return any(kv is not None for kv in past_kv)
+    key_cache = getattr(past_kv, "key_cache", None)
+    if key_cache is not None:
+        return any(k is not None and getattr(k, "numel", lambda: 0)() > 0 for k in key_cache)
+    return True
 
 
 def print_device_info(device: str) -> None:
@@ -49,8 +61,17 @@ def load_baseline_model(cfg: HAWPLAQConfig):
     print(f"[load] load_in_4bit = {cfg.model.load_in_4bit}")
     print(f"[load] device = {device}")
 
+    is_local = Path(model_id).expanduser().is_dir()
+    if is_local:
+        print(f"[load] detected local model directory: {model_id}")
+
     tok_kwargs: dict[str, Any] = {}
     model_kwargs: dict[str, Any] = {"torch_dtype": dtype, "device_map": device}
+
+    if is_local:
+        tok_kwargs["local_files_only"] = True
+        model_kwargs["local_files_only"] = True
+
     if cfg.model.load_in_4bit:
         from transformers import BitsAndBytesConfig
         model_kwargs["quantization_config"] = BitsAndBytesConfig(
@@ -60,8 +81,48 @@ def load_baseline_model(cfg: HAWPLAQConfig):
         model_kwargs.pop("torch_dtype", None)
         model_kwargs.pop("device_map", None)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id, **tok_kwargs)
-    model = AutoModelForCausalLM.from_pretrained(model_id, **model_kwargs)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_id, **tok_kwargs)
+    except OSError as e:
+        if "gated" in str(e).lower() or "access" in str(e).lower():
+            raise OSError(
+                f"Model '{model_id}' requires authentication.  "
+                f"Run `huggingface-cli login` or use a local model path instead.\n"
+                f"Original error: {e}"
+            ) from e
+        if is_local:
+            raise OSError(
+                f"Failed to load tokenizer from local path '{model_id}'.  "
+                f"Ensure the directory contains tokenizer files (tokenizer.json, tokenizer_config.json, etc.).\n"
+                f"Original error: {e}"
+            ) from e
+        raise OSError(
+            f"Failed to load tokenizer for '{model_id}'.  "
+            f"If the server has no internet, set model_id to a local directory path.\n"
+            f"Original error: {e}"
+        ) from e
+
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_id, **model_kwargs)
+    except OSError as e:
+        if "gated" in str(e).lower() or "access" in str(e).lower():
+            raise OSError(
+                f"Model '{model_id}' requires authentication.  "
+                f"Run `huggingface-cli login` or use a local model path instead.\n"
+                f"Original error: {e}"
+            ) from e
+        if is_local:
+            raise OSError(
+                f"Failed to load model from local path '{model_id}'.  "
+                f"Ensure the directory contains model files (config.json, model.safetensors, etc.).\n"
+                f"Original error: {e}"
+            ) from e
+        raise OSError(
+            f"Failed to load model '{model_id}'.  "
+            f"If the server has no internet, download the model first and set model_id to a local directory path.\n"
+            f"Original error: {e}"
+        ) from e
+
     if not cfg.model.load_in_4bit:
         model = model.to(device)
     model.eval()
@@ -83,13 +144,22 @@ def stepwise_greedy_generate(
     max_new_tokens: int,
     coordinator=None,
     reset_cache_fn=None,
-) -> list[str]:
+    full_recompute: bool = False,
+    use_external_past: bool = True,
+    return_ids: bool = False,
+):
     """Unified stepwise greedy generation for fair correctness comparison.
 
     Every mode (baseline, hawp_only, quant_*) goes through the same
     prefill-then-decode loop with argmax selection, ensuring that token
     choices differ only due to the model's KV quantization, not due to
     different outer generation semantics.
+
+    For modes that cannot use the HF KV cache correctly, set
+    ``full_recompute=True`` so that each decode step reprocesses the
+    full sequence.  This is slower but guarantees correctness.  For
+    quant modes that manage KV internally, ``full_recompute=False``
+    (default) relies on the internal cache.
 
     Args:
         model: The model (may be vanilla or HAWP-converted).
@@ -98,8 +168,21 @@ def stepwise_greedy_generate(
         max_new_tokens: Number of new tokens to generate per prompt.
         coordinator: Optional ModelCacheCoordinator for sched mode.
         reset_cache_fn: Optional callable to reset quant cache between prompts.
+        full_recompute: If True, pass the full input_ids each decode step
+            (for models without internal KV cache).
+        use_external_past: If True, feed ``outputs.past_key_values`` back into
+            the next decode step. Quant-cache modes should set this to False
+            because history is managed inside HAWPAttention.
+        return_ids: If True, also return a list of 1-D LongTensors with
+            generated token ids (excluding prompt ids).
+
+    Returns:
+        ``list[str]`` if *return_ids* is False; otherwise
+        ``(list[str], list[Tensor])`` where each Tensor holds the generated
+        ids for one prompt.
     """
     results = []
+    all_gen_ids = []
 
     for prompt in prompts:
         if reset_cache_fn is not None:
@@ -124,7 +207,7 @@ def stepwise_greedy_generate(
             input_ids=input_ids,
             attention_mask=prefill_mask,
             position_ids=prefill_pos,
-            use_cache=False,
+            use_cache=True,
         )
         next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
         generated_ids = next_token
@@ -132,21 +215,42 @@ def stepwise_greedy_generate(
         if coordinator is not None:
             coordinator.on_prefill(prompt_len)
 
+        past_kv = None if full_recompute or not use_external_past else outputs.past_key_values
+
         cur_pos = prompt_len
         for _ in range(max_new_tokens - 1):
-            attention_mask = torch.ones(
-                1, cur_pos + 1, device=model.device, dtype=torch.long,
-            )
-            position_ids = torch.tensor(
-                [[cur_pos]], device=model.device, dtype=torch.long,
-            )
+            if full_recompute:
+                all_ids = torch.cat([input_ids, generated_ids], dim=1)
+                seq_len = all_ids.shape[1]
+                attention_mask = torch.ones(
+                    1, seq_len, device=model.device, dtype=torch.long,
+                )
+                position_ids = torch.arange(
+                    seq_len, device=model.device, dtype=torch.long,
+                ).unsqueeze(0)
+                outputs = model(
+                    input_ids=all_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    use_cache=False,
+                )
+            else:
+                attention_mask = torch.ones(
+                    1, cur_pos + 1, device=model.device, dtype=torch.long,
+                )
+                position_ids = torch.tensor(
+                    [[cur_pos]], device=model.device, dtype=torch.long,
+                )
+                fwd_kw: dict = {
+                    "attention_mask": attention_mask,
+                    "position_ids": position_ids,
+                    "use_cache": True,
+                }
+                if use_external_past and _has_real_past_key_values(past_kv):
+                    fwd_kw["past_key_values"] = past_kv
+                outputs = model(input_ids=next_token, **fwd_kw)
+                past_kv = outputs.past_key_values if use_external_past else None
 
-            outputs = model(
-                input_ids=next_token,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                use_cache=False,
-            )
             next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
             generated_ids = torch.cat([generated_ids, next_token], dim=1)
             cur_pos += 1
@@ -157,24 +261,11 @@ def stepwise_greedy_generate(
         full_ids = torch.cat([input_ids, generated_ids], dim=1)
         text = tokenizer.decode(full_ids[0], skip_special_tokens=True)
         results.append(text)
+        if return_ids:
+            all_gen_ids.append(generated_ids[0].cpu())
 
-    return results
-
-
-@torch.inference_mode()
-def generate_text(model, tokenizer, prompts: list[str], cfg: HAWPLAQConfig) -> list[str]:
-    gen_kw = {
-        "max_new_tokens": cfg.generation.max_new_tokens,
-        "do_sample": cfg.generation.do_sample,
-        "temperature": cfg.generation.temperature,
-        "top_p": cfg.generation.top_p,
-    }
-    results = []
-    for p in prompts:
-        inputs = tokenizer(p, return_tensors="pt").to(model.device)
-        out_ids = model.generate(**inputs, **gen_kw)
-        text = tokenizer.decode(out_ids[0], skip_special_tokens=True)
-        results.append(text)
+    if return_ids:
+        return results, all_gen_ids
     return results
 
 
@@ -211,7 +302,7 @@ def generate_hawp_quant(
             input_ids=input_ids,
             attention_mask=prefill_mask,
             position_ids=prefill_pos,
-            use_cache=False,
+            use_cache=True,
         )
         next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
         generated_ids = next_token
@@ -230,7 +321,7 @@ def generate_hawp_quant(
                 input_ids=next_token,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                use_cache=False,
+                use_cache=True,
             )
             next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
             generated_ids = torch.cat([generated_ids, next_token], dim=1)
@@ -243,6 +334,89 @@ def generate_hawp_quant(
         text = tokenizer.decode(full_ids[0], skip_special_tokens=True)
         results.append(text)
 
+    return results
+
+
+@torch.inference_mode()
+def generate_pure_quant_only(
+    model,
+    tokenizer,
+    prompts: list[str],
+    cfg: HAWPLAQConfig,
+    kv_manager: PureQuantKVManager,
+    return_ids: bool = False,
+):
+    """Stepwise greedy generation for pure_quant_only mode.
+
+    Uses original HF attention with quantized KV cache managed by
+    PureQuantKVManager.  After each forward, captured K/V are stored
+    in the quant cache.  On decode steps, dequantized K/V are fed
+    back as past_key_value.
+
+    Args:
+        return_ids: If True, also return a list of 1-D LongTensors with
+            generated token ids (excluding prompt ids).
+
+    Returns:
+        ``list[str]`` if *return_ids* is False; otherwise
+        ``(list[str], list[Tensor])``.
+    """
+    max_new_tokens = cfg.generation.max_new_tokens
+    results = []
+    all_gen_ids = []
+
+    for prompt in prompts:
+        kv_manager.reset_caches()
+
+        input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(model.device)
+        bsz, prompt_len = input_ids.shape
+
+        prefill_mask = torch.ones(
+            bsz, prompt_len, device=model.device, dtype=torch.long,
+        )
+        prefill_pos = torch.arange(
+            prompt_len, device=model.device, dtype=torch.long,
+        ).unsqueeze(0)
+
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=prefill_mask,
+            position_ids=prefill_pos,
+            use_cache=True,
+        )
+        kv_manager.on_forward_done_from_output(outputs.past_key_values, prev_seq_len=0)
+        next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+        generated_ids = next_token
+
+        cur_pos = prompt_len
+        for _ in range(max_new_tokens - 1):
+            attention_mask = torch.ones(
+                1, cur_pos + 1, device=model.device, dtype=torch.long,
+            )
+            position_ids = torch.tensor([[cur_pos]], device=model.device, dtype=torch.long)
+
+            past_kv = kv_manager.get_past_kv()
+
+            outputs = model(
+                input_ids=next_token,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_kv,
+                use_cache=True,
+            )
+            kv_manager.on_forward_done_from_output(outputs.past_key_values, prev_seq_len=cur_pos)
+            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+            generated_ids = torch.cat([generated_ids, next_token], dim=1)
+            cur_pos += 1
+
+        full_ids = torch.cat([input_ids, generated_ids], dim=1)
+        text = tokenizer.decode(full_ids[0], skip_special_tokens=True)
+        results.append(text)
+        if return_ids:
+            all_gen_ids.append(generated_ids[0].cpu())
+
+    if return_ids:
+        return results, all_gen_ids
     return results
 
 
@@ -368,13 +542,27 @@ def _convert_and_load_projectors(model, cfg, device, mode: str):
         model, r_k=r_k, r_v=r_v,
         ranks_per_layer=effective_ranks_per_layer,
         allow_default_full_rank=allow_default,
+        logit_scale_mode=cfg.hawp.logit_scale_mode,
+        gamma_mode=cfg.hawp.gamma_mode,
+        gamma_value=cfg.hawp.gamma_value,
+        use_archive_k_ip_approx=cfg.hawp.use_archive_k_ip_approx,
     )
-    model = model.to(device)
+    if cfg.model.load_in_4bit:
+        _align_hawp_params_device_dtype(model)
+    else:
+        model = model.to(device)
     model.eval()
 
     if mode != "quant_only":
         from hawp_laq.runtime.projector_bank import load_projectors, inspect_projector_dir
         if Path(projector_dir).exists():
+            if not available_layers:
+                raise RuntimeError(
+                    f"[{mode}] projector_dir exists but contains no projector.pt files: "
+                    f"{projector_dir}. Mode '{mode}' requires trained projectors. "
+                    f"Run `python scripts/02_train_projectors.py` to train projectors first."
+                )
+
             ranks_json_path = Path(projector_dir) / "ranks.json"
             has_pt_files = bool(available_layers)
             if has_pt_files and not ranks_json_path.exists():
@@ -422,12 +610,26 @@ def _convert_and_load_projectors(model, cfg, device, mode: str):
                 )
 
             load_projectors(model, projector_dir, strict=True)
-            print(f"[{mode}] loaded projectors from {projector_dir}")
+            n_hawp = sum(1 for m in model.modules() if isinstance(m, HAWPAttention))
+            n_loaded = len(available_layers)
+            print(f"[{mode}] loaded projectors from {projector_dir} ({n_loaded}/{n_hawp} layers)")
         else:
-            print(f"[{mode}] no projectors at {projector_dir}")
+            raise RuntimeError(
+                f"[{mode}] projector_dir not found: {projector_dir}. "
+                f"Mode '{mode}' requires trained projectors. "
+                f"Run `python scripts/02_train_projectors.py` to train projectors first."
+            )
 
-    print(f"[{mode}] r_k={r_k}  r_v={r_v}"
-          + (f"  per-layer ranks: {len(ranks_per_layer)} layers" if ranks_per_layer else ""))
+    if effective_ranks_per_layer:
+        rk_vals = {rk for rk, _ in effective_ranks_per_layer.values()}
+        rv_vals = {rv for _, rv in effective_ranks_per_layer.values()}
+        lr_count = sum(1 for rk, rv in effective_ranks_per_layer.values() if rk < head_dim or rv < head_dim)
+        print(f"[{mode}] effective ranks: r_k∈{sorted(rk_vals)}  r_v∈{sorted(rv_vals)}  "
+              f"({lr_count} low-rank / {len(effective_ranks_per_layer)} total)")
+    elif ranks_per_layer:
+        print(f"[{mode}] r_k={r_k}  r_v={r_v}  per-layer ranks: {len(ranks_per_layer)} layers")
+    else:
+        print(f"[{mode}] r_k={r_k}  r_v={r_v}")
 
     return model, r_k, r_v
 
@@ -448,8 +650,17 @@ def _setup_hawp_quant_all_on_model(model, cfg, device):
 
 def _setup_quant_only_on_model(model, cfg, device):
     head_dim = _resolve_head_dim_from_model_or_attn(model)
-    model = convert_llama_to_hawp(model, r_k=head_dim, r_v=head_dim, allow_default_full_rank=True)
-    model = model.to(device)
+    model = convert_llama_to_hawp(
+        model, r_k=head_dim, r_v=head_dim, allow_default_full_rank=True,
+        logit_scale_mode=cfg.hawp.logit_scale_mode,
+        gamma_mode=cfg.hawp.gamma_mode,
+        gamma_value=cfg.hawp.gamma_value,
+        use_archive_k_ip_approx=cfg.hawp.use_archive_k_ip_approx,
+    )
+    if cfg.model.load_in_4bit:
+        _align_hawp_params_device_dtype(model)
+    else:
+        model = model.to(device)
     model.eval()
 
     _setup_quant_cache_per_layer(model, cfg, recent_window=cfg.sched.recent_window)
@@ -457,6 +668,28 @@ def _setup_quant_only_on_model(model, cfg, device):
     print(f"[quant_only] head_dim={head_dim}  recent_window={cfg.sched.recent_window}  (explicit full-rank, no low-rank projection)")
 
     return model, head_dim
+
+
+def _setup_pure_quant_only_on_model(model, cfg, device):
+    """Set up pure_quant_only: original HF attention + quantized KV cache.
+
+    Does NOT call convert_llama_to_hawp.  Does NOT create HAWPAttention.
+    Installs forward hooks on k_proj/v_proj to capture K/V, then stores
+    them in a quantized cache.  On decode steps, dequantized K/V are
+    fed back as past_key_value so the original attention formula is
+    preserved.
+    """
+    if not cfg.model.load_in_4bit:
+        model = model.to(device)
+    model.eval()
+
+    manager = install_pure_quant_hooks(model, cfg)
+    head_dim = manager.head_dim
+
+    print(f"[pure_quant_only] head_dim={head_dim}  recent_window={cfg.sched.recent_window}  "
+          f"(original HF attention, no HAWP conversion, quantized KV cache)")
+
+    return model, head_dim, manager
 
 
 def run_baseline(config_path: str | Path) -> None:
@@ -470,7 +703,7 @@ def run_baseline(config_path: str | Path) -> None:
     prompts = cfg.generation.prompts
     print(f"[baseline] running {len(prompts)} prompt(s) ...")
 
-    outputs = generate_text(model, tokenizer, prompts, cfg)
+    outputs = stepwise_greedy_generate(model, tokenizer, prompts, cfg.generation.max_new_tokens)
     _print_results(prompts, outputs)
 
 
@@ -489,7 +722,7 @@ def run_hawp_only(config_path: str | Path) -> None:
     prompts = cfg.generation.prompts
     print(f"[hawp_only] running {len(prompts)} prompt(s) ...")
 
-    outputs = generate_text(model, tokenizer, prompts, cfg)
+    outputs = stepwise_greedy_generate(model, tokenizer, prompts, cfg.generation.max_new_tokens)
     _print_results(prompts, outputs)
 
 
@@ -546,6 +779,31 @@ def run_quant_only(config_path: str | Path) -> None:
             s = module.quant_cache_summary()
             print(f"  layer {s['layer']:>2d}: recent={s['recent_tokens']}  archive={s['archive_tokens']}  "
                   f"runtime={_fmt_bytes(s['total_runtime_bytes'])}  compressed={_fmt_bytes(s['compressed_storage_bytes'])}")
+
+
+@torch.inference_mode()
+def run_pure_quant_only(config_path: str | Path) -> None:
+    cfg = load_config(config_path)
+    print("=" * 60)
+    print("[mode] pure_quant_only")
+    print_device_info(cfg.train.device)
+    print("=" * 60)
+
+    model, tokenizer, device = load_baseline_model(cfg)
+    model, head_dim, kv_manager = _setup_pure_quant_only_on_model(model, cfg, device)
+
+    recent_window = cfg.sched.recent_window
+    print(f"[pure_quant_only] head_dim={head_dim}  recent_window={recent_window}  (original attention + quant KV cache)")
+    prompts = cfg.generation.prompts
+    print(f"[pure_quant_only] running {len(prompts)} prompt(s) ...")
+
+    outputs = generate_pure_quant_only(model, tokenizer, prompts, cfg, kv_manager)
+    _print_results(prompts, outputs)
+
+    print(f"\n[pure_quant_only] --- cache summary ---")
+    for s in kv_manager.cache_summaries():
+        print(f"  layer {s['layer']:>2d}: recent={s['recent_tokens']}  archive={s['archive_tokens']}  "
+              f"runtime={_fmt_bytes(s['total_runtime_bytes'])}  compressed={_fmt_bytes(s['compressed_storage_bytes'])}")
 
 
 @torch.inference_mode()

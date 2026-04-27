@@ -34,8 +34,24 @@ def _run_single_group(cfg, layer_idx: int, clean_output_dir: bool = False) -> No
     meta = load_pt(Path(calib_dir) / "meta.pt")
     n_heads = meta.get("n_heads")
     if n_heads is None:
-        model_cfg = AutoConfig.from_pretrained(cfg.model.model_id)
+        model_cfg = AutoConfig.from_pretrained(cfg.model.model_id, local_files_only=Path(cfg.model.model_id).expanduser().is_dir())
         n_heads = model_cfg.num_attention_heads
+
+    capture_mode = meta.get("capture_mode", "pre_rope")
+    model_type = meta.get("model_type", "")
+    _NON_ROPE_MODEL_TYPES = {"opt", "gpt_neox"}
+
+    if not model_type:
+        model_cfg = AutoConfig.from_pretrained(cfg.model.model_id, local_files_only=Path(cfg.model.model_id).expanduser().is_dir())
+        model_type = getattr(model_cfg, "model_type", "")
+
+    is_rope = model_type.lower() not in _NON_ROPE_MODEL_TYPES
+    if is_rope and capture_mode != "post_rope":
+        raise ValueError(
+            f"RoPE model ({model_type}) requires post_rope calibration data, "
+            f"but got capture_mode={capture_mode}. "
+            f"Re-run calibration with calib.capture_mode=post_rope (or auto)."
+        )
 
     layer_data = load_pt(Path(calib_dir) / f"layer_{layer_idx}.pt")
     q = layer_data["q"].float()
@@ -89,9 +105,11 @@ def _run_rank_search(cfg) -> None:
     print("=" * 60)
     print(f"[rank_search] candidates={cfg.rank_search.rank_candidates}")
     print(f"[rank_search] n_steps={cfg.rank_search.n_steps}  lr={cfg.projector.lr}  device={cfg.train.device}")
-    print(f"[rank_search] selection_metric={cfg.rank_search.selection_metric}"
-          f"  value_weight={cfg.rank_search.selection_value_weight}"
-          f"  abs_tol={cfg.rank_search.selection_abs_tolerance}")
+    print(f"[rank_search] selection=constraint"
+          f"  rel_tol={cfg.rank_search.relative_tolerance}"
+          f"  logits_abs_tol={cfg.rank_search.logits_abs_tolerance}"
+          f"  attn_abs_tol={cfg.rank_search.attn_abs_tolerance}"
+          f"  value_abs_tol={cfg.rank_search.value_abs_tolerance}")
     print("=" * 60)
 
     selected = run_rank_search_from_config(cfg)
@@ -143,7 +161,10 @@ Examples:
     )
     parser.add_argument("--layer", type=int, default=None, help="Target layer index (single_group mode)")
     parser.add_argument("--ranks", nargs="+", type=int, default=None, help="Override rank candidates (rank_search mode)")
-    parser.add_argument("--tolerance", type=float, default=None, help="Override tolerance (rank_search mode)")
+    parser.add_argument("--relative-tolerance", type=float, default=None, help="Override relative tolerance (rank_search mode)")
+    parser.add_argument("--logits-abs-tolerance", type=float, default=None, help="Override logits abs tolerance (rank_search mode)")
+    parser.add_argument("--attn-abs-tolerance", type=float, default=None, help="Override attn abs tolerance (rank_search mode)")
+    parser.add_argument("--value-abs-tolerance", type=float, default=None, help="Override value abs tolerance (rank_search mode)")
     parser.add_argument(
         "--clean-output-dir",
         action="store_true",
@@ -159,8 +180,14 @@ Examples:
 
     if args.ranks is not None:
         cfg.rank_search.rank_candidates = args.ranks
-    if args.tolerance is not None:
-        cfg.rank_search.tolerance = args.tolerance
+    if args.relative_tolerance is not None:
+        cfg.rank_search.relative_tolerance = args.relative_tolerance
+    if args.logits_abs_tolerance is not None:
+        cfg.rank_search.logits_abs_tolerance = args.logits_abs_tolerance
+    if args.attn_abs_tolerance is not None:
+        cfg.rank_search.attn_abs_tolerance = args.attn_abs_tolerance
+    if args.value_abs_tolerance is not None:
+        cfg.rank_search.value_abs_tolerance = args.value_abs_tolerance
 
     if args.mode == "single_group":
         layer_idx = args.layer if args.layer is not None else cfg.projector.target_layer

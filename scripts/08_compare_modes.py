@@ -1,13 +1,20 @@
 #!/usr/bin/env python
 """Compare all modes side-by-side: python scripts/08_compare_modes.py [config]
 
-Separates **correctness** comparison (unified stepwise greedy) from **speed**
-comparison (production-path generation).  This ensures that token-level
-differences are due only to quantisation, not to divergent outer generation
-semantics (e.g. HF generate vs manual decode loop).
+All modes use the same real generation path (profile_generate_by_mode),
+the same prompt / max_new_tokens, and the same measurement:
+  torch.cuda.reset_peak_memory_stats() -> run -> torch.cuda.max_memory_allocated()
+
+Returns unified CacheStats: cache_runtime_bytes, cache_compressed_bytes, peak_gpu_bytes.
+Derived metrics: kv_compression_ratio, bytes_per_token, recent_ratio, archive_ratio,
+  memory_overhead_ratio.
+Quality metrics: token_consistency (from raw ids, no tokenizer round-trip),
+  ΔPPL (stepwise, through quant cache), compression-quality efficiency ratio.
 """
 
 import argparse
+import copy
+import math
 import sys
 import time
 from pathlib import Path
@@ -16,91 +23,48 @@ import torch
 from transformers import AutoConfig
 
 from hawp_laq.config import load_config
-from hawp_laq.modeling.attention_hawp import HAWPAttention
-from hawp_laq.modeling.modeling_llama_hawp import convert_llama_to_hawp
-from hawp_laq.eval.metrics import collect_kv_metrics
 from hawp_laq.runtime.generate import (
     _fmt_bytes,
     _resolve_device,
     load_baseline_model,
-    generate_text,
-    generate_hawp_quant,
     stepwise_greedy_generate,
-    _setup_hawp_quant_on_model,
-    _setup_hawp_quant_all_on_model,
-    _setup_quant_only_on_model,
 )
+from hawp_laq.runtime.mode_runner import setup_mode, make_reset_fn, profile_generate_by_mode
+from hawp_laq.runtime.cache_stats import CacheStats
+from hawp_laq.utils.memory import format_nbytes
 
-_MODES = ["baseline", "hawp_only", "quant_only", "hawp_quant", "hawp_quant_all", "hawp_quant_sched"]
-
-
-def _setup(model, cfg, device, mode):
-    if mode == "baseline":
-        return model, None
-    if mode == "hawp_only":
-        from hawp_laq.runtime.projector_bank import load_projectors
-        model = convert_llama_to_hawp(model, r_k=cfg.projector.r_k, r_v=cfg.projector.r_v)
-        model = model.to(device).eval()
-        if Path(cfg.projector.output_dir).exists():
-            load_projectors(model, cfg.projector.output_dir)
-        return model, None
-    if mode == "quant_only":
-        model, _ = _setup_quant_only_on_model(model, cfg, device)
-        return model, None
-    if mode == "hawp_quant":
-        model = _setup_hawp_quant_on_model(model, cfg, device)
-        return model, None
-    if mode == "hawp_quant_all":
-        model = _setup_hawp_quant_all_on_model(model, cfg, device)
-        return model, None
-    if mode == "hawp_quant_sched":
-        from hawp_laq.runtime.scheduler import TokenBudgetScheduler
-        from hawp_laq.runtime.cache_manager import ModelCacheCoordinator
-        model = _setup_hawp_quant_on_model(model, cfg, device)
-        sched = TokenBudgetScheduler(
-            total_budget=cfg.sched.total_budget,
-            recent_window=cfg.sched.recent_window,
-            high_ratio=cfg.sched.high_ratio,
-            low_ratio=cfg.sched.low_ratio,
-            drop_strategy=getattr(cfg.sched, "drop_strategy", "position"),
-        )
-        coordinator = ModelCacheCoordinator.from_model(
-            model, sched, drop_strategy=getattr(cfg.sched, "drop_strategy", "position"),
-        )
-        return model, coordinator
-    raise ValueError(f"Unknown mode: {mode}")
+_MODES = ["baseline", "hawp_only", "quant_only", "pure_quant_only", "hawp_quant", "hawp_quant_all", "hawp_quant_sched"]
 
 
-def _make_reset_fn(model, coordinator):
-    def _reset():
-        for mod in model.modules():
-            if isinstance(mod, HAWPAttention) and mod.use_cache_manager:
-                mod.reset_quant_cache()
-        if coordinator is not None:
-            coordinator.reset()
-    return _reset
+def _run_correctness(model, tokenizer, prompts, max_new_tokens, coordinator, kv_manager, mode, cfg=None):
+    """Unified stepwise greedy for all modes — for correctness comparison.
 
+    Always returns (texts, gen_ids_list) so consistency can be computed
+    from raw token ids without tokenizer round-trip.
+    """
+    if mode == "pure_quant_only":
+        if cfg is None:
+            from hawp_laq.config import HAWPLAQConfig
+            cfg = HAWPLAQConfig()
+        cfg.generation.max_new_tokens = max_new_tokens
+        from hawp_laq.runtime.generate import generate_pure_quant_only
+        return generate_pure_quant_only(model, tokenizer, prompts, cfg, kv_manager, return_ids=True)
 
-def _run_correctness(model, tokenizer, prompts, max_new_tokens, coordinator, mode):
-    """Unified stepwise greedy for all modes — for correctness comparison."""
     if mode in ("baseline", "hawp_only"):
         reset_fn = None
+        full_recompute = False
     else:
-        reset_fn = _make_reset_fn(model, coordinator)
+        reset_fn = make_reset_fn(model, coordinator, kv_manager)
+        full_recompute = False
 
     return stepwise_greedy_generate(
         model, tokenizer, prompts, max_new_tokens,
         coordinator=coordinator if coordinator is not None else None,
         reset_cache_fn=reset_fn,
+        full_recompute=full_recompute,
+        use_external_past=mode in ("baseline", "hawp_only"),
+        return_ids=True,
     )
-
-
-def _run_speed(model, tokenizer, prompts, cfg, coordinator, mode):
-    """Production-path generation — for speed comparison."""
-    if mode in ("baseline", "hawp_only"):
-        return generate_text(model, tokenizer, prompts, cfg)
-    else:
-        return generate_hawp_quant(model, tokenizer, prompts, cfg, coordinator=coordinator)
 
 
 def _safe_print(text):
@@ -108,48 +72,13 @@ def _safe_print(text):
     return text.encode(enc, errors="replace").decode(enc, errors="replace")
 
 
-def _compute_kv_summary(model, mode, cfg, tokenizer, prompts, model_config, coordinator=None):
-    has_cache = any(isinstance(m, HAWPAttention) and m.use_cache_manager for m in model.modules())
-    n_layers = getattr(model_config, "num_hidden_layers", 12)
-    n_kv_heads = getattr(model_config, "num_key_value_heads", getattr(model_config, "num_attention_heads", 12))
-    head_dim = getattr(model_config, "hidden_size", 768) // getattr(model_config, "num_attention_heads", 12)
-    max_new_tokens = cfg.generation.max_new_tokens
-
-    if has_cache:
-        kv_info = collect_kv_metrics(model)
-        total_tokens = kv_info["total_tokens"]
-        baseline_bytes = total_tokens * n_layers * n_kv_heads * head_dim * 2 * 2
-        runtime_bytes = kv_info.get("total_runtime_bytes", kv_info.get("total_bytes", baseline_bytes))
-        compressed_bytes = kv_info.get("compressed_storage_bytes", kv_info.get("total_bytes", baseline_bytes))
-    elif mode == "hawp_only":
-        seq_len = max(len(tokenizer(p)["input_ids"]) for p in prompts) + max_new_tokens
-        baseline_bytes = seq_len * n_layers * n_kv_heads * head_dim * 2 * 2
-        r_k = cfg.projector.r_k
-        r_v = cfg.projector.r_v
-        runtime_bytes = compressed_bytes = seq_len * n_layers * n_kv_heads * (r_k + r_v) * 2
-    else:
-        seq_len = max(len(tokenizer(p)["input_ids"]) for p in prompts) + max_new_tokens
-        baseline_bytes = seq_len * n_layers * n_kv_heads * head_dim * 2 * 2
-        runtime_bytes = baseline_bytes
-        compressed_bytes = baseline_bytes
-
-    saving = 1.0 - compressed_bytes / baseline_bytes if baseline_bytes > 0 else 0.0
-
-    sched_info = None
-    if mode == "hawp_quant_sched" and coordinator is not None:
-        try:
-            d = coordinator.scheduler.rebalance()
-            sched_info = {"HIGH": d.n_high, "LOW": d.n_low, "DROP": d.n_drop}
-        except Exception:
-            pass
-
-    return {
-        "baseline_bytes": baseline_bytes,
-        "runtime_bytes": runtime_bytes,
-        "compressed_bytes": compressed_bytes,
-        "saving_ratio": saving,
-        "sched_info": sched_info,
-    }
+def _compute_token_consistency_from_ids(baseline_ids: torch.Tensor, mode_ids: torch.Tensor) -> float:
+    n_cmp = min(len(baseline_ids), len(mode_ids))
+    if n_cmp == 0:
+        return 1.0
+    matched = sum(1 for a, b in zip(baseline_ids[:n_cmp].tolist(), mode_ids[:n_cmp].tolist()) if a == b)
+    total = max(len(baseline_ids), len(mode_ids))
+    return matched / total
 
 
 @torch.inference_mode()
@@ -159,6 +88,8 @@ def main():
     parser.add_argument("--modes", nargs="+", default=_MODES, choices=_MODES)
     parser.add_argument("--skip-speed", action="store_true",
                         help="Skip speed comparison (only run correctness)")
+    parser.add_argument("--skip-ppl", action="store_true",
+                        help="Skip perplexity evaluation")
     args = parser.parse_args()
 
     if args.config is None:
@@ -166,69 +97,139 @@ def main():
 
     cfg = load_config(args.config)
     device = _resolve_device(cfg.train.device)
-    model_config = AutoConfig.from_pretrained(cfg.model.model_id)
 
     correctness_results = {}
-    speed_results = {}
-    kv_results = {}
+    profile_results = {}
+    ppl_results = {}
+
+    print(f"\n{'='*60}")
+    print("Loading base model (once) ...")
+    base_model, tokenizer, dev = load_baseline_model(cfg)
+    if not cfg.model.load_in_4bit:
+        base_model = base_model.cpu()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     for mode in args.modes:
         print(f"\n{'='*60}")
-        print(f"[{mode}] loading model ...")
-        model, tokenizer, dev = load_baseline_model(cfg)
-        model, coordinator = _setup(model, cfg, dev, mode)
+        print(f"[{mode}] setting up mode ...")
+
+        try:
+            if cfg.model.load_in_4bit:
+                model, _, _ = load_baseline_model(cfg)
+            else:
+                model = copy.deepcopy(base_model)
+                model = model.to(dev)
+
+            model, coordinator, kv_manager = setup_mode(model, cfg, dev, mode)
+        except (RuntimeError, ValueError, FileNotFoundError) as exc:
+            print(f"[{mode}] SKIPPED — {exc}")
+            if not cfg.model.load_in_4bit:
+                del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            continue
         model.eval()
+        reset_fn = make_reset_fn(model, coordinator, kv_manager)
         prompts = cfg.generation.prompts
         max_new_tokens = cfg.generation.max_new_tokens
+
+        # --- Perplexity (stepwise, through quant cache) ---
+        if not args.skip_ppl:
+            from hawp_laq.eval.perplexity import compute_stepwise_ppl
+            seq_len = cfg.calib.seq_len
+            nsamples = cfg.calib.nsamples if cfg.mode == "local" else None
+            print(f"[{mode}] perplexity stepwise (seq_len={seq_len}, through cache) ...")
+            ppl_result = compute_stepwise_ppl(
+                model, tokenizer,
+                coordinator=coordinator, kv_manager=kv_manager, reset_fn=reset_fn,
+                seq_len=seq_len, nsamples=nsamples, device=dev,
+            )
+            ppl_results[mode] = ppl_result["perplexity"]
+            print(f"[{mode}] PPL={ppl_result['perplexity']:.4f}  (stepwise, quant cache exercised)")
 
         # --- Correctness run (unified stepwise greedy) ---
         print(f"[{mode}] correctness: stepwise greedy ({max_new_tokens} tokens) ...")
         corr_start = time.perf_counter()
-        corr_texts = _run_correctness(model, tokenizer, prompts, max_new_tokens, coordinator, mode)
+        corr_texts, corr_gen_ids = _run_correctness(model, tokenizer, prompts, max_new_tokens, coordinator, kv_manager, mode, cfg)
         corr_time = time.perf_counter() - corr_start
         total_new = max_new_tokens * len(prompts)
         correctness_results[mode] = {
             "texts": corr_texts,
+            "gen_ids": corr_gen_ids,
             "time": corr_time,
             "tok_per_s": total_new / corr_time if corr_time > 0 else 0,
         }
 
-        # --- Speed run (production path) ---
+        # --- Speed + cache + peak GPU run (profile_generate_by_mode) ---
         if not args.skip_speed:
-            if mode in ("baseline", "hawp_only"):
-                for mod in model.modules():
-                    if isinstance(mod, HAWPAttention) and mod.use_cache_manager:
-                        mod.reset_quant_cache()
-            elif coordinator is not None:
-                coordinator.reset()
-            else:
-                for mod in model.modules():
-                    if isinstance(mod, HAWPAttention) and mod.use_cache_manager:
-                        mod.reset_quant_cache()
-
-            print(f"[{mode}] speed: production path ...")
+            print(f"[{mode}] speed + cache + peak GPU: profile_generate_by_mode ...")
             speed_start = time.perf_counter()
-            speed_texts = _run_speed(model, tokenizer, prompts, cfg, coordinator, mode)
+            speed_texts, stats, gen_ids_list = profile_generate_by_mode(
+                model, tokenizer, prompts, cfg, mode,
+                coordinator=coordinator, kv_manager=kv_manager, reset_fn=reset_fn,
+            )
             speed_time = time.perf_counter() - speed_start
-            speed_results[mode] = {
+
+            profile_results[mode] = {
                 "texts": speed_texts,
                 "time": speed_time,
                 "tok_per_s": total_new / speed_time if speed_time > 0 else 0,
+                "stats": stats,
+                "gen_ids": gen_ids_list,
             }
-
-        # --- KV summary ---
-        kv_results[mode] = _compute_kv_summary(model, mode, cfg, tokenizer, prompts, model_config, coordinator)
 
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    del base_model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Determine reference mode for consistency
+    if "baseline" in correctness_results:
+        ref_mode = "baseline"
+    elif "hawp_only" in correctness_results:
+        ref_mode = "hawp_only"
+    elif args.modes:
+        ref_mode = args.modes[0]
+    else:
+        ref_mode = None
+
+    if ref_mode is not None and ref_mode != "baseline":
+        print(f"\n[warning] 'baseline' not in --modes; using '{ref_mode}' as reference for consistency/ΔPPL")
+
+    # Pre-compute token consistency per mode vs reference (always from raw ids)
+    consistency = {}
+    if ref_mode and len(args.modes) > 1 and ref_mode in correctness_results:
+        ref_ids_list = correctness_results[ref_mode].get("gen_ids")
+        if ref_ids_list is None:
+            print("\n[warning] no gen_ids available for consistency comparison; skipping")
+        else:
+            for mode in args.modes:
+                if mode == ref_mode:
+                    consistency[mode] = 1.0
+                    continue
+                if mode not in correctness_results:
+                    continue
+                mode_ids_list = correctness_results[mode].get("gen_ids")
+                if mode_ids_list is None:
+                    continue
+                ratios = []
+                for ref_ids, mode_ids in zip(ref_ids_list, mode_ids_list):
+                    ratios.append(_compute_token_consistency_from_ids(ref_ids, mode_ids))
+                consistency[mode] = sum(ratios) / len(ratios) if ratios else 0.0
 
     # ================================================================
     # Print: Correctness comparison
     # ================================================================
     print("\n" + "=" * 80)
     print("CORRECTNESS COMPARISON  (unified stepwise greedy, argmax)")
-    print("  -> All modes use the same outer decode loop.")
+    print("  -> All modes use the same argmax token selection.")
+    print("  -> All modes use incremental KV cache (past_key_values) for decoding.")
+    print("  -> quant_*: internal KV cache (only new token per step)")
+    print("  -> pure_quant_only: original attention + quantized KV cache (no HAWP)")
     print("  -> Token differences are due only to quantisation / low-rank.")
     print("=" * 80)
 
@@ -238,48 +239,96 @@ def main():
             text = correctness_results[mode]["texts"][pi]
             print(f"  [{mode:>20}] {_safe_print(text)}")
 
+    # Token consistency + ΔPPL
+    if consistency:
+        print(f"\n{'='*80}")
+        ref_label = ref_mode
+        print(f"QUALITY COMPARISON  (vs {ref_label})")
+        print(f"{'='*80}")
+        header = f"{'Mode':<22} {'Consistency':>12}"
+        if ppl_results:
+            header += f" {'PPL':>10} {'ΔPPL':>10}"
+        print(f"\n{header}")
+        print("-" * len(header))
+        ref_ppl = ppl_results.get(ref_mode, None) if ppl_results else None
+        for mode in args.modes:
+            line = f"{mode:<22} {consistency.get(mode, 0.0):>11.1%}"
+            if ppl_results and mode in ppl_results:
+                ppl = ppl_results[mode]
+                dppl = ppl - ref_ppl if ref_ppl is not None and not math.isnan(ppl) else float("nan")
+                line += f" {ppl:>10.2f} {dppl:>+10.2f}"
+            print(line)
+
     # ================================================================
-    # Print: Speed comparison
+    # Print: Speed + Cache + Peak GPU comparison
     # ================================================================
-    if speed_results:
+    if profile_results:
         print("\n" + "=" * 80)
-        print("SPEED COMPARISON  (production-path generation)")
-        print("  -> baseline / hawp_only use HF model.generate().")
-        print("  -> quant_* modes use manual stepwise decode loop.")
-        print("  -> Speed numbers are NOT directly comparable across paths.")
+        print("SPEED + CACHE + PEAK GPU COMPARISON  (profile_generate_by_mode)")
+        print("  -> All modes use the same stepwise generation + measurement flow.")
+        print("  -> cache_runtime_bytes = real runtime cache footprint (not formula).")
+        print("  -> peak_gpu_bytes = torch.cuda.max_memory_allocated().")
         print("=" * 80)
 
-        print(f"\n{'Mode':<22} {'Time (s)':>10} {'Speed':>12}")
-        print("-" * 46)
+        print(f"\n{'Mode':<22} {'Speed':>12} {'KV压缩率':>10} {'model_B/tok':>12} {'Overhead':>9} {'Cache RT':>12} {'Peak GPU':>12}")
+        print("-" * 90)
         for mode in args.modes:
-            r = speed_results[mode]
-            print(f"{mode:<22} {r['time']:>10.2f} {r['tok_per_s']:>10.1f} t/s")
-    else:
-        print("\n  (speed comparison skipped)")
+            if mode not in profile_results:
+                continue
+            r = profile_results[mode]
+            s = r["stats"]
+            cr = f"{s.kv_compression_ratio:.1f}x" if s.kv_compression_ratio > 0 else "N/A"
+            bpt = f"{s.bytes_per_token:.1f}" if s.bytes_per_token > 0 else "N/A"
+            oh = f"{s.memory_overhead_ratio:.1f}x" if s.memory_overhead_ratio > 0 else "N/A"
+            print(f"{mode:<22} {r['tok_per_s']:>10.1f} t/s "
+                  f"{cr:>10} {bpt:>12} {oh:>9} "
+                  f"{format_nbytes(s.cache_runtime_bytes):>12} "
+                  f"{format_nbytes(s.peak_gpu_bytes):>12}")
+
+        # Detailed cache stats
+        print(f"\n{'='*80}")
+        print("CACHE DETAIL")
+        print(f"{'='*80}")
+        for mode in args.modes:
+            if mode not in profile_results:
+                continue
+            s = profile_results[mode]["stats"]
+            print(f"\n  [{mode}]")
+            print(f"    tokens_total={s.cache_tokens_total}  recent={s.recent_tokens} ({s.recent_ratio:.1%})  "
+                  f"archive={s.archive_tokens} ({s.archive_ratio:.1%})")
+            print(f"    runtime={format_nbytes(s.cache_runtime_bytes)}  "
+                  f"archive_quant={format_nbytes(s.cache_compressed_bytes)}  "
+                  f"baseline_kv={format_nbytes(s.baseline_kv_bytes)}  "
+                  f"compression={s.kv_compression_ratio:.1f}x  "
+                  f"overhead={s.memory_overhead_ratio:.1f}x  "
+                  f"impl={s.impl}")
 
     # ================================================================
-    # Print: KV memory comparison
+    # Print: Compression-Quality Efficiency Ratio
     # ================================================================
-    print("\n" + "=" * 80)
-    print("KV MEMORY COMPARISON")
-    print("=" * 80)
-
-    print(f"\n{'Mode':<22} {'Baseline':>12} {'Runtime':>12} {'Compressed':>12} {'Saving':>8}")
-    print("-" * 70)
-    for mode in args.modes:
-        kv = kv_results[mode]
-        print(f"{mode:<22} {_fmt_bytes(kv['baseline_bytes']):>12} "
-              f"{_fmt_bytes(kv['runtime_bytes']):>12} "
-              f"{_fmt_bytes(kv['compressed_bytes']):>12} "
-              f"{kv['saving_ratio']:>7.1%}")
-
-    if any(kv_results[m].get("sched_info") for m in args.modes):
-        print(f"\n{'Mode':<22} {'HIGH':>6} {'LOW':>6} {'DROP':>6}")
-        print("-" * 42)
+    if consistency and profile_results and ref_mode:
+        print(f"\n{'='*80}")
+        print(f"COMPRESSION-QUALITY EFFICIENCY  (compression_ratio-1)/(1-consistency)")
+        print("  -> Higher = more compression gained per unit of quality lost.")
+        print("  -> 'inf' means no quality loss at all (consistency=100%).")
+        print(f"{'='*80}")
+        print(f"\n{'Mode':<22} {'压缩率':>10} {'一致率':>10} {'效率比':>12}")
+        print("-" * 58)
         for mode in args.modes:
-            si = kv_results[mode].get("sched_info")
-            if si:
-                print(f"{mode:<22} {si['HIGH']:>6} {si['LOW']:>6} {si['DROP']:>6}")
+            if mode == ref_mode:
+                print(f"{mode:<22} {'1.0x':>10} {'100.0%':>10} {'—':>12}")
+                continue
+            if mode not in profile_results or mode not in consistency:
+                continue
+            cr = profile_results[mode]["stats"].kv_compression_ratio
+            c = consistency[mode]
+            if c >= 1.0:
+                eff = float("inf")
+                eff_str = "inf"
+            else:
+                eff = (cr - 1.0) / (1.0 - c)
+                eff_str = f"{eff:.1f}"
+            print(f"{mode:<22} {cr:>9.1f}x {c:>9.1%} {eff_str:>12}")
 
 
 if __name__ == "__main__":

@@ -17,58 +17,14 @@ from hawp_laq.runtime.generate import (
     load_baseline_model,
     _resolve_device,
     _fmt_bytes,
-    _setup_hawp_quant_on_model,
-    _setup_quant_only_on_model,
-    generate_text,
-    generate_hawp_quant,
 )
+from hawp_laq.runtime.mode_runner import setup_mode, make_reset_fn, generate_by_mode, profile_generate_by_mode
+from hawp_laq.runtime.cache_stats import CacheStats
 from hawp_laq.modeling.attention_hawp import HAWPAttention
-from hawp_laq.modeling.modeling_llama_hawp import convert_llama_to_hawp
+from hawp_laq.utils.memory import format_nbytes
 
 
-def _setup_mode(model, cfg, device, mode: str):
-    if mode == "baseline":
-        return model, None
-
-    if mode == "hawp_only":
-        from hawp_laq.runtime.projector_bank import load_projectors
-        r_k, r_v = cfg.projector.r_k, cfg.projector.r_v
-        model = convert_llama_to_hawp(model, r_k=r_k, r_v=r_v)
-        model = model.to(device).eval()
-        if Path(cfg.projector.output_dir).exists():
-            load_projectors(model, cfg.projector.output_dir)
-        return model, None
-
-    if mode == "quant_only":
-        model, _ = _setup_quant_only_on_model(model, cfg, device)
-        return model, "quant"
-
-    if mode in ("hawp_quant", "hawp_quant_all", "hawp_quant_sched"):
-        if mode == "hawp_quant_all":
-            from hawp_laq.runtime.generate import _setup_hawp_quant_all_on_model
-            model = _setup_hawp_quant_all_on_model(model, cfg, device)
-        else:
-            model = _setup_hawp_quant_on_model(model, cfg, device)
-        coordinator = None
-        if mode == "hawp_quant_sched":
-            from hawp_laq.runtime.scheduler import TokenBudgetScheduler
-            from hawp_laq.runtime.cache_manager import ModelCacheCoordinator
-            sched = TokenBudgetScheduler(
-                total_budget=cfg.sched.total_budget,
-                recent_window=cfg.sched.recent_window,
-                high_ratio=cfg.sched.high_ratio,
-                low_ratio=cfg.sched.low_ratio,
-                drop_strategy=getattr(cfg.sched, "drop_strategy", "position"),
-            )
-            coordinator = ModelCacheCoordinator.from_model(
-                model, sched, drop_strategy=getattr(cfg.sched, "drop_strategy", "position"),
-            )
-        return model, coordinator
-
-    raise ValueError(f"Unknown mode: {mode}")
-
-
-def _run_perplexity(model, tokenizer, cfg, mode, coordinator, device):
+def _run_perplexity(model, tokenizer, cfg, mode, coordinator, kv_manager, device):
     from hawp_laq.eval.perplexity import compute_perplexity
 
     seq_len = cfg.calib.seq_len
@@ -76,13 +32,10 @@ def _run_perplexity(model, tokenizer, cfg, mode, coordinator, device):
 
     print(f"\n{'='*60}")
     print(f"[ppl] mode={mode}  seq_len={seq_len}  nsamples={nsamples}")
+    print(f"  NOTE: teacher-forcing PPL — does not exercise quant cache / scheduler path")
     print(f"{'='*60}")
 
-    for mod in model.modules():
-        if isinstance(mod, HAWPAttention) and mod.use_cache_manager:
-            mod.reset_quant_cache()
-    if coordinator is not None:
-        coordinator.reset()
+    make_reset_fn(model, coordinator, kv_manager)()
 
     result = compute_perplexity(model, tokenizer, seq_len=seq_len, nsamples=nsamples, device=device)
     print(f"  perplexity={result['perplexity']:.4f}  nll={result['nll']:.4f}  "
@@ -90,7 +43,7 @@ def _run_perplexity(model, tokenizer, cfg, mode, coordinator, device):
     return result
 
 
-def _run_needle(model, tokenizer, cfg, mode, coordinator, device):
+def _run_needle(model, tokenizer, cfg, mode, coordinator, kv_manager, device):
     from hawp_laq.eval.needle import run_needle_test, needle_accuracy
 
     if cfg.mode == "local":
@@ -104,10 +57,19 @@ def _run_needle(model, tokenizer, cfg, mode, coordinator, device):
     print(f"[needle] mode={mode}  context_lens={context_lens}")
     print(f"{'='*60}")
 
+    def generate_fn(prompt: str) -> str:
+        outputs = generate_by_mode(
+            model, tokenizer, [prompt], cfg, mode,
+            coordinator=coordinator, kv_manager=kv_manager,
+        )
+        return outputs[0]
+
     results = run_needle_test(
         model, tokenizer,
         context_lens=context_lens, depths=depths,
         device=device,
+        generate_fn=generate_fn,
+        reset_fn=make_reset_fn(model, coordinator, kv_manager),
     )
 
     acc = needle_accuracy(results)
@@ -119,10 +81,12 @@ def _run_needle(model, tokenizer, cfg, mode, coordinator, device):
     return {"accuracy_summary": acc, "details": results}
 
 
-def _run_long_context_speed(model, tokenizer, cfg, mode, coordinator, device, seq_lens, max_new_tokens):
+def _run_long_context_speed(model, tokenizer, cfg, mode, coordinator, kv_manager, device, seq_lens, max_new_tokens):
     print(f"\n{'='*60}")
     print(f"[long_ctx] mode={mode}  seq_lens={seq_lens}")
     print(f"{'='*60}")
+
+    reset_fn = make_reset_fn(model, coordinator, kv_manager)
 
     results = []
     for seq_len in seq_lens:
@@ -132,35 +96,34 @@ def _run_long_context_speed(model, tokenizer, cfg, mode, coordinator, device, se
         prompt_ids = enc["input_ids"][0][:seq_len]
         prompt = tokenizer.decode(prompt_ids)
 
-        for mod in model.modules():
-            if isinstance(mod, HAWPAttention) and mod.use_cache_manager:
-                mod.reset_quant_cache()
-        if coordinator is not None:
-            coordinator.reset()
+        reset_fn()
 
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
         start = time.perf_counter()
-
-        with torch.inference_mode():
-            out_ids = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
-
+        outputs, stats, _ = profile_generate_by_mode(
+            model, tokenizer, [prompt], cfg, mode,
+            coordinator=coordinator, kv_manager=kv_manager, reset_fn=reset_fn,
+        )
         elapsed = time.perf_counter() - start
-        peak_mem = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
+
+        input_len = len(tokenizer.encode(prompt))
+        generated_text = outputs[0]
+        new_tokens = len(tokenizer.encode(generated_text)) - input_len
 
         info = {
             "target_seq_len": seq_len,
-            "input_len": inputs["input_ids"].shape[1],
-            "new_tokens": out_ids.shape[1] - inputs["input_ids"].shape[1],
+            "input_len": input_len,
+            "new_tokens": new_tokens,
             "elapsed_s": round(elapsed, 3),
             "tokens_per_s": round(max_new_tokens / elapsed, 2) if elapsed > 0 else 0,
-            "peak_gpu_bytes": peak_mem,
-            "peak_gpu_formatted": _fmt_bytes(peak_mem),
+            "peak_gpu_bytes": stats.peak_gpu_bytes,
+            "peak_gpu_formatted": format_nbytes(stats.peak_gpu_bytes),
+            "cache_runtime_bytes": stats.cache_runtime_bytes,
+            "cache_runtime_formatted": format_nbytes(stats.cache_runtime_bytes),
         }
         results.append(info)
         print(f"  seq={seq_len:>5d}: time={info['elapsed_s']:>6.3f}s  "
-              f"speed={info['tokens_per_s']:>6.1f} tok/s  peak_gpu={info['peak_gpu_formatted']}")
+              f"speed={info['tokens_per_s']:>6.1f} tok/s  peak_gpu={info['peak_gpu_formatted']}  "
+              f"cache={info['cache_runtime_formatted']}")
 
     return results
 
@@ -180,7 +143,7 @@ def main():
     parser = argparse.ArgumentParser(description="HAWP-LAQ long context eval")
     parser.add_argument("config", nargs="?", default=None)
     parser.add_argument("--mode",
-                        choices=["baseline", "hawp_only", "quant_only", "hawp_quant", "hawp_quant_all", "hawp_quant_sched"],
+                        choices=["baseline", "hawp_only", "quant_only", "hawp_quant", "hawp_quant_all", "hawp_quant_sched", "pure_quant_only"],
                         default="baseline")
     parser.add_argument("--seq-lens", nargs="+", type=int, default=[512, 1024, 2048])
     parser.add_argument("--max-new-tokens", type=int, default=32)
@@ -199,16 +162,16 @@ def main():
     print("=" * 60)
 
     model, tokenizer, _ = load_baseline_model(cfg)
-    model, coordinator = _setup_mode(model, cfg, device, args.mode)
+    model, coordinator, kv_manager = setup_mode(model, cfg, device, args.mode)
     model.eval()
 
     if not args.skip_ppl:
-        _run_perplexity(model, tokenizer, cfg, args.mode, coordinator, device)
+        _run_perplexity(model, tokenizer, cfg, args.mode, coordinator, kv_manager, device)
 
     if not args.skip_needle:
-        _run_needle(model, tokenizer, cfg, args.mode, coordinator, device)
+        _run_needle(model, tokenizer, cfg, args.mode, coordinator, kv_manager, device)
 
-    _run_long_context_speed(model, tokenizer, cfg, args.mode, coordinator, device, args.seq_lens, args.max_new_tokens)
+    _run_long_context_speed(model, tokenizer, cfg, args.mode, coordinator, kv_manager, device, args.seq_lens, args.max_new_tokens)
 
     _print_kv_summary(model)
 

@@ -11,7 +11,7 @@ from hawp_laq.utils.memory import format_nbytes
 class CacheManager:
     """Multi-layer KV cache with recent/archive tiers and TurboQuant.
 
-    * Recent tokens: stored as fp16 latent.
+    * Recent tokens: stored as latent tensors in ``dtype`` precision.
     * Archive tokens: K via TurboQuantProd, V via TurboQuantMSE.
 
     Can be constructed either from a :class:`HAWPLAQConfig` or by
@@ -35,6 +35,8 @@ class CacheManager:
         cfg: Optional HAWPLAQConfig — used to build K/V quantizers.
         k_quantizer: Pre-built K quantizer (overrides cfg).
         v_quantizer: Pre-built V quantizer (overrides cfg).
+        dtype: Storage dtype for recent tokens, forwarded to LayerKVCache.
+            Must match the model weight dtype.  Required (no default).
     """
 
     def __init__(
@@ -42,9 +44,11 @@ class CacheManager:
         n_layers: int,
         n_heads: int,
         head_dim: int,
+        dtype: torch.dtype,
         k_dim: int | None = None,
         v_dim: int | None = None,
         scheduler: TokenBudgetScheduler | None = None,
+        recent_window: int | None = None,
         cfg: HAWPLAQConfig | None = None,
         k_quantizer=None,
         v_quantizer=None,
@@ -55,6 +59,7 @@ class CacheManager:
         self.head_dim = head_dim
         self.k_dim = k_dim if k_dim is not None else head_dim
         self.v_dim = v_dim if v_dim is not None else head_dim
+        self.recent_window = recent_window if recent_window is not None else 0
         if self.k_dim != self.v_dim:
             raise NotImplementedError(
                 f"CacheManager requires k_dim == v_dim, but got k_dim={self.k_dim}, "
@@ -97,7 +102,7 @@ class CacheManager:
                 use_rotation=v_quantizer.use_rotation,
                 group_size=v_quantizer.group_size,
             )
-            self._caches.append(LayerKVCache(n_heads, head_dim, kq, vq))
+            self._caches.append(LayerKVCache(n_heads, head_dim, kq, vq, dtype=dtype, recent_window=self.recent_window))
 
     # ------------------------------------------------------------------
     # Append
@@ -117,10 +122,10 @@ class CacheManager:
     # ------------------------------------------------------------------
 
     def get_kv_for_attention(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Get full KV for a layer: archive dequantized + recent fp16.
+        """Get full KV for a layer: archive dequantized + recent.
 
         Returns:
-            ``(k, v)`` float tensors of shape ``[T, dim]``.
+            ``(k, v)`` tensors of shape ``[T, dim]`` in ``dtype``.
         """
         cache = self._caches[layer_idx]
         return cache.get_all_k(), cache.get_all_v()
@@ -140,10 +145,20 @@ class CacheManager:
 
     def apply_scheduler(self) -> int:
         drop_count = self.scheduler.compute_drop_count()
-        if drop_count > 0:
-            for c in self._caches:
-                c.drop_oldest(drop_count)
-        return drop_count
+        if drop_count <= 0:
+            return 0
+        min_can_drop = drop_count
+        for c in self._caches:
+            min_can_drop = min(min_can_drop, c.n_archive)
+        if min_can_drop <= 0:
+            return 0
+        actual_drops = []
+        for c in self._caches:
+            actual_drops.append(c.drop_oldest(min_can_drop))
+        min_dropped = min(actual_drops) if actual_drops else 0
+        if min_dropped > 0:
+            self.scheduler.acknowledge_drop(min_dropped)
+        return min_dropped
 
     # ------------------------------------------------------------------
     # Memory
@@ -245,11 +260,20 @@ class ModelCacheCoordinator:
         drop_count = self.scheduler.compute_drop_count()
         if drop_count <= 0:
             return
+        min_can_drop = drop_count
+        for layer in self._layers:
+            min_can_drop = min(min_can_drop, layer.n_archive_tokens)
+        if min_can_drop <= 0:
+            return
+        actual_drops = []
         for layer in self._layers:
             if self.drop_strategy == "norm":
-                layer.drop_least_important_from_archive(drop_count)
+                actual_drops.append(layer.drop_least_important_from_archive(min_can_drop))
             else:
-                layer.drop_oldest_from_archive(drop_count)
+                actual_drops.append(layer.drop_oldest_from_archive(min_can_drop))
+        min_dropped = min(actual_drops) if actual_drops else 0
+        if min_dropped > 0:
+            self.scheduler.acknowledge_drop(min_dropped)
 
     def reset(self) -> None:
         self.scheduler.reset()

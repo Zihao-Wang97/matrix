@@ -28,6 +28,7 @@ class CompressorPackage:
         recent_window: int = 64,
         high_ratio: float = 0.25,
         low_ratio: float = 0.60,
+        kv_elem_size: int = 2,
     ):
         self.projector_dir = Path(projector_dir)
         self.n_layers = n_layers
@@ -42,6 +43,7 @@ class CompressorPackage:
         self.recent_window = recent_window
         self.high_ratio = high_ratio
         self.low_ratio = low_ratio
+        self.kv_elem_size = kv_elem_size
 
         self._projectors: dict[int, dict] = {}
         self._load_projectors()
@@ -91,10 +93,10 @@ class CompressorPackage:
 
             n_kv_heads = self.n_heads
 
-            baseline_bytes = 2 * seq_len * n_kv_heads * self.head_dim * 2
-            latent_bytes = 2 * seq_len * n_kv_heads * r_k * 2
+            baseline_bytes = 2 * seq_len * n_kv_heads * self.head_dim * self.kv_elem_size
+            latent_bytes = 2 * seq_len * n_kv_heads * r_k * self.kv_elem_size
             if r_v != r_k:
-                latent_bytes = seq_len * n_kv_heads * r_k * 2 + seq_len * n_kv_heads * r_v * 2
+                latent_bytes = seq_len * n_kv_heads * r_k * self.kv_elem_size + seq_len * n_kv_heads * r_v * self.kv_elem_size
 
             k_quant = KQuantizer(group_size=self.k_group_size, use_rotation=self.use_rotation_for_k)
             v_quant = VQuantizer(group_size=self.v_group_size, outlier_threshold=self.outlier_threshold)
@@ -162,6 +164,7 @@ class CompressorPackage:
             "recent_window": self.recent_window,
             "high_ratio": self.high_ratio,
             "low_ratio": self.low_ratio,
+            "kv_elem_size": self.kv_elem_size,
             "ranks": {str(k): {"r_k": v[0], "r_v": v[1]} for k, v in self.ranks.items()},
         }
         save_json(meta, output_dir / "compressor_meta.json")
@@ -196,6 +199,7 @@ class CompressorPackage:
             recent_window=meta.get("recent_window", 64),
             high_ratio=meta.get("high_ratio", 0.25),
             low_ratio=meta.get("low_ratio", 0.60),
+            kv_elem_size=meta.get("kv_elem_size", 2),
         )
 
 

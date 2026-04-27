@@ -1,4 +1,5 @@
 import pytest
+import torch
 
 from hawp_laq.runtime.cache_manager import CacheManager
 from hawp_laq.config import HAWPLAQConfig
@@ -10,6 +11,7 @@ def test_cache_manager_rejects_asymmetric_dims_if_layer_cache_not_supported():
             n_layers=2,
             n_heads=4,
             head_dim=16,
+            dtype=torch.float32,
             k_dim=8,
             v_dim=6,
         )
@@ -20,6 +22,7 @@ def test_cache_manager_accepts_symmetric_kv_dims():
         n_layers=2,
         n_heads=4,
         head_dim=16,
+        dtype=torch.float32,
         k_dim=8,
         v_dim=8,
     )

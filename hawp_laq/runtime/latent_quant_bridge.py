@@ -188,8 +188,8 @@ def saving_ratio(
     """
     quant = latent_kv_bytes(qkv, k_quantizer, v_quantizer)
     seq_len = qkv.k_q.shape_orig[0] if qkv.k_q.shape_orig[0] > 0 else qkv.k_q.q.shape[0]
-    r_k = qkv.k_q.q.shape[-1]
-    r_v = qkv.v_q.q.shape[-1]
+    r_k = qkv.k_q.shape_orig[-1]
+    r_v = qkv.v_q.shape_orig[-1]
     base = baseline_kv_bytes(seq_len, r_k, r_v)
     if base["total_bytes"] == 0:
         return 0.0

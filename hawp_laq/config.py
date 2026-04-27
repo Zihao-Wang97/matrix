@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional, get_type_hints, Union
+import warnings
 
 import yaml
 
@@ -13,10 +14,7 @@ class DataConfig:
 
 @dataclass
 class ModelConfig:
-    name: str = "hawp_laq_base"
     model_id: str = "facebook/opt-125m"
-    backbone: str = "resnet50"
-    pretrained: Optional[Path] = None
     torch_dtype: str = "float32"
     load_in_4bit: bool = False
 
@@ -36,6 +34,7 @@ class CalibConfig:
     seq_len: int = 128
     output_dir: Path = Path("artifacts/calib")
     dataset: str = "wikitext2"
+    capture_mode: str = "auto"
 
 
 @dataclass
@@ -78,13 +77,13 @@ class SchedConfig:
 
 @dataclass
 class RankSearchConfig:
-    rank_candidates: list = field(default_factory=lambda: [8, 16, 32, 64])
-    tolerance: float = 0.02
+    rank_candidates: list = field(default_factory=lambda: [16, 32, 48 ,64])
     output_dir: Path = Path("artifacts/ranks")
     n_steps: int = 1500
-    selection_metric: str = "attn_value_abs"
-    selection_value_weight: float = 0.25
-    selection_abs_tolerance: float = 0.04
+    relative_tolerance: float = 0.10
+    logits_abs_tolerance: float = 1e-6
+    attn_abs_tolerance: float = 1e-5
+    value_abs_tolerance: float = 1e-4
 
 
 @dataclass
@@ -109,6 +108,14 @@ class ServingConfig:
 
 
 @dataclass
+class HAWPConfig:
+    logit_scale_mode: str = "rk"
+    gamma_mode: str = "learned"
+    gamma_value: float | None = None
+    use_archive_k_ip_approx: bool = True
+
+
+@dataclass
 class HAWPLAQConfig:
     mode: str = "local"
     data: DataConfig = field(default_factory=DataConfig)
@@ -122,6 +129,7 @@ class HAWPLAQConfig:
     train: TrainConfig = field(default_factory=TrainConfig)
     log: LogConfig = field(default_factory=LogConfig)
     serving: ServingConfig = field(default_factory=ServingConfig)
+    hawp: HAWPConfig = field(default_factory=HAWPConfig)
 
 
 def _to_dataclass(cls: type, raw: dict[str, Any]) -> Any:
@@ -138,6 +146,14 @@ def _to_dataclass(cls: type, raw: dict[str, Any]) -> Any:
             init_kwargs[f] = Path(str(val))
         else:
             init_kwargs[f] = val
+    unknown = set(raw.keys()) - set(cls.__dataclass_fields__.keys())
+    if unknown:
+        warnings.warn(
+            f"Unknown fields in {cls.__name__}: {sorted(unknown)}. "
+            f"These fields are not recognized and will be ignored.",
+            UserWarning,
+            stacklevel=3,
+        )
     return cls(**init_kwargs)
 
 
