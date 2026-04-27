@@ -1,11 +1,37 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import torch
 
 from hawp_laq.utils.math_utils import orthogonalize
 from hawp_laq.utils.packbits import pack_uint4, unpack_uint4, pack_uint2, unpack_uint2, pack_bool, unpack_bool
+
+
+def _validate_logical_shape(
+    logical_shape: tuple[int, ...] | None,
+    *,
+    dim: int,
+    n_rows: int,
+) -> tuple[int, ...] | None:
+    if logical_shape is None:
+        return None
+
+    logical_shape = tuple(logical_shape)
+    if len(logical_shape) < 1:
+        raise ValueError("logical_shape must have at least one dimension")
+    if logical_shape[-1] != dim:
+        raise ValueError(
+            f"logical_shape last dim must equal quantizer dim={dim}, got {logical_shape[-1]}"
+        )
+    logical_rows = math.prod(logical_shape[:-1])
+    if logical_rows != n_rows:
+        raise ValueError(
+            f"logical_shape row product must match flattened rows: "
+            f"prod({logical_shape[:-1]})={logical_rows}, rows={n_rows}"
+        )
+    return logical_shape
 
 
 @dataclass
@@ -35,6 +61,7 @@ class TurboQuantizedTensor:
         shape_orig: Original input shape before reshape.
         bits: Bits per element.
         group_size: Quantization group size.
+        logical_shape: Optional logical layout used by cache code.
     """
 
     q: torch.Tensor
@@ -44,6 +71,7 @@ class TurboQuantizedTensor:
     shape_orig: tuple[int, ...]
     bits: int
     group_size: int
+    logical_shape: tuple[int, ...] | None = None
 
 
 class TurboQuantMSE:
@@ -151,7 +179,11 @@ class TurboQuantMSE:
     # Quantize
     # ------------------------------------------------------------------
 
-    def quantize(self, x: torch.Tensor) -> TurboQuantizedTensor:
+    def quantize(
+        self,
+        x: torch.Tensor,
+        logical_shape: tuple[int, ...] | None = None,
+    ) -> TurboQuantizedTensor:
         """Quantize a float tensor.
 
         Args:
@@ -178,6 +210,11 @@ class TurboQuantMSE:
 
         shape_orig = x.shape
         x_2d = x.reshape(-1, self.dim).float()  # [N, D]
+        logical_shape = _validate_logical_shape(
+            logical_shape,
+            dim=self.dim,
+            n_rows=x_2d.shape[0],
+        )
 
         # --- Step 1: optional rotation ---
         rotation: torch.Tensor | None = None
@@ -238,6 +275,7 @@ class TurboQuantMSE:
             shape_orig=shape_orig,
             bits=self.bits,
             group_size=gs,
+            logical_shape=logical_shape,
         )
 
     # ------------------------------------------------------------------
@@ -291,6 +329,14 @@ class TurboQuantMSE:
             x_2d = x_2d @ rot
 
         return x_2d.reshape(qx.shape_orig)
+
+    def dequantize_logical(self, qx: TurboQuantizedTensor) -> torch.Tensor:
+        """Dequantize and restore the optional cache logical layout."""
+        x = self.dequantize(qx)
+        logical_shape = getattr(qx, "logical_shape", None)
+        if logical_shape is not None:
+            return x.reshape(logical_shape)
+        return x
 
     # ------------------------------------------------------------------
     # Memory estimation
@@ -353,6 +399,7 @@ class TurboQuantProdResult:
         residual_norm: Per-row L2 norm of residual, shape [N], dtype float32.
         shape_orig: Original input shape.
         dim: Latent dimension.
+        logical_shape: Optional logical layout used by cache code.
     """
 
     mse: TurboQuantizedTensor
@@ -360,6 +407,7 @@ class TurboQuantProdResult:
     residual_norm: torch.Tensor
     shape_orig: tuple[int, ...]
     dim: int
+    logical_shape: tuple[int, ...] | None = None
 
 
 class TurboQuantProd:
@@ -424,7 +472,11 @@ class TurboQuantProd:
     def _rotation(self) -> torch.Tensor | None:
         return self._mse_quantizer._rotation
 
-    def quantize(self, x: torch.Tensor) -> TurboQuantProdResult:
+    def quantize(
+        self,
+        x: torch.Tensor,
+        logical_shape: tuple[int, ...] | None = None,
+    ) -> TurboQuantProdResult:
         """Two-stage quantization: MSE + 1-bit residual.
 
         Args:
@@ -448,9 +500,17 @@ class TurboQuantProd:
 
         shape_orig = x.shape
         x_flat = x.reshape(-1, self.dim).float()
+        logical_shape = _validate_logical_shape(
+            logical_shape,
+            dim=self.dim,
+            n_rows=x_flat.shape[0],
+        )
 
         # Stage 1: MSE quantization
-        mse_result = self._mse_quantizer.quantize(x_flat.reshape(shape_orig))
+        mse_result = self._mse_quantizer.quantize(
+            x_flat.reshape(shape_orig),
+            logical_shape=logical_shape,
+        )
         x_hat = self._mse_quantizer.dequantize(mse_result)
         x_hat_flat = x_hat.reshape(-1, self.dim)
 
@@ -466,6 +526,7 @@ class TurboQuantProd:
             residual_norm=residual_norm,
             shape_orig=shape_orig,
             dim=self.dim,
+            logical_shape=logical_shape,
         )
 
     def dequantize(self, qx: TurboQuantProdResult) -> torch.Tensor:
@@ -492,6 +553,36 @@ class TurboQuantProd:
 
         x_flat = x_hat_flat + r_hat
         return x_flat.reshape(qx.shape_orig)
+
+    def dequantize_logical(self, qx: TurboQuantProdResult) -> torch.Tensor:
+        """Dequantize and restore the optional cache logical layout."""
+        x = self.dequantize(qx)
+        logical_shape = (
+            getattr(qx, "logical_shape", None)
+            or getattr(qx.mse, "logical_shape", None)
+        )
+        if logical_shape is not None:
+            return x.reshape(logical_shape)
+        return x
+
+    def dequantize_mse(self, qx: TurboQuantProdResult, logical: bool = False) -> torch.Tensor:
+        """Dequantize only the MSE stage, without the residual.
+
+        Args:
+            qx: A :class:`TurboQuantProdResult` from :meth:`quantize`.
+            logical: If True, restore ``qx.logical_shape`` when available.
+
+        Returns:
+            Float tensor with the MSE reconstruction shape.
+        """
+        x = self._mse_quantizer.dequantize(qx.mse)
+        logical_shape = (
+            getattr(qx, "logical_shape", None)
+            or getattr(qx.mse, "logical_shape", None)
+        )
+        if logical and logical_shape is not None:
+            return x.reshape(logical_shape)
+        return x
 
     def approx_inner_product(
         self,

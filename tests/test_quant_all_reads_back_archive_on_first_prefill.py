@@ -158,7 +158,7 @@ def test_quant_all_vs_quant_window_behavior():
     assert attn_win._quant_recent_k is not None, (
         "quant (window>0): recent should be populated after first forward"
     )
-    assert attn_win._quant_archive_k_qx is None, (
+    assert not attn_win._quant_archive_chunks, (
         "quant (window>0): archive should still be empty (tokens within window)"
     )
 

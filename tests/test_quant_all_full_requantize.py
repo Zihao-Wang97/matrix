@@ -51,8 +51,8 @@ def test_quant_all_chunked_archive_after_append():
     v_lat_2 = torch.randn(1, nkv, 5, rv)
     attn._quant_cache_append_to_archive(k_lat_2, v_lat_2)
 
-    assert len(attn._quant_archive_chunks) == 2
-    assert attn._quant_archive_chunks[1].n_tokens == 5
+    assert len(attn._quant_archive_chunks) == 1
+    assert attn._quant_archive_chunks[0].n_tokens == 15
 
     k_deq_2, v_deq_2 = attn._quant_cache_get_kv()
     assert k_deq_2.shape == (nkv, 15, rk)
@@ -79,7 +79,8 @@ def test_archive_chunked_roundtrip_after_multiple_appends():
         assert k_deq.shape == (nkv, total_tokens, rk)
         assert v_deq.shape == (nkv, total_tokens, rv)
 
-    assert len(attn._quant_archive_chunks) == len(append_sizes)
+    assert len(attn._quant_archive_chunks) == 1
+    assert attn._quant_archive_chunks[0].n_tokens == sum(append_sizes)
 
     k_deq, v_deq = attn._quant_cache_get_kv()
     assert k_deq.shape[1] == sum(append_sizes)

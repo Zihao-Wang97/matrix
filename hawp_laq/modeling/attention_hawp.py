@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from hawp_laq.modeling.rope_utils import LlamaRotaryEmbedding, apply_rotary_pos_emb
+from hawp_laq.utils.packbits import unpack_bool
 
 
 logger = logging.getLogger(__name__)
@@ -259,20 +260,26 @@ class HAWPAttention(nn.Module):
         self._quant_archive_chunks = []
 
     @property
-    def _quant_archive_k_qx(self):
-        if not self._quant_archive_chunks:
-            return None
+    def _single_archive_k_qx(self):
+        """Return single-chunk k_qx, or None for empty/multi-chunk.
+
+        Only valid when there is exactly one archive chunk.  Returns the
+        quantized key tensor for that chunk.  Returns None when the archive
+        has 0 or >1 chunks.
+        """
         if len(self._quant_archive_chunks) == 1:
             return self._quant_archive_chunks[0].k_qx
-        return self._dequant_archive_k()
+        return None
 
     @property
-    def _quant_archive_v_qx(self):
-        if not self._quant_archive_chunks:
-            return None
+    def _single_archive_v_qx(self):
+        """Return single-chunk v_qx, or None for empty/multi-chunk.
+
+        Same semantics as ``_single_archive_k_qx`` for values.
+        """
         if len(self._quant_archive_chunks) == 1:
             return self._quant_archive_chunks[0].v_qx
-        return self._dequant_archive_v()
+        return None
 
     @property
     def n_archive_tokens(self) -> int:
@@ -293,8 +300,14 @@ class HAWPAttention(nn.Module):
         _, _, rv = v_new.shape
         k_flat = k_new.reshape(nkv * T, rk).float()
         v_flat = v_new.reshape(nkv * T, rv).float()
-        k_qx = self._tq_k_quantizer.quantize(k_flat)
-        v_qx = self._tq_v_quantizer.quantize(v_flat)
+        k_qx = self._tq_k_quantizer.quantize(
+            k_flat,
+            logical_shape=(nkv, T, rk),
+        )
+        v_qx = self._tq_v_quantizer.quantize(
+            v_flat,
+            logical_shape=(nkv, T, rv),
+        )
         k_norms = k_new.float().norm(dim=2).to(torch.float16)
         return _QuantChunk(k_qx, v_qx, T, k_norms)
 
@@ -318,13 +331,13 @@ class HAWPAttention(nn.Module):
         k_demote = self._quant_recent_k[:, :n_demote, :]
         v_demote = self._quant_recent_v[:, :n_demote, :]
         chunk = self._quantize_to_chunk(k_demote.unsqueeze(0), v_demote.unsqueeze(0))
-        self._quant_archive_chunks.append(chunk)
+        self._append_or_merge_archive_chunk(chunk)
         self._quant_recent_k = self._quant_recent_k[:, n_demote:, :]
         self._quant_recent_v = self._quant_recent_v[:, n_demote:, :]
 
     def _quant_cache_append_to_archive(self, k_lat: torch.Tensor, v_lat: torch.Tensor) -> None:
         chunk = self._quantize_to_chunk(k_lat, v_lat)
-        self._quant_archive_chunks.append(chunk)
+        self._append_or_merge_archive_chunk(chunk)
 
     def _quant_cache_append_latent(self, k_lat: torch.Tensor, v_lat: torch.Tensor) -> None:
         if self.recent_window == 0:
@@ -334,52 +347,206 @@ class HAWPAttention(nn.Module):
         while self._quant_recent_k is not None and self._quant_recent_k.shape[1] > self.recent_window:
             self._quant_cache_demote()
 
-    # TODO(optional fast-path): _merge_quantized is preserved for a future
-    # incremental-merge fast path.  Currently unused because the default
-    # _quant_cache_append_to_archive uses correctness-first full requantize.
     @staticmethod
-    def _merge_quantized(old_qx, new_qx, nkv, dim):
+    def _merge_rows_by_head(
+        old_rows: torch.Tensor,
+        new_rows: torch.Tensor,
+        nkv: int,
+        old_T: int,
+        new_T: int,
+    ) -> torch.Tensor:
+        if old_rows.shape[0] != nkv * old_T:
+            raise RuntimeError(
+                f"old_rows first dim {old_rows.shape[0]} != nkv*old_T ({nkv * old_T})"
+            )
+        if new_rows.shape[0] != nkv * new_T:
+            raise RuntimeError(
+                f"new_rows first dim {new_rows.shape[0]} != nkv*new_T ({nkv * new_T})"
+            )
+        if old_rows.shape[1:] != new_rows.shape[1:]:
+            raise RuntimeError(
+                f"row payload shape mismatch: old={tuple(old_rows.shape[1:])}, "
+                f"new={tuple(new_rows.shape[1:])}"
+            )
+
+        payload_shape = old_rows.shape[1:]
+        old_by_head = old_rows.reshape(nkv, old_T, *payload_shape)
+        new_by_head = new_rows.reshape(nkv, new_T, *payload_shape)
+        merged = torch.cat([old_by_head, new_by_head], dim=1)
+        return merged.reshape(nkv * (old_T + new_T), *payload_shape)
+
+    @staticmethod
+    def _check_quantized_compatible(old_qx, new_qx, dim: int) -> None:
+        if type(old_qx) is not type(new_qx):
+            raise RuntimeError(
+                f"quantized tensor type mismatch: {type(old_qx).__name__} vs {type(new_qx).__name__}"
+            )
+        if old_qx.shape_orig[-1] != dim or new_qx.shape_orig[-1] != dim:
+            raise RuntimeError(
+                f"quantized dim mismatch: old={old_qx.shape_orig[-1]}, "
+                f"new={new_qx.shape_orig[-1]}, expected={dim}"
+            )
+        if old_qx.bits != new_qx.bits:
+            raise RuntimeError(f"bits mismatch: old={old_qx.bits}, new={new_qx.bits}")
+        if old_qx.group_size != new_qx.group_size:
+            raise RuntimeError(
+                f"group_size mismatch: old={old_qx.group_size}, new={new_qx.group_size}"
+            )
+        old_rot = old_qx.rotation
+        new_rot = new_qx.rotation
+        if (old_rot is None) != (new_rot is None):
+            raise RuntimeError("rotation mismatch: one quantized tensor has rotation and the other does not")
+        if old_rot is not None and not torch.equal(old_rot, new_rot.to(old_rot.device, old_rot.dtype)):
+            raise RuntimeError("rotation mismatch between quantized tensors")
+
+    @staticmethod
+    def _quantized_row_count(qx) -> int:
+        if hasattr(qx, "mse"):
+            return qx.mse.q.shape[0]
+        return qx.q.shape[0]
+
+    @staticmethod
+    def _get_logical_nkv_T_dim(qx, nkv: int, dim: int) -> tuple[int, int, int]:
+        logical_shape = getattr(qx, "logical_shape", None)
+        if logical_shape is not None:
+            if len(logical_shape) != 3:
+                raise RuntimeError(f"logical_shape must be 3-D [nkv,T,dim], got {logical_shape}")
+            q_nkv, q_T, q_dim = logical_shape
+            if q_nkv != nkv or q_dim != dim:
+                raise RuntimeError(
+                    f"logical_shape mismatch: got {logical_shape}, expected nkv={nkv}, dim={dim}"
+                )
+            if HAWPAttention._quantized_row_count(qx) != nkv * q_T:
+                raise RuntimeError(
+                    f"logical_shape rows {nkv * q_T} do not match quantized rows "
+                    f"{HAWPAttention._quantized_row_count(qx)}"
+                )
+            return q_nkv, q_T, q_dim
+
+        rows = HAWPAttention._quantized_row_count(qx)
+        if rows % nkv != 0:
+            raise RuntimeError(f"Cannot infer token count from rows={rows}, nkv={nkv}")
+        if qx.shape_orig[-1] != dim:
+            raise RuntimeError(
+                f"shape_orig dim mismatch: got {qx.shape_orig[-1]}, expected={dim}"
+            )
+        return nkv, rows // nkv, dim
+
+    @staticmethod
+    def _merge_quantized_by_head(old_qx, new_qx, nkv: int, dim: int):
         from hawp_laq.runtime.turboquant import TurboQuantProdResult, TurboQuantizedTensor
-        if isinstance(new_qx, TurboQuantProdResult):
+
+        _, old_T, _ = HAWPAttention._get_logical_nkv_T_dim(old_qx, nkv, dim)
+        _, new_T, _ = HAWPAttention._get_logical_nkv_T_dim(new_qx, nkv, dim)
+        merged_logical_shape = (nkv, old_T + new_T, dim)
+
+        if isinstance(old_qx, TurboQuantProdResult):
+            if not isinstance(new_qx, TurboQuantProdResult):
+                raise RuntimeError("quantized tensor type mismatch for TurboQuantProdResult merge")
+            if old_qx.dim != dim or new_qx.dim != dim:
+                raise RuntimeError(
+                    f"TurboQuantProd dim mismatch: old={old_qx.dim}, new={new_qx.dim}, expected={dim}"
+                )
             old_mse = old_qx.mse
             new_mse = new_qx.mse
+            HAWPAttention._check_quantized_compatible(old_mse, new_mse, dim)
             merged_mse = TurboQuantizedTensor(
-                q=torch.cat([old_mse.q, new_mse.q], dim=0),
-                scale=torch.cat([old_mse.scale, new_mse.scale], dim=0),
-                zero_point=torch.cat([old_mse.zero_point, new_mse.zero_point], dim=0),
-                shape_orig=(old_mse.shape_orig[0] + new_mse.shape_orig[0], dim),
+                q=HAWPAttention._merge_rows_by_head(old_mse.q, new_mse.q, nkv, old_T, new_T),
+                scale=HAWPAttention._merge_rows_by_head(old_mse.scale, new_mse.scale, nkv, old_T, new_T),
+                zero_point=HAWPAttention._merge_rows_by_head(old_mse.zero_point, new_mse.zero_point, nkv, old_T, new_T),
+                shape_orig=(nkv * (old_T + new_T), dim),
                 bits=old_mse.bits,
                 group_size=old_mse.group_size,
                 rotation=old_mse.rotation,
+                logical_shape=merged_logical_shape,
             )
             return TurboQuantProdResult(
                 mse=merged_mse,
-                residual_sign=torch.cat([old_qx.residual_sign, new_qx.residual_sign], dim=0),
-                residual_norm=torch.cat([old_qx.residual_norm, new_qx.residual_norm], dim=0),
+                residual_sign=HAWPAttention._merge_rows_by_head(
+                    old_qx.residual_sign, new_qx.residual_sign, nkv, old_T, new_T,
+                ),
+                residual_norm=HAWPAttention._merge_rows_by_head(
+                    old_qx.residual_norm, new_qx.residual_norm, nkv, old_T, new_T,
+                ),
                 dim=dim,
-                shape_orig=(old_qx.shape_orig[0] + new_qx.shape_orig[0], dim),
+                shape_orig=(nkv * (old_T + new_T), dim),
+                logical_shape=merged_logical_shape,
             )
-        else:
+
+        if isinstance(old_qx, TurboQuantizedTensor):
+            if not isinstance(new_qx, TurboQuantizedTensor):
+                raise RuntimeError("quantized tensor type mismatch for TurboQuantizedTensor merge")
+            HAWPAttention._check_quantized_compatible(old_qx, new_qx, dim)
             return TurboQuantizedTensor(
-                q=torch.cat([old_qx.q, new_qx.q], dim=0),
-                scale=torch.cat([old_qx.scale, new_qx.scale], dim=0),
-                zero_point=torch.cat([old_qx.zero_point, new_qx.zero_point], dim=0),
-                shape_orig=(old_qx.shape_orig[0] + new_qx.shape_orig[0], dim),
+                q=HAWPAttention._merge_rows_by_head(old_qx.q, new_qx.q, nkv, old_T, new_T),
+                scale=HAWPAttention._merge_rows_by_head(old_qx.scale, new_qx.scale, nkv, old_T, new_T),
+                zero_point=HAWPAttention._merge_rows_by_head(old_qx.zero_point, new_qx.zero_point, nkv, old_T, new_T),
+                shape_orig=(nkv * (old_T + new_T), dim),
                 bits=old_qx.bits,
                 group_size=old_qx.group_size,
                 rotation=old_qx.rotation,
+                logical_shape=merged_logical_shape,
             )
+
+        raise RuntimeError(f"Unsupported quantized tensor type: {type(old_qx).__name__}")
+
+    @staticmethod
+    def _merge_quantized(old_qx, new_qx, nkv, dim):
+        return HAWPAttention._merge_quantized_by_head(old_qx, new_qx, nkv, dim)
+
+    def _merge_chunks_by_head(self, old_chunk: _QuantChunk, new_chunk: _QuantChunk) -> _QuantChunk:
+        nkv = self.num_key_value_heads
+        _, old_T, _ = self._get_logical_nkv_T_dim(old_chunk.k_qx, nkv, self.r_k)
+        _, new_T, _ = self._get_logical_nkv_T_dim(new_chunk.k_qx, nkv, self.r_k)
+        _, old_v_T, _ = self._get_logical_nkv_T_dim(old_chunk.v_qx, nkv, self.r_v)
+        _, new_v_T, _ = self._get_logical_nkv_T_dim(new_chunk.v_qx, nkv, self.r_v)
+        if old_T != old_v_T or new_T != new_v_T:
+            raise RuntimeError(
+                f"K/V token count mismatch while merging chunks: "
+                f"K=({old_T},{new_T}) V=({old_v_T},{new_v_T})"
+            )
+        k_qx = self._merge_quantized_by_head(old_chunk.k_qx, new_chunk.k_qx, nkv, self.r_k)
+        v_qx = self._merge_quantized_by_head(old_chunk.v_qx, new_chunk.v_qx, nkv, self.r_v)
+
+        if old_chunk.k_norms is None and new_chunk.k_norms is None:
+            k_norms = None
+        elif old_chunk.k_norms is not None and new_chunk.k_norms is not None:
+            k_norms = torch.cat([old_chunk.k_norms, new_chunk.k_norms], dim=1)
+        else:
+            raise RuntimeError("k_norms mismatch while merging archive chunks")
+
+        return _QuantChunk(k_qx, v_qx, old_T + new_T, k_norms)
+
+    def _append_or_merge_archive_chunk(self, new_chunk: _QuantChunk) -> None:
+        if not self._quant_archive_chunks:
+            self._quant_archive_chunks.append(new_chunk)
+            return
+        if len(self._quant_archive_chunks) == 1:
+            self._quant_archive_chunks[0] = self._merge_chunks_by_head(
+                self._quant_archive_chunks[0], new_chunk,
+            )
+            return
+
+        # Scheduler/drop policies can mutate archive chunks; single-old-chunk
+        # mode with hawp_quant_sched needs separate validation before use.
+        raise RuntimeError(
+            f"single archive chunk invariant violated: found {len(self._quant_archive_chunks)} chunks"
+        )
 
     def _quant_cache_get_kv(self) -> tuple[torch.Tensor, torch.Tensor]:
         k_parts = []
         v_parts = []
         for chunk in self._quant_archive_chunks:
-            k_deq = self._tq_k_quantizer.dequantize(chunk.k_qx).reshape(
-                self.num_key_value_heads, chunk.n_tokens, self.r_k,
-            )
-            v_deq = self._tq_v_quantizer.dequantize(chunk.v_qx).reshape(
-                self.num_key_value_heads, chunk.n_tokens, self.r_v,
-            )
+            k_deq = self._tq_k_quantizer.dequantize(chunk.k_qx)
+            if getattr(chunk.k_qx, "logical_shape", None) is not None:
+                k_deq = k_deq.reshape(chunk.k_qx.logical_shape)
+            else:
+                k_deq = k_deq.reshape(self.num_key_value_heads, chunk.n_tokens, self.r_k)
+            v_deq = self._tq_v_quantizer.dequantize(chunk.v_qx)
+            if getattr(chunk.v_qx, "logical_shape", None) is not None:
+                v_deq = v_deq.reshape(chunk.v_qx.logical_shape)
+            else:
+                v_deq = v_deq.reshape(self.num_key_value_heads, chunk.n_tokens, self.r_v)
             k_parts.append(k_deq)
             v_parts.append(v_deq)
         if self._quant_recent_k is not None:
@@ -410,8 +577,14 @@ class HAWPAttention(nn.Module):
                 nkv = self.num_key_value_heads
                 k_flat = k_deq.reshape(nkv * remaining, self.r_k).float()
                 v_flat = v_deq.reshape(nkv * remaining, self.r_v).float()
-                new_k_qx = self._tq_k_quantizer.quantize(k_flat)
-                new_v_qx = self._tq_v_quantizer.quantize(v_flat)
+                new_k_qx = self._tq_k_quantizer.quantize(
+                    k_flat,
+                    logical_shape=(nkv, remaining, self.r_k),
+                )
+                new_v_qx = self._tq_v_quantizer.quantize(
+                    v_flat,
+                    logical_shape=(nkv, remaining, self.r_v),
+                )
                 new_k_norms = first.k_norms[:, can_drop:] if first.k_norms is not None else None
                 self._quant_archive_chunks[0] = _QuantChunk(new_k_qx, new_v_qx, remaining, new_k_norms)
                 dropped += can_drop
@@ -459,8 +632,14 @@ class HAWPAttention(nn.Module):
             new_T = len(keep_indices)
             k_flat = k_raw_keep.reshape(nkv * new_T, self.r_k).float()
             v_flat = v_raw_keep.reshape(nkv * new_T, self.r_v).float()
-            new_k_qx = self._tq_k_quantizer.quantize(k_flat)
-            new_v_qx = self._tq_v_quantizer.quantize(v_flat)
+            new_k_qx = self._tq_k_quantizer.quantize(
+                k_flat,
+                logical_shape=(nkv, new_T, self.r_k),
+            )
+            new_v_qx = self._tq_v_quantizer.quantize(
+                v_flat,
+                logical_shape=(nkv, new_T, self.r_v),
+            )
             new_chunks.append(_QuantChunk(new_k_qx, new_v_qx, new_T, kept_k_norms))
         self._quant_archive_chunks = new_chunks
         return drop_n
@@ -879,10 +1058,15 @@ class HAWPAttention(nn.Module):
         return torch.tensor(scale, dtype=q_lat.dtype, device=q_lat.device)
 
     def _can_use_archive_k_ip_approx(self) -> bool:
-        """Check whether the approx_inner_product fast path is available."""
+        """Check whether the approx_inner_product fast path is available.
+
+        Checks chunk count and quantizer type directly, without touching
+        ``_single_archive_k_qx`` (which triggers dequantization for
+        multi-chunk).
+        """
         if not self.use_archive_k_ip_approx:
             return False
-        if self._quant_archive_k_qx is None:
+        if not self._quant_archive_chunks:
             return False
         if self._tq_k_quantizer is None:
             return False
@@ -892,18 +1076,22 @@ class HAWPAttention(nn.Module):
     def _dequant_archive_k(self) -> torch.Tensor:
         parts = []
         for chunk in self._quant_archive_chunks:
-            deq = self._tq_k_quantizer.dequantize(chunk.k_qx).reshape(
-                self.num_key_value_heads, chunk.n_tokens, self.r_k,
-            )
+            deq = self._tq_k_quantizer.dequantize(chunk.k_qx)
+            if getattr(chunk.k_qx, "logical_shape", None) is not None:
+                deq = deq.reshape(chunk.k_qx.logical_shape)
+            else:
+                deq = deq.reshape(self.num_key_value_heads, chunk.n_tokens, self.r_k)
             parts.append(deq)
         return torch.cat(parts, dim=1)
 
     def _dequant_archive_v(self) -> torch.Tensor:
         parts = []
         for chunk in self._quant_archive_chunks:
-            deq = self._tq_v_quantizer.dequantize(chunk.v_qx).reshape(
-                self.num_key_value_heads, chunk.n_tokens, self.r_v,
-            )
+            deq = self._tq_v_quantizer.dequantize(chunk.v_qx)
+            if getattr(chunk.v_qx, "logical_shape", None) is not None:
+                deq = deq.reshape(chunk.v_qx.logical_shape)
+            else:
+                deq = deq.reshape(self.num_key_value_heads, chunk.n_tokens, self.r_v)
             parts.append(deq)
         return torch.cat(parts, dim=1)
 
@@ -911,10 +1099,10 @@ class HAWPAttention(nn.Module):
         self,
         q_lat: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute archive K logits via TurboQuantProd.approx_inner_product.
+        """Compute archive K logits via batch approx_inner_product.
 
-        Processes each chunk independently and concatenates the per-chunk
-        logits, avoiding the need to hold a full dequantized archive.
+        Eliminates the per-head Python loop by batch-dequantizing each chunk
+        across all KV heads and using batched matrix multiply.
 
         Args:
             q_lat: [bsz, n_heads, q_len, r_k]
@@ -922,46 +1110,82 @@ class HAWPAttention(nn.Module):
         Returns:
             archive_logits: [bsz, n_heads, q_len, T_archive]
         """
-        from hawp_laq.runtime.turboquant import TurboQuantProdResult, TurboQuantizedTensor
+        if self.num_heads != self.num_key_value_heads * self.num_key_value_groups:
+            raise RuntimeError(
+                f"Head layout mismatch: num_heads={self.num_heads}, "
+                f"num_key_value_heads={self.num_key_value_heads}, "
+                f"num_key_value_groups={self.num_key_value_groups}"
+            )
+        if q_lat.shape[1] != self.num_heads:
+            raise RuntimeError(
+                f"q_lat head count mismatch: "
+                f"expected {self.num_heads}, got {q_lat.shape[1]}"
+            )
+        if q_lat.shape[-1] != self.r_k:
+            raise RuntimeError(
+                f"q_lat latent dim mismatch: "
+                f"expected r_k={self.r_k}, got {q_lat.shape[-1]}"
+            )
 
         g = self.num_key_value_groups
         rk = self.r_k
         bsz = q_lat.shape[0]
         q_len = q_lat.shape[2]
+        nkv = self.num_key_value_heads
+        num_heads = self.num_heads
 
-        head_logits = []
-        for h in range(self.num_key_value_heads):
-            q_h = q_lat[:, h * g:(h + 1) * g, :, :].reshape(bsz * g * q_len, rk)
-            chunk_logits = []
-            for chunk in self._quant_archive_chunks:
-                T_chunk = chunk.n_tokens
-                qx = chunk.k_qx
-                sl = slice(h * T_chunk, (h + 1) * T_chunk)
-                per_head_mse = TurboQuantizedTensor(
-                    q=qx.mse.q[sl],
-                    scale=qx.mse.scale[sl],
-                    zero_point=qx.mse.zero_point[sl],
-                    rotation=qx.mse.rotation,
-                    shape_orig=(T_chunk, rk),
-                    bits=qx.mse.bits,
-                    group_size=qx.mse.group_size,
-                )
-                per_head_qx = TurboQuantProdResult(
-                    mse=per_head_mse,
-                    residual_sign=qx.residual_sign[sl],
-                    residual_norm=qx.residual_norm[sl],
-                    shape_orig=(T_chunk, rk),
-                    dim=rk,
-                )
-                ip = self._tq_k_quantizer.approx_inner_product(q_h, per_head_qx)
-                chunk_logits.append(ip)
-            head_logits.append(torch.cat(chunk_logits, dim=-1))
+        if not self._quant_archive_chunks:
+            return q_lat.new_empty(bsz, num_heads, q_len, 0)
 
-        T_archive = sum(c.n_tokens for c in self._quant_archive_chunks)
-        stacked = torch.stack(head_logits, dim=0)
-        stacked = stacked.reshape(self.num_key_value_heads, bsz, g, q_len, T_archive)
-        stacked = stacked.permute(1, 0, 2, 3, 4).reshape(bsz, self.num_heads, q_len, T_archive)
-        return stacked
+        # ------------------------------------------------------------------
+        # 1. 重组 query：从 [bsz, num_heads, q_len, rk]
+        #    变为 [bsz, nkv, g*q_len, rk]
+        # ------------------------------------------------------------------
+        q_grouped = q_lat.reshape(bsz, nkv, g, q_len, rk)
+        q_grouped = q_grouped.permute(0, 1, 3, 2, 4).contiguous()
+        q_grouped = q_grouped.reshape(bsz, nkv, g * q_len, rk).float()
+
+        # ------------------------------------------------------------------
+        # 2. 逐个 chunk 处理，但在 chunk 内 batch 所有 heads
+        # ------------------------------------------------------------------
+        chunk_logits_list = []
+        for chunk in self._quant_archive_chunks:
+            T_chunk = chunk.n_tokens
+
+            # --- Part A: MSE contribution ---
+            x_hat = self._tq_k_quantizer.dequantize_mse(chunk.k_qx, logical=True)
+            if x_hat.dim() == 2:
+                x_hat = x_hat.reshape(nkv, T_chunk, rk)
+            x_hat = x_hat.to(device=q_grouped.device, dtype=torch.float32)
+            k_bmm = x_hat.unsqueeze(0)
+            mse_ip = torch.matmul(q_grouped, k_bmm.transpose(-2, -1))
+            # [bsz, nkv, g*q_len, T_chunk]
+
+            # --- Part B: Residual contribution ---
+            sign_unpacked = unpack_bool(chunk.k_qx.residual_sign, rk)
+            sign_unpacked = sign_unpacked.reshape(nkv, T_chunk, rk)
+            sign_float = sign_unpacked.to(device=q_grouped.device, dtype=torch.float32)
+            sign_float.mul_(2.0).sub_(1.0)
+            scale = (chunk.k_qx.residual_norm / math.sqrt(rk)).reshape(nkv, T_chunk)
+            scale = scale.to(device=q_grouped.device, dtype=torch.float32)
+
+            sign_bmm = sign_float.unsqueeze(0)
+            sign_ip = torch.matmul(q_grouped, sign_bmm.transpose(-2, -1))
+            sign_ip = sign_ip * scale.unsqueeze(0).unsqueeze(-2)
+
+            # --- Combine MSE + Residual ---
+            chunk_ip = mse_ip + sign_ip
+
+            # ------------------------------------------------------------------
+            # 3. 重组回标准 attention logits shape: [bsz, num_heads, q_len, T_chunk]
+            # ------------------------------------------------------------------
+            chunk_ip = chunk_ip.reshape(bsz, nkv, q_len, g, T_chunk)
+            chunk_ip = chunk_ip.permute(0, 1, 3, 2, 4).contiguous()
+            chunk_ip = chunk_ip.reshape(bsz, num_heads, q_len, T_chunk)
+
+            chunk_logits_list.append(chunk_ip)
+
+        return torch.cat(chunk_logits_list, dim=-1)
 
     def _compute_archive_k_logits_dequant(
         self,
