@@ -476,12 +476,15 @@ def _read_ranks_from_projector_files(
     """Read r_k/r_v from each available projector.pt file.
 
     Skips layers where r_k or r_v exceeds head_dim (incompatible artifact).
+    Uses normalize_projector_data to infer missing r_k/r_v from tensor shapes.
     """
+    from hawp_laq.runtime.projector_bank import normalize_projector_data
     ranks_from_files: dict[int, tuple[int, int]] = {}
     for layer_idx in available_layers:
         pt_path = projector_dir / f"layer_{layer_idx}" / "projector.pt"
         if pt_path.exists():
             data = torch.load(pt_path, map_location="cpu", weights_only=False)
+            data = normalize_projector_data(data, layer_idx)
             if "r_k" in data and "r_v" in data:
                 rk, rv = data["r_k"], data["r_v"]
                 if rk <= head_dim and rv <= head_dim:

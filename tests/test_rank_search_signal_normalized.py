@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -21,7 +22,7 @@ from hawp_laq.utils.io import save_pt
 def _make_calib_dir(tmp_path, n_layers=1, n_heads=4, d_model=64):
     calib_dir = tmp_path / "calib"
     calib_dir.mkdir()
-    save_pt({"n_layers": n_layers, "n_heads": n_heads}, calib_dir / "meta.pt")
+    save_pt({"n_layers": n_layers, "n_heads": n_heads, "hidden_size": d_model}, calib_dir / "meta.pt")
     for i in range(n_layers):
         save_pt(
             {
@@ -37,20 +38,22 @@ def _make_calib_dir(tmp_path, n_layers=1, n_heads=4, d_model=64):
 class TestComputeSignalScales:
     def test_positive_values(self):
         d_model, n_heads = 64, 4
+        head_dim = d_model // n_heads
         q = torch.randn(2, 8, d_model)
         k = torch.randn(2, 8, d_model)
         v = torch.randn(2, 8, d_model)
-        scales = compute_signal_scales(q, k, v, n_heads)
+        scales = compute_signal_scales(q, k, v, n_heads, d_model=d_model, head_dim=head_dim)
         assert scales["signal_logits"] >= 0
         assert scales["signal_attn"] >= 0
         assert scales["signal_value"] >= 0
 
     def test_constant_input(self):
         d_model, n_heads = 32, 2
+        head_dim = d_model // n_heads
         q = torch.ones(1, 4, d_model)
         k = torch.ones(1, 4, d_model)
         v = torch.ones(1, 4, d_model)
-        scales = compute_signal_scales(q, k, v, n_heads)
+        scales = compute_signal_scales(q, k, v, n_heads, d_model=d_model, head_dim=head_dim)
         assert scales["signal_logits"] >= 0
         assert scales["signal_attn"] >= 0
         assert scales["signal_value"] >= 0
@@ -60,10 +63,10 @@ class TestSignalNormalizedPass:
     def _make_result(self, logits_loss=0.01, attn_loss=0.01, value_loss=0.02):
         return {
             "r_k": 48, "r_v": 32, "rank_cost": 80,
-            "final_loss": 0.04,
-            "final_logits_loss": logits_loss,
-            "final_attn_loss": attn_loss,
-            "final_value_loss": value_loss,
+            "best_calib_total": 0.04,
+            "best_calib_logits": logits_loss,
+            "best_calib_attn": attn_loss,
+            "best_calib_value": value_loss,
         }
 
     def _make_signal(self, logits=1.0, attn=1.0, value=1.0):
@@ -177,10 +180,10 @@ class TestSignalNormalizedSelection:
         deep (scale=0.5) should FAIL."""
         r = {
             "r_k": 48, "r_v": 32, "rank_cost": 80,
-            "final_loss": 0.04,
-            "final_logits_loss": 0.015,
-            "final_attn_loss": 0.015,
-            "final_value_loss": 0.03,
+            "best_calib_total": 0.04,
+            "best_calib_logits": 0.015,
+            "best_calib_attn": 0.015,
+            "best_calib_value": 0.03,
         }
         sig = {"signal_logits": 1.0, "signal_attn": 1.0, "signal_value": 1.0}
 
@@ -260,6 +263,7 @@ class TestSignalNormalizedSelection:
     def test_compute_signal_scales_accepts_non_contiguous_tensors(self):
         """reshape() should handle non-contiguous q/k/v transparently."""
         d_model, n_heads = 32, 2
+        head_dim = d_model // n_heads
         base_q = torch.randn(1, d_model, 4)
         base_k = torch.randn(1, d_model, 4)
         base_v = torch.randn(1, d_model, 4)
@@ -268,7 +272,107 @@ class TestSignalNormalizedSelection:
         v = base_v.transpose(1, 2).contiguous()
         # After contiguous(), these are contiguous — the real test is that
         # compute_signal_scales doesn't crash on any reasonably shaped input
-        scales = compute_signal_scales(q, k, v, n_heads)
+        scales = compute_signal_scales(q, k, v, n_heads, d_model=d_model, head_dim=head_dim)
         assert scales["signal_logits"] >= 0
         assert scales["signal_attn"] >= 0
         assert scales["signal_value"] >= 0
+
+
+class TestNHeadsFallback:
+    def test_n_heads_from_autoconfig(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock
+        from hawp_laq.offline import rank_search as rs
+
+        calib_dir = tmp_path / "calib"
+        calib_dir.mkdir()
+        d_model = 64
+        save_pt(
+            {"n_layers": 1, "model_id": "fake-model", "hidden_size": d_model},
+            calib_dir / "meta.pt",
+        )
+        save_pt(
+            {
+                "q": torch.randn(2, 8, d_model),
+                "k": torch.randn(2, 8, d_model),
+                "v": torch.randn(2, 8, d_model),
+            },
+            calib_dir / "layer_0.pt",
+        )
+
+        mock_cfg = MagicMock()
+        mock_cfg.num_attention_heads = 4
+
+        import transformers
+        monkeypatch.setattr(transformers.AutoConfig, "from_pretrained",
+                            lambda *a, **kw: mock_cfg)
+
+        result = rs.search_rank_per_layer(
+            calib_dir,
+            rank_pairs=[(4, 4)],
+            n_steps=1,
+            selection_mode="constraint",
+        )
+        assert 0 in result
+        assert result[0] == (4, 4)
+
+    def test_n_heads_missing_and_no_model_id_raises(self, tmp_path):
+        from hawp_laq.offline import rank_search as rs
+
+        calib_dir = tmp_path / "calib"
+        calib_dir.mkdir()
+        save_pt({"n_layers": 1}, calib_dir / "meta.pt")
+        save_pt(
+            {
+                "q": torch.randn(2, 8, 64),
+                "k": torch.randn(2, 8, 64),
+                "v": torch.randn(2, 8, 64),
+            },
+            calib_dir / "layer_0.pt",
+        )
+
+        with pytest.raises(ValueError, match="n_heads.*model_id"):
+            rs.search_rank_per_layer(
+                calib_dir,
+                rank_pairs=[(4, 4)],
+                n_steps=1,
+                selection_mode="constraint",
+            )
+
+    def test_run_from_config_no_model_id_raises(self, tmp_path, monkeypatch):
+        from hawp_laq.offline import rank_search as rs
+
+        calib_dir = tmp_path / "calib"
+        calib_dir.mkdir()
+        save_pt({"n_layers": 1}, calib_dir / "meta.pt")
+        save_pt(
+            {
+                "q": torch.randn(2, 8, 64),
+                "k": torch.randn(2, 8, 64),
+                "v": torch.randn(2, 8, 64),
+            },
+            calib_dir / "layer_0.pt",
+        )
+
+        config = MagicMock()
+        config.calib.output_dir = str(calib_dir)
+        config.rank_search.rank_candidates = [4]
+        config.rank_search.r_k_candidates = None
+        config.rank_search.r_v_candidates = None
+        config.rank_search.rank_pair_candidates = None
+        config.rank_search.output_dir = str(tmp_path / "out")
+        config.rank_search.n_steps = 1
+        config.rank_search.relative_tolerance = 0.1
+        config.rank_search.logits_abs_tolerance = 1e-6
+        config.rank_search.attn_abs_tolerance = 1e-5
+        config.rank_search.value_abs_tolerance = 1e-4
+        config.rank_search.selection_mode = "constraint"
+        config.projector.lr = 1e-3
+        config.projector.orthogonalize_every = 10
+        config.projector.w_logits = 1.0
+        config.projector.w_attn = 1.0
+        config.projector.w_value = 0.5
+        config.projector.n_steps = 1
+        config.train.device = "cpu"
+
+        with pytest.raises(ValueError, match="n_heads.*model_id"):
+            rs.run_rank_search_from_config(config)

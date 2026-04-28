@@ -28,13 +28,33 @@ projector:
   r_k: 32
   r_v: 32
   lr: 0.0005
-  n_steps: 500
+  n_steps: 1500
   orthogonalize_every: 20
   target_layer: 0
   w_logits: 1.0
   w_attn: 1.0
   w_value: 0.5
   output_dir: /data/hawp_laq/artifacts/projectors
+  optimizer: riemannian_adam
+  warmup_steps: 50
+  row_batch_size: 128
+  lr_pk: 5e-3
+  lr_pv: 5e-3
+  lr_xi: 1e-2
+  beta1: 0.9
+  beta2: 0.99
+  grad_clip: 1.0
+  lambda_z: 1.0
+  lambda_o: 2.0
+  lambda_v: 0.05
+  eval_every: 50
+  early_stopping: true
+  patience: 5
+  min_delta: 1e-4
+  min_delta_mode: relative
+  gamma_min: 1e-4
+  eps_loss: 1e-8
+  adam_eps: 1e-8
 
 quant:
   enabled: true

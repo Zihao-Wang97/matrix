@@ -29,15 +29,36 @@ projector:
   r_k: 48
   r_v: 64
   lr: 0.0015
-  n_steps: 600
+  n_steps: 200
   orthogonalize_every: 10
   target_layer: 0
   w_logits: 1.0
   w_attn: 2.0
   w_value: 0.25
   output_dir: artifacts/projectors
+  optimizer: riemannian_adam
+  warmup_steps: 30
+  row_batch_size: 64
+  lr_pk: 5e-3
+  lr_pv: 5e-3
+  lr_xi: 1e-2
+  beta1: 0.9
+  beta2: 0.99
+  grad_clip: 1.0
+  lambda_z: 1.0
+  lambda_o: 2.0
+  lambda_v: 0.05
+  eval_every: 20
+  early_stopping: true
+  patience: 5
+  min_delta: 1e-4
+  min_delta_mode: relative
+  gamma_min: 1e-4
+  eps_loss: 1e-8
+  adam_eps: 1e-8
 
 rank_search:
+  # n_steps per candidate during rank search (overrides projector.n_steps)
   n_steps: 1500
   relative_tolerance: 0.10
   logits_abs_tolerance: 1.0e-6

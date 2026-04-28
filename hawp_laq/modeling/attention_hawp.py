@@ -1105,8 +1105,24 @@ class HAWPAttention(nn.Module):
 
         if "gamma" in data:
             self.gamma.data.copy_(data["gamma"].to(self.gamma.device, self.gamma.dtype))
-        elif "gamma_k" in data and "gamma_v" in data:
+        elif "gamma_v" in data:
+            import warnings
+            warnings.warn(
+                f"layer {self.layer_idx}: projector.pt missing 'gamma', using "
+                f"'gamma_v' as fallback. Consider retraining projectors.",
+                UserWarning,
+                stacklevel=2,
+            )
             self.gamma.data.copy_(data["gamma_v"].to(self.gamma.device, self.gamma.dtype))
+        elif "gamma_k" in data:
+            import warnings
+            warnings.warn(
+                f"layer {self.layer_idx}: projector.pt missing 'gamma', using "
+                f"'gamma_k' as fallback. Consider retraining projectors.",
+                UserWarning,
+                stacklevel=2,
+            )
+            self.gamma.data.copy_(data["gamma_k"].to(self.gamma.device, self.gamma.dtype))
 
     def _compute_low_rank_logit_scale(self, q_lat: torch.Tensor) -> torch.Tensor:
         """Compute the scale factor applied to low-rank logits.

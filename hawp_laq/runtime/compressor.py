@@ -49,10 +49,12 @@ class CompressorPackage:
         self._load_projectors()
 
     def _load_projectors(self) -> None:
+        from hawp_laq.runtime.projector_bank import normalize_projector_data
         for layer_idx in range(self.n_layers):
             pt_path = self.projector_dir / f"layer_{layer_idx}" / "projector.pt"
             if pt_path.exists():
                 data = torch.load(pt_path, map_location="cpu", weights_only=True)
+                data = normalize_projector_data(data, layer_idx)
                 self._projectors[layer_idx] = data
                 missing = []
                 if "r_k" not in data:

@@ -41,7 +41,7 @@ def test_load_projectors_strict_shape_check():
     bad_dir.mkdir(parents=True, exist_ok=True)
     layer_dir = bad_dir / "layer_0"
     layer_dir.mkdir(parents=True, exist_ok=True)
-    torch.save({"p_k": torch.randn(64, 32), "p_v": torch.randn(64, 32)}, layer_dir / "projector.pt")
+    torch.save({"p_k": torch.randn(64, 32), "p_v": torch.randn(64, 32), "r_k": 32, "r_v": 32, "causal_mask": True}, layer_dir / "projector.pt")
 
     with pytest.raises(ValueError, match="p_k shape"):
         load_projectors(model2, bad_dir, strict=True)

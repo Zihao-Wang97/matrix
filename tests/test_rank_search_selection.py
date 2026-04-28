@@ -125,17 +125,22 @@ def test_rank_search_prefers_rank_search_n_steps_over_projector_n_steps(tmp_path
     import hawp_laq.offline.rank_search as rs_mod
     original = rs_mod._evaluate_rank
 
-    def _capturing_evaluate(q, k, v, rank_k, rank_v, d_model, n_heads,
-                            n_steps, lr, orthogonalize_every, w_logits, w_attn,
-                            w_value, device):
+    def _capturing_evaluate(q, k, v, r_k, r_v, d_model, n_heads, *,
+                            n_steps=200, lr=1e-3, orthogonalize_every=10,
+                            w_logits=1.0, w_attn=1.0, w_value=0.5, device="cpu",
+                            **kwargs):
         n_steps_used.append(n_steps)
         return {
-            "rank_k": rank_k,
-            "rank_v": rank_v,
-            "final_loss": 0.1,
-            "final_logits_loss": 0.08,
-            "final_attn_loss": 0.01,
-            "final_value_loss": 0.02,
+            "r_k": r_k,
+            "r_v": r_v,
+            "best_calib_total": 0.1,
+            "best_calib_logits": 0.08,
+            "best_calib_attn": 0.01,
+            "best_calib_value": 0.02,
+            "best_step": n_steps,
+            "actual_steps": n_steps,
+            "stopped_early": False,
+            "rank_cost": r_k + r_v,
             "p_k_shape": (16, 8),
             "p_v_shape": (16, 8),
         }
@@ -180,18 +185,23 @@ def test_rank_search_all_pass_selects_smallest_rank(tmp_path):
     import hawp_laq.offline.rank_search as rs_mod
     original = rs_mod._evaluate_rank
 
-    def _mock_evaluate(q, k, v, rank_k, rank_v, d_model, n_heads,
-                       n_steps, lr, orthogonalize_every, w_logits, w_attn,
-                       w_value, device):
+    def _mock_evaluate(q, k, v, r_k, r_v, d_model, n_heads, *,
+                       n_steps=200, lr=1e-3, orthogonalize_every=10,
+                       w_logits=1.0, w_attn=1.0, w_value=0.5, device="cpu",
+                       **kwargs):
         return {
-            "rank_k": rank_k,
-            "rank_v": rank_v,
-            "final_loss": 0.01,
-            "final_logits_loss": 0.008,
-            "final_attn_loss": 0.001,
-            "final_value_loss": 0.001,
-            "p_k_shape": (16, rank_k),
-            "p_v_shape": (16, rank_v),
+            "r_k": r_k,
+            "r_v": r_v,
+            "best_calib_total": 0.01,
+            "best_calib_logits": 0.008,
+            "best_calib_attn": 0.001,
+            "best_calib_value": 0.001,
+            "best_step": n_steps,
+            "actual_steps": n_steps,
+            "stopped_early": False,
+            "rank_cost": r_k + r_v,
+            "p_k_shape": (16, r_k),
+            "p_v_shape": (16, r_v),
         }
 
     rs_mod._evaluate_rank = _mock_evaluate

@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional, get_type_hints, Union
+from typing import Any, Optional, Union, get_type_hints, get_args
 import warnings
 
 import yaml
@@ -42,7 +42,10 @@ class ProjectorConfig:
     rank: Optional[int] = None
     r_k: Optional[int] = None
     r_v: Optional[int] = None
+    # -- legacy training fields (retained for backward compat) --
     lr: float = 1e-3
+    # Default max training steps for projector training (single_group).
+    # May be overridden by ``rank_search.n_steps`` during rank search.
     n_steps: int = 200
     orthogonalize_every: int = 10
     target_layer: int = 0
@@ -50,6 +53,27 @@ class ProjectorConfig:
     w_attn: float = 1.0
     w_value: float = 0.5
     output_dir: Path = Path("artifacts/projectors")
+    # -- Riemannian-Adam optimizer fields --
+    optimizer: str = "riemannian_adam"
+    warmup_steps: int = 30
+    row_batch_size: Optional[int] = None
+    lr_pk: float = 5e-3
+    lr_pv: float = 5e-3
+    lr_xi: float = 1e-2
+    beta1: float = 0.9
+    beta2: float = 0.99
+    grad_clip: float = 1.0
+    lambda_z: float = 1.0
+    lambda_o: float = 2.0
+    lambda_v: float = 0.05
+    eval_every: int = 50
+    early_stopping: bool = True
+    patience: int = 5
+    min_delta: float = 1e-4
+    min_delta_mode: str = "relative"
+    gamma_min: float = 1e-4
+    eps_loss: float = 1e-8
+    adam_eps: float = 1e-8
 
 
 @dataclass
@@ -82,6 +106,9 @@ class RankSearchConfig:
     r_v_candidates: list | None = None
     rank_pair_candidates: list | None = None
     output_dir: Path = Path("artifacts/ranks")
+    # Max training steps per candidate during rank search.
+    # Overrides ``projector.n_steps`` when present. If missing / None,
+    # the rank search runner falls back to ``projector.n_steps``.
     n_steps: int = 1500
     relative_tolerance: float = 0.10
     logits_abs_tolerance: float = 1e-6
@@ -142,6 +169,52 @@ class HAWPLAQConfig:
     hawp: HAWPConfig = field(default_factory=HAWPConfig)
 
 
+def _is_optional_like(tp) -> bool:
+    """Return True if *tp* is Optional[T] / T|None (typing.Union or types.UnionType)."""
+    if tp is None:
+        return False
+    args = get_args(tp)
+    return len(args) >= 2 and type(None) in args
+
+
+def _unwrap_optional(tp) -> type | None:
+    """Return the concrete type inside Optional[T] / T|None, or None."""
+    if tp is None:
+        return None
+    args = get_args(tp)
+    if not args:
+        return None
+    non_none = [a for a in args if a is not type(None)]
+    if len(non_none) == 1 and len(args) == 2:
+        return non_none[0]
+    return None
+
+
+def _coerce_scalar(val, field_type):
+    """Coerce a YAML scalar *val* to match *field_type*.
+
+    Handles: float, int, Optional[float], Optional[int], float|None, int|None.
+    bool is never coerced to int.  None passes through.  Path is handled
+    separately by the caller.
+    """
+    if val is None:
+        return None
+    if isinstance(val, bool):
+        return val
+
+    concrete = field_type
+    if _is_optional_like(field_type):
+        concrete = _unwrap_optional(field_type)
+        if concrete is None:
+            return val
+
+    if concrete is float and isinstance(val, str):
+        return float(val)
+    if concrete is int and isinstance(val, str):
+        return int(val)
+    return val
+
+
 def _to_dataclass(cls: type, raw: dict[str, Any]) -> Any:
     init_kwargs: dict[str, Any] = {}
     hints = get_type_hints(cls)
@@ -155,7 +228,7 @@ def _to_dataclass(cls: type, raw: dict[str, Any]) -> Any:
         elif field_type is Path:
             init_kwargs[f] = Path(str(val))
         else:
-            init_kwargs[f] = val
+            init_kwargs[f] = _coerce_scalar(val, field_type)
     unknown = set(raw.keys()) - set(cls.__dataclass_fields__.keys())
     if unknown:
         warnings.warn(

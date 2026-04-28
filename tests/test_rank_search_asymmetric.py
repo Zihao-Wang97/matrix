@@ -19,7 +19,7 @@ from hawp_laq.utils.io import save_pt
 def _make_calib_dir(tmp_path, n_layers=1, n_heads=4, d_model=64):
     calib_dir = tmp_path / "calib"
     calib_dir.mkdir()
-    save_pt({"n_layers": n_layers, "n_heads": n_heads}, calib_dir / "meta.pt")
+    save_pt({"n_layers": n_layers, "n_heads": n_heads, "hidden_size": d_model}, calib_dir / "meta.pt")
     for i in range(n_layers):
         save_pt(
             {
@@ -104,7 +104,7 @@ class TestEvaluateRankAsymmetric:
         )
         assert result["r_k"] == 16
         assert result["r_v"] == 8
-        assert "final_loss" in result
+        assert "best_calib_total" in result
         assert "rank_cost" in result
         assert result["rank_cost"] == 24
 

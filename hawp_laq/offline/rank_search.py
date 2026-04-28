@@ -78,6 +78,120 @@ def build_rank_pairs(
 
 
 # ------------------------------------------------------------------
+# Dimension inference & multi-head conversion helpers
+# ------------------------------------------------------------------
+
+
+def infer_calib_dims(
+    x: torch.Tensor,
+    n_heads: int,
+    meta: dict | None = None,
+) -> tuple[int, int]:
+    """Infer (d_model, head_dim) from calibration tensor *x*.
+
+    Supports three input layouts:
+      - ``[B, T, d_model]``
+      - ``[B, H, T, d_h]``
+      - ``[B*H, T, d_h]``
+
+    Priority: use ``meta`` keys (``d_model`` / ``hidden_size`` / ``model_dim``)
+    when available; fall back to heuristic only when meta is absent.
+    """
+    if n_heads is None or n_heads <= 0:
+        raise ValueError("n_heads must be a positive integer")
+
+    meta = meta or {}
+    model_d_model = (
+        meta.get("d_model")
+        or meta.get("hidden_size")
+        or meta.get("model_dim")
+    )
+
+    if model_d_model is not None and model_d_model % n_heads != 0:
+        raise ValueError(
+            f"meta d_model={model_d_model} is not divisible by n_heads={n_heads}"
+        )
+
+    head_dim_model = model_d_model // n_heads if model_d_model is not None else None
+
+    if x.ndim == 4:
+        dh = x.shape[-1]
+        if model_d_model is not None:
+            if dh != head_dim_model:
+                raise ValueError(
+                    f"4-D tensor last dim {dh} != meta head_dim "
+                    f"{head_dim_model} (d_model={model_d_model}, n_heads={n_heads})"
+                )
+            return model_d_model, head_dim_model
+        return dh * n_heads, dh
+
+    if x.ndim == 3:
+        D = x.shape[-1]
+        if model_d_model is not None:
+            if D == model_d_model:
+                return model_d_model, head_dim_model
+            if D == head_dim_model:
+                return model_d_model, head_dim_model
+            raise ValueError(
+                f"3-D tensor last dim {D} matches neither d_model={model_d_model} "
+                f"nor head_dim={head_dim_model}"
+            )
+        if D % n_heads == 0:
+            warnings.warn(
+                f"infer_calib_dims: no meta d_model; fallback assuming "
+                f"[B,T,d_model] with d_model={D}, head_dim={D // n_heads}",
+                UserWarning,
+                stacklevel=2,
+            )
+            return D, D // n_heads
+        raise ValueError(
+            f"3-D tensor last dim {D} is not divisible by n_heads={n_heads} "
+            f"and no meta d_model provided"
+        )
+
+    raise ValueError(
+        f"Unsupported calibration tensor ndim={x.ndim}, expected 3 or 4"
+    )
+
+
+def to_mh_for_signal(
+    x: torch.Tensor,
+    n_heads: int,
+    d_model: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """Convert Q/K/V calibration tensor to ``[B_eff, H_eff, T, head_dim]``.
+
+    Supported input layouts:
+      - ``[B, T, d_model]`` → reshape to ``[B, n_heads, T, head_dim]``
+      - ``[B, H, T, d_h]``  → pass-through (must have d_h == head_dim)
+      - ``[B*H, T, d_h]``   → unsqueeze to ``[B*H, 1, T, head_dim]``
+    """
+    if x.ndim == 4:
+        if x.shape[-1] != head_dim:
+            raise ValueError(
+                f"4-D tensor last dim {x.shape[-1]} != head_dim {head_dim}"
+            )
+        return x
+
+    if x.ndim == 3:
+        D = x.shape[-1]
+        if D == d_model:
+            B, T, _ = x.shape
+            return x.reshape(B, T, n_heads, head_dim).transpose(1, 2)
+        if D == head_dim:
+            return x.unsqueeze(1)
+        raise ValueError(
+            f"3-D tensor last dim {D} matches neither d_model={d_model} "
+            f"nor head_dim={head_dim}"
+        )
+
+    raise ValueError(
+        f"Unsupported tensor ndim={x.ndim}, expected 3 or 4"
+    )
+
+
+# ------------------------------------------------------------------
 # Single candidate evaluation
 # ------------------------------------------------------------------
 
@@ -90,13 +204,34 @@ def _evaluate_rank(
     r_v: int,
     d_model: int,
     n_heads: int,
-    n_steps: int,
-    lr: float,
-    orthogonalize_every: int,
-    w_logits: float,
-    w_attn: float,
-    w_value: float,
-    device: str,
+    *,
+    n_steps: int = 200,
+    lr: float = 1e-3,
+    orthogonalize_every: int = 10,
+    w_logits: float = 1.0,
+    w_attn: float = 1.0,
+    w_value: float = 0.5,
+    device: str = "cpu",
+    warmup_steps: int = 30,
+    row_batch_size: int | None = None,
+    lr_pk: float = 5e-3,
+    lr_pv: float = 5e-3,
+    lr_xi: float = 1e-2,
+    beta1: float = 0.9,
+    beta2: float = 0.99,
+    grad_clip: float = 1.0,
+    lambda_z: float = 1.0,
+    lambda_o: float = 2.0,
+    lambda_v: float = 0.05,
+    eval_every: int = 50,
+    early_stopping: bool = True,
+    patience: int = 5,
+    min_delta: float = 1e-4,
+    min_delta_mode: str = "relative",
+    gamma_min: float = 1e-4,
+    eps_loss: float = 1e-8,
+    adam_eps: float = 1e-8,
+    optimizer: str = "riemannian_adam",
 ) -> dict:
     trainer = ProjectorTrainer(
         d_model=d_model,
@@ -110,15 +245,55 @@ def _evaluate_rank(
         w_value=w_value,
         device=device,
     )
-    result = trainer.train_one_group(q, k, v, n_steps=n_steps)
-    metrics = result["metrics"]
+    result = trainer.train_one_group(
+        q, k, v,
+        n_steps=n_steps,
+        warmup_steps=warmup_steps,
+        row_batch_size=row_batch_size,
+        lr_pk=lr_pk,
+        lr_pv=lr_pv,
+        lr_xi=lr_xi,
+        beta1=beta1,
+        beta2=beta2,
+        grad_clip=grad_clip,
+        lambda_z=lambda_z,
+        lambda_o=lambda_o,
+        lambda_v=lambda_v,
+        eval_every=eval_every,
+        early_stopping=early_stopping,
+        patience=patience,
+        min_delta=min_delta,
+        min_delta_mode=min_delta_mode,
+        gamma_min=gamma_min,
+        eps_loss=eps_loss,
+        adam_eps=adam_eps,
+        optimizer=optimizer,
+    )
+
+    # Prefer Riemannian-Adam best_calib_* fields; fall back to metrics[-1]
+    # for legacy trainer (Adam+orthogonalize).
+    if "best_calib_total" in result:
+        total = result["best_calib_total"]
+        logits = result["best_calib_logits"]
+        attn = result["best_calib_attn"]
+        value = result["best_calib_value"]
+    else:
+        m = result["metrics"]
+        total = m["total"][-1]
+        logits = m["logits"][-1]
+        attn = m["attn"][-1]
+        value = m["value"][-1]
+
     return {
         "r_k": r_k,
         "r_v": r_v,
-        "final_loss": metrics["total"][-1],
-        "final_logits_loss": metrics["logits"][-1],
-        "final_attn_loss": metrics["attn"][-1],
-        "final_value_loss": metrics["value"][-1],
+        "best_calib_total": total,
+        "best_calib_logits": logits,
+        "best_calib_attn": attn,
+        "best_calib_value": value,
+        "best_step": result.get("best_step", n_steps),
+        "actual_steps": result.get("actual_steps", n_steps),
+        "stopped_early": result.get("stopped_early", False),
         "rank_cost": r_k + r_v,
         "p_k_shape": tuple(result["p_k"].shape),
         "p_v_shape": tuple(result["p_v"].shape),
@@ -174,29 +349,55 @@ def compute_signal_scales(
     k: torch.Tensor,
     v: torch.Tensor,
     n_heads: int,
+    d_model: int | None = None,
+    head_dim: int | None = None,
 ) -> dict[str, float]:
     """Compute per-component signal strengths from full-precision Q/K/V.
+
+    Supports three calibration layouts: ``[B,T,d_model]``,
+    ``[B,H,T,d_h]``, and ``[B*H,T,d_h]``.
+
+    Applies a causal mask to match the optimizer's objective, so signal
+    magnitudes are consistent with the training loss space.
 
     Returns mean squared magnitude of: logits, attention weights, value output.
     These are used as signal references for normalized error thresholds.
     """
-    d_model = q.shape[-1]
-    head_dim = d_model // n_heads
+    if d_model is None or head_dim is None:
+        _dm, _hd = infer_calib_dims(q, n_heads)
+        d_model = d_model or _dm
+        head_dim = head_dim or _hd
 
-    # Reshape to multi-head: [B, T, D] → [B, n_heads, T, head_dim]
-    b, s, _ = q.shape
-    q_mh = q.reshape(b, s, n_heads, head_dim).transpose(1, 2)
-    k_mh = k.reshape(b, s, n_heads, head_dim).transpose(1, 2)
-    v_mh = v.reshape(b, s, n_heads, head_dim).transpose(1, 2)
+    q_mh = to_mh_for_signal(q, n_heads, d_model, head_dim)
+    k_mh = to_mh_for_signal(k, n_heads, d_model, head_dim)
+    v_mh = to_mh_for_signal(v, n_heads, d_model, head_dim)
+
+    if not (q_mh.shape == k_mh.shape == v_mh.shape):
+        raise ValueError(
+            f"Shape mismatch after to_mh_for_signal: q={q_mh.shape}, "
+            f"k={k_mh.shape}, v={v_mh.shape}"
+        )
 
     logits_fp = torch.matmul(q_mh, k_mh.transpose(-2, -1)) / math.sqrt(head_dim)
-    attn_fp = torch.softmax(logits_fp, dim=-1)
+
+    T = q_mh.shape[-2]
+    causal = torch.tril(
+        torch.ones(T, T, dtype=torch.bool, device=logits_fp.device)
+    )
+    causal = causal.unsqueeze(0).unsqueeze(0).expand_as(logits_fp)
+    logits_masked = logits_fp.masked_fill(~causal, float("-inf"))
+    attn_fp = torch.softmax(logits_masked, dim=-1)
     value_fp = torch.matmul(attn_fp, v_mh)
 
+    n_valid = int(causal.sum())
+    signal_logits = logits_fp[causal].pow(2).sum().item() / max(n_valid, 1)
+    signal_attn = attn_fp[causal].pow(2).sum().item() / max(n_valid, 1)
+    signal_value = value_fp.pow(2).mean().item()
+
     return {
-        "signal_logits": logits_fp.pow(2).mean().item(),
-        "signal_attn": attn_fp.pow(2).mean().item(),
-        "signal_value": value_fp.pow(2).mean().item(),
+        "signal_logits": signal_logits,
+        "signal_attn": signal_attn,
+        "signal_value": signal_value,
     }
 
 
@@ -218,9 +419,9 @@ def _signal_normalized_pass(
     sig_attn = max(signal_scales["signal_attn"], eps)
     sig_value = max(signal_scales["signal_value"], eps)
 
-    n_logits = result["final_logits_loss"] / sig_logits
-    n_attn = result["final_attn_loss"] / sig_attn
-    n_value = result["final_value_loss"] / sig_value
+    n_logits = float(result["best_calib_logits"]) / sig_logits
+    n_attn = float(result["best_calib_attn"]) / sig_attn
+    n_value = float(result["best_calib_value"]) / sig_value
 
     tol_logits = logits_signal_tolerance * layer_scale
     tol_attn = attn_signal_tolerance * layer_scale
@@ -243,6 +444,22 @@ def _signal_normalized_pass(
 # ------------------------------------------------------------------
 # Per-layer rank search
 # ------------------------------------------------------------------
+
+
+def _print_header(c1: str, c2: str, c3: str) -> None:
+    print(f"  {'r_k':>4} {'r_v':>4}  {c1:>10}  {c2:>10}  {c3:>10}  {'cost':>6}  {'result':>8}")
+
+
+def _print_row(r: dict, c1, c2, c3) -> None:
+    tag = "PASS" if r.get("all_pass", False) else "REJECT"
+    print(
+        f"  {r['r_k']:>4d} {r['r_v']:>4d}"
+        f"  {str(c1):>10s}"
+        f"  {str(c2):>10s}"
+        f"  {str(c3):>10s}"
+        f"  {r['rank_cost']:>6d}"
+        f"  {tag:>8}"
+    )
 
 
 def search_rank_per_layer(
@@ -269,6 +486,27 @@ def search_rank_per_layer(
     value_signal_tolerance: float = 0.02,
     layer_tolerance_scale: list | None = None,
     layer_rank_floor: list | None = None,
+    # -- Riemannian-Adam optimizer params (forwarded to train_one_group) --
+    warmup_steps: int = 30,
+    row_batch_size: int | None = None,
+    lr_pk: float = 5e-3,
+    lr_pv: float = 5e-3,
+    lr_xi: float = 1e-2,
+    beta1: float = 0.9,
+    beta2: float = 0.99,
+    grad_clip: float = 1.0,
+    lambda_z: float = 1.0,
+    lambda_o: float = 2.0,
+    lambda_v: float = 0.05,
+    eval_every: int = 50,
+    early_stopping: bool = True,
+    patience: int = 5,
+    min_delta: float = 1e-4,
+    min_delta_mode: str = "relative",
+    gamma_min: float = 1e-4,
+    eps_loss: float = 1e-8,
+    adam_eps: float = 1e-8,
+    optimizer: str = "riemannian_adam",
 ) -> dict[int, tuple[int, int]]:
 
     # ---- resolve rank_pairs (backward-compat) ----
@@ -282,7 +520,7 @@ def search_rank_per_layer(
                 "Either rank_pairs or rank_candidates must be provided"
             )
 
-    _valid_modes = {"constraint", "signal_normalized"}
+    _valid_modes = {"constraint", "signal_normalized", "total", "logits", "attn_value_abs"}
     if selection_mode not in _valid_modes:
         raise ValueError(
             f"Unknown selection_mode={selection_mode!r}. "
@@ -293,6 +531,21 @@ def search_rank_per_layer(
     meta = load_pt(calib_dir / "meta.pt")
     n_layers = meta.get("n_layers", 0)
     n_heads = meta.get("n_heads")
+    if n_heads is None:
+        model_id = meta.get("model_id")
+        if model_id is None:
+            raise ValueError(
+                "Cannot infer n_heads: meta.pt must contain either "
+                "'n_heads' or 'model_id'."
+            )
+        from transformers import AutoConfig
+        cfg_auto = AutoConfig.from_pretrained(model_id)
+        n_heads = cfg_auto.num_attention_heads
+    if n_heads is None or n_heads <= 0:
+        raise ValueError(
+            "n_heads must be a positive integer; "
+            "set meta['n_heads'] or provide meta['model_id']"
+        )
 
     if n_layers == 0:
         for p in sorted(calib_dir.glob("layer_*.pt")):
@@ -318,16 +571,7 @@ def search_rank_per_layer(
         q = data["q"].float()
         k = data["k"].float()
         v = data["v"].float()
-        d_model = q.shape[-1]
-
-        if n_heads is None:
-            from transformers import AutoConfig
-            cfg_auto = AutoConfig.from_pretrained(
-                meta.get("model_id", "facebook/opt-125m")
-            )
-            n_heads = cfg_auto.num_attention_heads
-
-        head_dim = d_model // n_heads
+        d_model, head_dim = infer_calib_dims(q, n_heads, meta)
 
         # Per-layer copy — floor filtering and head_dim validation must
         # only affect this layer, never leak into subsequent ones.
@@ -412,7 +656,12 @@ def search_rank_per_layer(
         # ---- evaluate every candidate pair ----
         signal_scales = None
         if selection_mode == "signal_normalized":
-            signal_scales = compute_signal_scales(q, k, v, n_heads)
+            signal_scales = compute_signal_scales(
+                q, k, v,
+                n_heads=n_heads,
+                d_model=d_model,
+                head_dim=head_dim,
+            )
             print(
                 f"[rank_search] signal logits={signal_scales['signal_logits']:.6f}"
                 f" attn={signal_scales['signal_attn']:.6f}"
@@ -423,19 +672,33 @@ def search_rank_per_layer(
         for rk, rv in layer_rank_pairs:
             r = _evaluate_rank(
                 q, k, v, rk, rv, d_model, n_heads,
-                n_steps, lr, orthogonalize_every,
-                w_logits, w_attn, w_value, device,
+                n_steps=n_steps, lr=lr,
+                orthogonalize_every=orthogonalize_every,
+                w_logits=w_logits, w_attn=w_attn, w_value=w_value,
+                device=device,
+                warmup_steps=warmup_steps,
+                row_batch_size=row_batch_size,
+                lr_pk=lr_pk, lr_pv=lr_pv, lr_xi=lr_xi,
+                beta1=beta1, beta2=beta2,
+                grad_clip=grad_clip,
+                lambda_z=lambda_z, lambda_o=lambda_o, lambda_v=lambda_v,
+                eval_every=eval_every,
+                early_stopping=early_stopping,
+                patience=patience,
+                min_delta=min_delta, min_delta_mode=min_delta_mode,
+                gamma_min=gamma_min,
+                eps_loss=eps_loss, adam_eps=adam_eps,
+                optimizer=optimizer,
             )
             results.append(r)
-            cost = r.get("rank_cost", r.get("r_k", 0) + r.get("r_v", 0))
+            cost = r["rank_cost"]
             print(
-                f"  r_k={r.get('r_k', r.get('rank_k', 0)):>3d}"
-                f" r_v={r.get('r_v', r.get('rank_v', 0)):>3d}"
-                f"  total={r['final_loss']:.6f}"
-                f"  logits={r['final_logits_loss']:.6f}"
-                f"  attn={r['final_attn_loss']:.6f}"
-                f"  val={r['final_value_loss']:.6f}"
-                f"  cost={cost}"
+                f"  r_k={r['r_k']:>3d} r_v={r['r_v']:>3d}"
+                f"  calib_total={r['best_calib_total']:.6f}"
+                f"  calib_logits={r['best_calib_logits']:.6f}"
+                f"  calib_attn={r['best_calib_attn']:.6f}"
+                f"  calib_value={r['best_calib_value']:.6f}"
+                f"  cost={cost}  step={r['best_step']} stopped={r['stopped_early']}"
             )
 
         if not results:
@@ -443,7 +706,7 @@ def search_rank_per_layer(
 
         # ---- judge each candidate ----
         if selection_mode == "signal_normalized":
-            _nsig = signal_scales  # already computed
+            _nsig = signal_scales
             for r in results:
                 _signal_normalized_pass(
                     r, _nsig,
@@ -452,31 +715,43 @@ def search_rank_per_layer(
                     value_signal_tolerance,
                     layer_scale,
                 )
-        else:
-            # ---- legacy constraint mode ----
-            baseline_result = min(results, key=lambda x: x["final_loss"])
+        elif selection_mode == "constraint":
+            baseline_result = min(results, key=lambda x: x["best_calib_total"])
             for r in results:
                 r["logits_pass"] = _component_pass(
-                    r["final_logits_loss"],
-                    baseline_result["final_logits_loss"],
-                    relative_tolerance,
-                    logits_abs_tolerance,
+                    r["best_calib_logits"], baseline_result["best_calib_logits"],
+                    relative_tolerance, logits_abs_tolerance,
                 )
                 r["attn_pass"] = _component_pass(
-                    r["final_attn_loss"],
-                    baseline_result["final_attn_loss"],
-                    relative_tolerance,
-                    attn_abs_tolerance,
+                    r["best_calib_attn"], baseline_result["best_calib_attn"],
+                    relative_tolerance, attn_abs_tolerance,
                 )
                 r["value_pass"] = _component_pass(
-                    r["final_value_loss"],
-                    baseline_result["final_value_loss"],
-                    relative_tolerance,
-                    value_abs_tolerance,
+                    r["best_calib_value"], baseline_result["best_calib_value"],
+                    relative_tolerance, value_abs_tolerance,
                 )
-                r["all_pass"] = (
-                    r["logits_pass"] and r["attn_pass"] and r["value_pass"]
+                r["all_pass"] = r["logits_pass"] and r["attn_pass"] and r["value_pass"]
+        elif selection_mode == "total":
+            best_total = min(r["best_calib_total"] for r in results)
+            for r in results:
+                r["total_pass"] = _component_pass(
+                    r["best_calib_total"], best_total,
+                    relative_tolerance, best_total * relative_tolerance + 1e-8,
                 )
+                r["all_pass"] = r["total_pass"]
+        elif selection_mode == "logits":
+            best_logits = min(r["best_calib_logits"] for r in results)
+            for r in results:
+                r["logits_pass"] = _component_pass(
+                    r["best_calib_logits"], best_logits,
+                    relative_tolerance, logits_abs_tolerance,
+                )
+                r["all_pass"] = r["logits_pass"]
+        elif selection_mode == "attn_value_abs":
+            for r in results:
+                r["attn_pass"] = r["best_calib_attn"] <= attn_abs_tolerance
+                r["value_pass"] = r["best_calib_value"] <= value_abs_tolerance
+                r["all_pass"] = r["attn_pass"] and r["value_pass"]
 
         # ---- print per-candidate assessment ----
         if selection_mode == "signal_normalized":
@@ -484,70 +759,39 @@ def search_rank_per_layer(
                   f"(logits_tol={logits_signal_tolerance:.4f}*{layer_scale}={logits_signal_tolerance*layer_scale:.4f}, "
                   f"attn_tol={attn_signal_tolerance:.4f}*{layer_scale}={attn_signal_tolerance*layer_scale:.4f}, "
                   f"value_tol={value_signal_tolerance:.4f}*{layer_scale}={value_signal_tolerance*layer_scale:.4f}) ---")
-            print(
-                f"  {'r_k':>4} {'r_v':>4}"
-                f"  {'nlogits':>10}"
-                f"  {'nattn':>10}"
-                f"  {'nvalue':>10}"
-                f"  {'cost':>6}"
-                f"  {'result':>8}"
-            )
+            _print_header("nlogits", "nattn", "nvalue")
             for r in results:
-                tag = "PASS" if r["all_pass"] else "REJECT"
-                rk = r.get("r_k", r.get("rank_k", 0))
-                rv = r.get("r_v", r.get("rank_v", 0))
-                cost = r.get("rank_cost", rk + rv)
-                print(
-                    f"  {rk:>4d} {rv:>4d}"
-                    f"  {r.get('normalized_logits_error', 0):>10.4f}"
-                    f"  {r.get('normalized_attn_error', 0):>10.4f}"
-                    f"  {r.get('normalized_value_error', 0):>10.4f}"
-                    f"  {cost:>6d}"
-                    f"  {tag:>8}"
-                )
+                _print_row(r, r.get("normalized_logits_error", 0), r.get("normalized_attn_error", 0), r.get("normalized_value_error", 0))
+        elif selection_mode == "attn_value_abs":
+            print(f"\n  --- attn_value_abs check "
+                  f"(attn_tol={attn_abs_tolerance:.1e}, value_tol={value_abs_tolerance:.1e}) ---")
+            _print_header("attn", "value", "cost")
+            for r in results:
+                _print_row(r, f"{'PASS' if r['attn_pass'] else 'FAIL':>10}", f"{'PASS' if r['value_pass'] else 'FAIL':>10}", r['rank_cost'])
         else:
-            print(f"\n  --- constraint check (rel_tol={relative_tolerance}) ---")
-            print(
-                f"  {'r_k':>4} {'r_v':>4}"
-                f"  {'logits':>10}"
-                f"  {'attn':>10}"
-                f"  {'value':>10}"
-                f"  {'cost':>6}"
-                f"  {'result':>8}"
-            )
+            label = selection_mode
+            print(f"\n  --- {label} check (rel_tol={relative_tolerance}) ---")
+            _print_header("logits", "attn", "value")
             for r in results:
                 tag = "PASS" if r["all_pass"] else "REJECT"
-                rk = r.get("r_k", r.get("rank_k", 0))
-                rv = r.get("r_v", r.get("rank_v", 0))
-                cost = r.get("rank_cost", rk + rv)
-                print(
-                    f"  {rk:>4d} {rv:>4d}"
-                    f"  {'PASS' if r['logits_pass'] else 'FAIL':>10}"
-                    f"  {'PASS' if r['attn_pass'] else 'FAIL':>10}"
-                    f"  {'PASS' if r['value_pass'] else 'FAIL':>10}"
-                    f"  {cost:>6d}"
-                    f"  {tag:>8}"
-                )
+                _print_row(r, f"{tag:>10}", "", f"{r['rank_cost']:>6d}")
 
         # ---- selection: prefer smallest rank_cost among passing pairs ----
         passing = [r for r in results if r["all_pass"]]
         if passing:
-            def _cost(r):
-                return r.get("rank_cost", r.get("r_k", r.get("rank_k", 0)) + r.get("r_v", r.get("rank_v", 0)))
-            passing.sort(key=lambda x: (_cost(x), x["final_loss"]))
+            passing.sort(key=lambda x: (x["rank_cost"], x["best_calib_total"]))
             best = passing[0]
         else:
-            results.sort(key=lambda x: x["final_loss"])
+            results.sort(key=lambda x: x["best_calib_total"])
             best = results[0]
 
-        chosen_rk = best.get("r_k", best.get("rank_k", 0))
-        chosen_rv = best.get("r_v", best.get("rank_v", 0))
-        cost = best.get("rank_cost", chosen_rk + chosen_rv)
+        chosen_rk, chosen_rv = best["r_k"], best["r_v"]
         selected_ranks[layer_idx] = (chosen_rk, chosen_rv)
 
         print(
             f"[rank_search] layer {layer_idx}: selected r_k={chosen_rk} r_v={chosen_rv}"
-            f"  cost={cost}  total_loss={best['final_loss']:.6f}"
+            f"  cost={best['rank_cost']}  calib_total={best['best_calib_total']:.6f}"
+            f"  best_step={best.get('best_step', '?')} stopped_early={best.get('stopped_early', '?')}"
         )
 
         # ---- per-layer output (optional) ----
@@ -566,6 +810,13 @@ def search_rank_per_layer(
                 "selected_r_k": chosen_rk,
                 "selected_r_v": chosen_rv,
                 "selection_method": selection_mode,
+                "best_calib_total": best.get("best_calib_total", 0.0),
+                "best_calib_logits": best.get("best_calib_logits", 0.0),
+                "best_calib_attn": best.get("best_calib_attn", 0.0),
+                "best_calib_value": best.get("best_calib_value", 0.0),
+                "best_step": best.get("best_step", 0),
+                "actual_steps": best.get("actual_steps", 0),
+                "stopped_early": best.get("stopped_early", False),
                 "relative_tolerance": relative_tolerance,
                 "logits_abs_tolerance": logits_abs_tolerance,
                 "attn_abs_tolerance": attn_abs_tolerance,
@@ -593,17 +844,25 @@ def run_rank_search_from_config(config) -> dict[int, tuple[int, int]]:
     meta = load_pt(calib_dir / "meta.pt")
     n_heads = meta.get("n_heads")
     if n_heads is None:
+        model_id = meta.get("model_id")
+        if model_id is None:
+            raise ValueError(
+                "Cannot infer n_heads: meta.pt must contain either "
+                "'n_heads' or 'model_id'."
+            )
         from transformers import AutoConfig
-        model_cfg = AutoConfig.from_pretrained(
-            meta.get("model_id", "facebook/opt-125m")
-        )
+        model_cfg = AutoConfig.from_pretrained(model_id)
         n_heads = model_cfg.num_attention_heads
+    if n_heads is None or n_heads <= 0:
+        raise ValueError(
+            "n_heads must be a positive integer; "
+            "set meta['n_heads'] or provide meta['model_id']"
+        )
 
     # Find sample data to determine d_model / head_dim
     for p in sorted(calib_dir.glob("layer_*.pt")):
         sample = load_pt(p)
-        d_model = sample["q"].shape[-1]
-        head_dim = d_model // n_heads
+        d_model, head_dim = infer_calib_dims(sample["q"], n_heads, meta)
         break
     else:
         raise FileNotFoundError(f"No layer_*.pt files found in {calib_dir}")
@@ -642,4 +901,25 @@ def run_rank_search_from_config(config) -> dict[int, tuple[int, int]]:
         value_signal_tolerance=getattr(config.rank_search, "value_signal_tolerance", 0.02),
         layer_tolerance_scale=getattr(config.rank_search, "layer_tolerance_scale", None),
         layer_rank_floor=getattr(config.rank_search, "layer_rank_floor", None),
+        # -- Riemannian-Adam params from config.projector --
+        warmup_steps=getattr(config.projector, "warmup_steps", 30),
+        row_batch_size=getattr(config.projector, "row_batch_size", None),
+        lr_pk=getattr(config.projector, "lr_pk", 5e-3),
+        lr_pv=getattr(config.projector, "lr_pv", 5e-3),
+        lr_xi=getattr(config.projector, "lr_xi", 1e-2),
+        beta1=getattr(config.projector, "beta1", 0.9),
+        beta2=getattr(config.projector, "beta2", 0.99),
+        grad_clip=getattr(config.projector, "grad_clip", 1.0),
+        lambda_z=getattr(config.projector, "lambda_z", 1.0),
+        lambda_o=getattr(config.projector, "lambda_o", 2.0),
+        lambda_v=getattr(config.projector, "lambda_v", 0.05),
+        eval_every=getattr(config.projector, "eval_every", 50),
+        early_stopping=getattr(config.projector, "early_stopping", True),
+        patience=getattr(config.projector, "patience", 5),
+        min_delta=getattr(config.projector, "min_delta", 1e-4),
+        min_delta_mode=getattr(config.projector, "min_delta_mode", "relative"),
+        gamma_min=getattr(config.projector, "gamma_min", 1e-4),
+        eps_loss=getattr(config.projector, "eps_loss", 1e-8),
+        adam_eps=getattr(config.projector, "adam_eps", 1e-8),
+        optimizer=getattr(config.projector, "optimizer", "riemannian_adam"),
     )

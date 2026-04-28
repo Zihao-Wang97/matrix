@@ -42,6 +42,7 @@ def load_projectors(model: torch.nn.Module, projector_dir: str | Path, strict: b
             if not pt_path.exists():
                 continue
             data = torch.load(pt_path, map_location="cpu", weights_only=True)
+            data = normalize_projector_data(data, module.layer_idx)
             if module.gamma_mode == "learned" and not data.get("causal_mask", False):
                 import warnings
                 warnings.warn(
@@ -64,6 +65,62 @@ def load_ranks(ranks_path: str | Path) -> dict[int, tuple[int, int]]:
     if "selected_ranks" in raw:
         raw = raw["selected_ranks"]
     return {int(k): (v["r_k"], v["r_v"]) for k, v in raw.items()}
+
+
+def normalize_projector_data(data: dict, layer_idx: int) -> dict:
+    """Normalize projector data dict for backward compatibility.
+
+    - If 'gamma' is missing but 'gamma_v'/'gamma_k' exists, synthesizes
+      'gamma' (preferring gamma_v) and emits a warning.
+    - If 'r_k' is missing, infers it from p_k.shape[1] when p_k is not
+      square, and emits a warning.  Same for 'r_v'.
+    - Square p_k/p_v (shape [d_h, d_h]) means the rank cannot be inferred;
+      in that case no key is added.
+    """
+    if "gamma" not in data:
+        if "gamma_v" in data:
+            warnings.warn(
+                f"Layer {layer_idx}: projector.pt missing 'gamma', using "
+                f"'gamma_v' as fallback. Consider retraining projectors.",
+                UserWarning,
+                stacklevel=2,
+            )
+            data["gamma"] = data["gamma_v"]
+        elif "gamma_k" in data:
+            warnings.warn(
+                f"Layer {layer_idx}: projector.pt missing 'gamma', using "
+                f"'gamma_k' as fallback. Consider retraining projectors.",
+                UserWarning,
+                stacklevel=2,
+            )
+            data["gamma"] = data["gamma_k"]
+
+    p_k = data.get("p_k")
+    p_v = data.get("p_v")
+
+    if "r_k" not in data and p_k is not None and p_k.ndim == 2 and p_k.shape[0] != p_k.shape[1]:
+        inferred = p_k.shape[1]
+        warnings.warn(
+            f"Layer {layer_idx}: projector.pt missing 'r_k', inferred "
+            f"r_k={inferred} from p_k shape {tuple(p_k.shape)}. "
+            f"Consider retraining projectors.",
+            UserWarning,
+            stacklevel=2,
+        )
+        data["r_k"] = inferred
+
+    if "r_v" not in data and p_v is not None and p_v.ndim == 2 and p_v.shape[0] != p_v.shape[1]:
+        inferred = p_v.shape[1]
+        warnings.warn(
+            f"Layer {layer_idx}: projector.pt missing 'r_v', inferred "
+            f"r_v={inferred} from p_v shape {tuple(p_v.shape)}. "
+            f"Consider retraining projectors.",
+            UserWarning,
+            stacklevel=2,
+        )
+        data["r_v"] = inferred
+
+    return data
 
 
 def get_available_projector_layers(projector_dir: str | Path) -> set[int]:
@@ -118,6 +175,7 @@ def rebuild_ranks_json(projector_dir: str | Path) -> Path:
         if not pt_path.exists():
             continue
         data = torch.load(pt_path, map_location="cpu", weights_only=False)
+        data = normalize_projector_data(data, layer_idx)
         if "r_k" not in data or "r_v" not in data:
             warnings.warn(
                 f"Layer {layer_idx} projector.pt is missing r_k/r_v keys; "
@@ -167,6 +225,8 @@ def inspect_projector_dir(
         except Exception:
             result["shape_mismatch_layers"].append(layer_idx)
             continue
+
+        data = normalize_projector_data(data, layer_idx)
 
         if "r_k" not in data or "r_v" not in data:
             result["legacy_layers"].append(layer_idx)
@@ -235,6 +295,21 @@ def train_all_layers(
     device: str = "cpu",
     output_dir: str | Path = "artifacts/projectors",
 ) -> Path:
+    """Train projectors for all layers (legacy entry point).
+
+    .. deprecated::
+        This function is kept for backward compatibility and does not
+        consume the full ProjectorConfig / RankSearchConfig. Prefer
+        scripts/02_train_projectors.py or direct ProjectorTrainer usage
+        with explicit riemannian_adam config.
+    """
+    warnings.warn(
+        "train_all_layers is a legacy entry point and does not consume the full "
+        "projector config; prefer scripts/02_train_projectors.py / ProjectorTrainer "
+        "with explicit riemannian_adam config.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     from hawp_laq.offline.projector_trainer import ProjectorTrainer
     from hawp_laq.utils.io import load_pt
 
@@ -270,16 +345,7 @@ def train_all_layers(
         )
         result = trainer_k.train_one_group(q, k, v, n_steps=n_steps)
 
-        combined = {
-            "p_k": result["p_k"],
-            "p_v": result["p_v"],
-            "gamma": result["gamma"],
-            "r_k": layer_r_k,
-            "r_v": layer_r_v,
-        }
-        layer_dir = output_dir / f"layer_{layer_idx}"
-        layer_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(combined, layer_dir / "projector.pt")
+        ProjectorTrainer.save_result(result, layer_idx, output_dir)
 
     ranks_data = {}
     for layer_idx in range(n_layers):
