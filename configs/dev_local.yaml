@@ -44,6 +44,37 @@ rank_search:
   attn_abs_tolerance: 1.0e-5
   value_abs_tolerance: 1.0e-4
   output_dir: artifacts/ranks
+  selection_mode: signal_normalized
+  logits_signal_tolerance: 0.01
+  attn_signal_tolerance: 0.01
+  value_signal_tolerance: 0.02
+  rank_pair_candidates:
+    - [64, 64]
+    - [64, 48]
+    - [48, 48]
+    - [48, 32]
+    - [32, 32]
+  layer_tolerance_scale:
+    - layers: [0, 1, 2, 3]
+      scale: 0.5
+  
+    - layers: [4, 5, 6, 7, 8]
+      scale: 1.0
+  
+    - layers: [9, 10, 11]
+      scale: 1.5
+  layer_rank_floor:
+    - layers: [0, 1, 2, 3]
+      min_r_k: 64
+      min_r_v: 48
+
+    - layers: [4, 5, 6, 7, 8]
+      min_r_k: 48
+      min_r_v: 32
+
+    - layers: [9, 10, 11]
+      min_r_k: 32
+      min_r_v: 24
 
 quant:
   enabled: true

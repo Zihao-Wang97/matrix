@@ -228,8 +228,10 @@ class HAWPAttention(nn.Module):
         self._calib_callback = None
         self._tq_k_quantizer = None
         self._tq_v_quantizer = None
-        self._quant_recent_k = None
-        self._quant_recent_v = None
+        self._recent_k_buffer = None
+        self._recent_v_buffer = None
+        self._recent_start = 0
+        self._recent_count = 0
         self._quant_archive_chunks: list[_QuantChunk] = []
         self._hawp_parent_use_cache = False
         self._hawp_parent_use_cache_valid = False
@@ -255,9 +257,19 @@ class HAWPAttention(nn.Module):
         self.reset_quant_cache()
 
     def reset_quant_cache(self) -> None:
-        self._quant_recent_k = None
-        self._quant_recent_v = None
+        self._recent_k_buffer = None
+        self._recent_v_buffer = None
+        self._recent_start = 0
+        self._recent_count = 0
         self._quant_archive_chunks = []
+
+    @property
+    def _quant_recent_k(self) -> torch.Tensor | None:
+        return self._get_recent_k()
+
+    @property
+    def _quant_recent_v(self) -> torch.Tensor | None:
+        return self._get_recent_v()
 
     @property
     def _single_archive_k_qx(self):
@@ -289,8 +301,7 @@ class HAWPAttention(nn.Module):
         total = 0
         for chunk in self._quant_archive_chunks:
             total += chunk.n_tokens
-        if self._quant_recent_k is not None:
-            total += self._quant_recent_k.shape[1]
+        total += self._recent_count
         return total
 
     def _quantize_to_chunk(self, k_lat: torch.Tensor, v_lat: torch.Tensor) -> _QuantChunk:
@@ -311,41 +322,112 @@ class HAWPAttention(nn.Module):
         k_norms = k_new.float().norm(dim=2).to(torch.float16)
         return _QuantChunk(k_qx, v_qx, T, k_norms)
 
+    def _ensure_recent_buffer(self, k_new: torch.Tensor, v_new: torch.Tensor) -> None:
+        if self.recent_window <= 0:
+            return
+
+        k_shape = (self.num_key_value_heads, self.recent_window, self.r_k)
+        v_shape = (self.num_key_value_heads, self.recent_window, self.r_v)
+        needs_alloc = (
+            self._recent_k_buffer is None
+            or self._recent_v_buffer is None
+            or tuple(self._recent_k_buffer.shape) != k_shape
+            or tuple(self._recent_v_buffer.shape) != v_shape
+            or self._recent_k_buffer.device != k_new.device
+            or self._recent_v_buffer.device != v_new.device
+            or self._recent_k_buffer.dtype != k_new.dtype
+            or self._recent_v_buffer.dtype != v_new.dtype
+        )
+        if needs_alloc:
+            self._recent_k_buffer = torch.empty(k_shape, device=k_new.device, dtype=k_new.dtype)
+            self._recent_v_buffer = torch.empty(v_shape, device=v_new.device, dtype=v_new.dtype)
+            self._recent_start = 0
+            self._recent_count = 0
+
+    def _get_recent_from_buffer(self, buf: torch.Tensor | None) -> torch.Tensor | None:
+        if buf is None or self._recent_count == 0:
+            return None
+        end = self._recent_start + self._recent_count
+        if end <= self.recent_window:
+            return buf[:, self._recent_start:end, :]
+        tail = buf[:, self._recent_start:, :]
+        head = buf[:, :end % self.recent_window, :]
+        return torch.cat([tail, head], dim=1)
+
+    def _get_recent_k(self) -> torch.Tensor | None:
+        return self._get_recent_from_buffer(self._recent_k_buffer)
+
+    def _get_recent_v(self) -> torch.Tensor | None:
+        return self._get_recent_from_buffer(self._recent_v_buffer)
+
+    def _write_recent_contiguous(self, k_keep: torch.Tensor, v_keep: torch.Tensor) -> None:
+        T_keep = k_keep.shape[1]
+        if self.recent_window <= 0:
+            raise RuntimeError("_write_recent_contiguous requires recent_window > 0")
+        if T_keep > self.recent_window:
+            raise RuntimeError(f"T_keep={T_keep} exceeds recent_window={self.recent_window}")
+
+        self._ensure_recent_buffer(k_keep, v_keep)
+        if T_keep > 0:
+            self._recent_k_buffer[:, :T_keep, :].copy_(k_keep)
+            self._recent_v_buffer[:, :T_keep, :].copy_(v_keep)
+        self._recent_start = 0
+        self._recent_count = T_keep
+
+    def _append_demoted_token_to_archive(self, k_old: torch.Tensor, v_old: torch.Tensor) -> None:
+        chunk = self._quantize_to_chunk(k_old.unsqueeze(0), v_old.unsqueeze(0))
+        self._append_or_merge_archive_chunk(chunk)
+
     def _quant_cache_append(self, k_lat: torch.Tensor, v_lat: torch.Tensor) -> None:
+        if self.recent_window <= 0:
+            self._quant_cache_append_to_archive(k_lat, v_lat)
+            return
+
         k_new = k_lat[0].detach()
         v_new = v_lat[0].detach()
-        if self._quant_recent_k is None:
-            self._quant_recent_k = k_new
-            self._quant_recent_v = v_new
-        else:
-            self._quant_recent_k = torch.cat([self._quant_recent_k, k_new], dim=1)
-            self._quant_recent_v = torch.cat([self._quant_recent_v, v_new], dim=1)
+        self._ensure_recent_buffer(k_new, v_new)
+
+        T = k_new.shape[1]
+        if self._recent_count == 0 and T > self.recent_window:
+            n_archive = T - self.recent_window
+            archive_chunk = self._quantize_to_chunk(
+                k_new[:, :n_archive, :].unsqueeze(0),
+                v_new[:, :n_archive, :].unsqueeze(0),
+            )
+            self._append_or_merge_archive_chunk(archive_chunk)
+            self._write_recent_contiguous(
+                k_new[:, n_archive:, :],
+                v_new[:, n_archive:, :],
+            )
+            return
+
+        for t in range(T):
+            if self._recent_count == self.recent_window:
+                old_pos = self._recent_start
+                k_old = self._recent_k_buffer[:, old_pos:old_pos + 1, :]
+                v_old = self._recent_v_buffer[:, old_pos:old_pos + 1, :]
+                self._append_demoted_token_to_archive(k_old, v_old)
+                self._recent_start = (self._recent_start + 1) % self.recent_window
+                self._recent_count -= 1
+
+            write_pos = (self._recent_start + self._recent_count) % self.recent_window
+            self._recent_k_buffer[:, write_pos:write_pos + 1, :].copy_(k_new[:, t:t + 1, :])
+            self._recent_v_buffer[:, write_pos:write_pos + 1, :].copy_(v_new[:, t:t + 1, :])
+            self._recent_count += 1
 
     def _quant_cache_demote(self) -> None:
-        if self._quant_recent_k is None:
-            return
-        n_recent = self._quant_recent_k.shape[1]
-        if n_recent <= self.recent_window:
-            return
-        n_demote = n_recent - self.recent_window
-        k_demote = self._quant_recent_k[:, :n_demote, :]
-        v_demote = self._quant_recent_v[:, :n_demote, :]
-        chunk = self._quantize_to_chunk(k_demote.unsqueeze(0), v_demote.unsqueeze(0))
-        self._append_or_merge_archive_chunk(chunk)
-        self._quant_recent_k = self._quant_recent_k[:, n_demote:, :]
-        self._quant_recent_v = self._quant_recent_v[:, n_demote:, :]
+        # Ring-buffer append demotes one oldest token before overwrite.
+        return
 
     def _quant_cache_append_to_archive(self, k_lat: torch.Tensor, v_lat: torch.Tensor) -> None:
         chunk = self._quantize_to_chunk(k_lat, v_lat)
         self._append_or_merge_archive_chunk(chunk)
 
     def _quant_cache_append_latent(self, k_lat: torch.Tensor, v_lat: torch.Tensor) -> None:
-        if self.recent_window == 0:
+        if self.recent_window <= 0:
             self._quant_cache_append_to_archive(k_lat, v_lat)
             return
         self._quant_cache_append(k_lat, v_lat)
-        while self._quant_recent_k is not None and self._quant_recent_k.shape[1] > self.recent_window:
-            self._quant_cache_demote()
 
     @staticmethod
     def _merge_rows_by_head(
@@ -549,9 +631,11 @@ class HAWPAttention(nn.Module):
                 v_deq = v_deq.reshape(self.num_key_value_heads, chunk.n_tokens, self.r_v)
             k_parts.append(k_deq)
             v_parts.append(v_deq)
-        if self._quant_recent_k is not None:
-            k_parts.append(self._quant_recent_k.float())
-            v_parts.append(self._quant_recent_v.float())
+        recent_k = self._get_recent_k()
+        recent_v = self._get_recent_v()
+        if recent_k is not None:
+            k_parts.append(recent_k.float())
+            v_parts.append(recent_v.float())
         if not k_parts:
             return None, None
         return torch.cat(k_parts, dim=1), torch.cat(v_parts, dim=1)
@@ -645,13 +729,17 @@ class HAWPAttention(nn.Module):
         return drop_n
 
     def quant_cache_summary(self) -> dict:
-        n_recent = self._quant_recent_k.shape[1] if self._quant_recent_k is not None else 0
+        n_recent = self._recent_count
         n_archive = sum(c.n_tokens for c in self._quant_archive_chunks)
 
-        recent_fp_bytes = 0
-        if self._quant_recent_k is not None:
-            recent_fp_bytes += self._quant_recent_k.nelement() * self._quant_recent_k.element_size()
-            recent_fp_bytes += self._quant_recent_v.nelement() * self._quant_recent_v.element_size()
+        recent_active_bytes = 0
+        recent_alloc_bytes = 0
+        if self._recent_k_buffer is not None:
+            recent_active_bytes += n_recent * self.num_key_value_heads * self.r_k * self._recent_k_buffer.element_size()
+            recent_alloc_bytes += self._recent_k_buffer.nelement() * self._recent_k_buffer.element_size()
+        if self._recent_v_buffer is not None:
+            recent_active_bytes += n_recent * self.num_key_value_heads * self.r_v * self._recent_v_buffer.element_size()
+            recent_alloc_bytes += self._recent_v_buffer.nelement() * self._recent_v_buffer.element_size()
 
         archive_quant_bytes = 0
         for chunk in self._quant_archive_chunks:
@@ -663,13 +751,15 @@ class HAWPAttention(nn.Module):
             if chunk.k_norms is not None:
                 archive_meta_bytes += chunk.k_norms.nelement() * chunk.k_norms.element_size()
 
-        total_runtime_bytes = recent_fp_bytes + archive_quant_bytes + archive_meta_bytes
+        total_runtime_bytes = recent_alloc_bytes + archive_quant_bytes + archive_meta_bytes
 
         return {
             "layer": self.layer_idx,
             "recent_tokens": n_recent,
             "archive_tokens": n_archive,
-            "recent_fp_bytes": recent_fp_bytes,
+            "recent_fp_bytes": recent_active_bytes,
+            "recent_active_bytes": recent_active_bytes,
+            "recent_alloc_bytes": recent_alloc_bytes,
             "archive_quant_bytes": archive_quant_bytes,
             "archive_meta_bytes": archive_meta_bytes,
             "total_runtime_bytes": total_runtime_bytes,
@@ -837,7 +927,9 @@ class HAWPAttention(nn.Module):
 
         if use_internal_quant_cache:
             has_archive = bool(self._quant_archive_chunks)
-            has_recent = self._quant_recent_k is not None
+            recent_k = self._get_recent_k()
+            recent_v = self._get_recent_v()
+            has_recent = recent_k is not None
 
             logit_scale = self._compute_low_rank_logit_scale(q_lat)
             logit_parts = []
@@ -853,9 +945,9 @@ class HAWPAttention(nn.Module):
                 v_parts_for_attn.append(self._dequant_archive_v().to(q_lat.dtype))
 
             if has_recent:
-                recent_logits = self._compute_recent_k_logits(q_lat, self._quant_recent_k)
+                recent_logits = self._compute_recent_k_logits(q_lat, recent_k)
                 logit_parts.append(recent_logits)
-                v_parts_for_attn.append(self._quant_recent_v.to(q_lat.dtype))
+                v_parts_for_attn.append(recent_v.to(q_lat.dtype))
 
             current_k_expanded = self._repeat_kv(k_lat)
             current_logits = torch.matmul(q_lat, current_k_expanded.transpose(2, 3))

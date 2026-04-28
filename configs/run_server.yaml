@@ -55,13 +55,30 @@ sched:
   low_ratio: 0.60
 
 rank_search:
-  rank_candidates:
-    - 16
-    - 32
-    - 64
-    - 128
-    - 256
+  selection_mode: signal_normalized
+  logits_signal_tolerance: 0.01
+  attn_signal_tolerance: 0.01
+  value_signal_tolerance: 0.02
+  r_k_candidates: [32, 48, 64]
+  r_v_candidates: [16, 32, 48, 64]
   output_dir: /data/hawp_laq/artifacts/ranks
+  layer_tolerance_scale:
+    - layers: [0, 1, 2, 3]
+      scale: 1.5
+    - layers: [4, 5, 6, 7, 8]
+      scale: 1.0
+    - layers: [9, 10, 11]
+      scale: 0.5
+  layer_rank_floor:
+    - layers: [0, 1, 2, 3]
+      min_r_k: 48
+      min_r_v: 32
+    - layers: [4, 5, 6, 7, 8]
+      min_r_k: 64
+      min_r_v: 48
+    - layers: [9, 10, 11]
+      min_r_k: 64
+      min_r_v: 64
 
 train:
   batch_size: 32

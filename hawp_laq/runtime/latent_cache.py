@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-from typing import Any
-
 import torch
 
 from hawp_laq.modeling.attention_hawp import _QuantChunk
-from hawp_laq.runtime.turboquant import TurboQuantMSE, TurboQuantProd, TurboQuantizedTensor, TurboQuantProdResult
+from hawp_laq.runtime.turboquant import TurboQuantMSE, TurboQuantProd
 from hawp_laq.utils.memory import tensor_nbytes
 
 
@@ -34,19 +32,43 @@ class LayerKVCache:
     def __init__(
         self,
         n_heads: int,
-        head_dim: int,
-        k_quantizer: TurboQuantProd,
-        v_quantizer: TurboQuantMSE,
-        dtype: torch.dtype,
+        head_dim: int | None = None,
+        k_quantizer: TurboQuantProd | None = None,
+        v_quantizer: TurboQuantMSE | None = None,
+        dtype: torch.dtype | None = None,
+        *,
+        k_dim: int | None = None,
+        v_dim: int | None = None,
         recent_window: int = 0,
     ) -> None:
         self.n_heads = n_heads
-        self.head_dim = head_dim
-        self.d_model = n_heads * head_dim
+        self.recent_window = recent_window
+
+        if dtype is None:
+            raise ValueError("dtype must be explicitly provided")
+
         self.k_quantizer = k_quantizer
         self.v_quantizer = v_quantizer
         self.dtype = dtype
-        self.recent_window = recent_window
+
+        # Resolve k_dim / v_dim: prefer explicit args, fall back to quantizer.dim
+        if k_dim is not None:
+            self.k_dim = k_dim
+        elif k_quantizer is not None:
+            self.k_dim = k_quantizer.dim
+        elif head_dim is not None:
+            self.k_dim = head_dim
+        else:
+            raise ValueError("Cannot resolve k_dim: provide k_dim, k_quantizer, or head_dim")
+
+        if v_dim is not None:
+            self.v_dim = v_dim
+        elif v_quantizer is not None:
+            self.v_dim = v_quantizer.dim
+        elif head_dim is not None:
+            self.v_dim = head_dim
+        else:
+            raise ValueError("Cannot resolve v_dim: provide v_dim, v_quantizer, or head_dim")
 
         self._recent_k: list[torch.Tensor] = []
         self._recent_v: list[torch.Tensor] = []
@@ -72,6 +94,28 @@ class LayerKVCache:
             k = k.unsqueeze(0)
         if v.dim() == 1:
             v = v.unsqueeze(0)
+
+        if k.dim() != 2:
+            raise ValueError(
+                f"Expected k shape [T, {self.k_dim}], got {tuple(k.shape)}"
+            )
+        if v.dim() != 2:
+            raise ValueError(
+                f"Expected v shape [T, {self.v_dim}], got {tuple(v.shape)}"
+            )
+        if k.shape[0] != v.shape[0]:
+            raise ValueError(
+                f"K/V token count mismatch: k has {k.shape[0]}, v has {v.shape[0]}"
+            )
+        if k.shape[-1] != self.k_dim:
+            raise ValueError(
+                f"Expected k dim {self.k_dim}, got {k.shape[-1]}"
+            )
+        if v.shape[-1] != self.v_dim:
+            raise ValueError(
+                f"Expected v dim {self.v_dim}, got {v.shape[-1]}"
+            )
+
         self._recent_k.append(k.detach().to(self.dtype).cpu())
         self._recent_v.append(v.detach().to(self.dtype).cpu())
         if self.recent_window > 0:
@@ -84,8 +128,6 @@ class LayerKVCache:
     def _quantize_flat(self, k: torch.Tensor, v: torch.Tensor) -> _QuantChunk:
         """Quantize a [T, D] KV pair into a chunk."""
         T = k.shape[0]
-        dk = k.shape[-1]
-        dv = v.shape[-1]
         k_qx = self.k_quantizer.quantize(k.float())
         v_qx = self.v_quantizer.quantize(v.float())
         k_norms = None
@@ -151,7 +193,7 @@ class LayerKVCache:
         if self._recent_k:
             parts.append(torch.cat(self._recent_k, dim=0).to(self.dtype))
         if not parts:
-            return torch.empty(0, self.k_quantizer.dim)
+            return torch.empty(0, self.k_dim, dtype=self.dtype)
         return torch.cat(parts, dim=0).to(self.dtype)
 
     def get_all_v(self) -> torch.Tensor:
@@ -167,7 +209,7 @@ class LayerKVCache:
         if self._recent_v:
             parts.append(torch.cat(self._recent_v, dim=0).to(self.dtype))
         if not parts:
-            return torch.empty(0, self.v_quantizer.dim)
+            return torch.empty(0, self.v_dim, dtype=self.dtype)
         return torch.cat(parts, dim=0).to(self.dtype)
 
     def drop_oldest(self, n: int) -> int:
@@ -188,7 +230,6 @@ class LayerKVCache:
                 self._archive_chunks.pop(0)
                 dropped += first.n_tokens
             else:
-                remaining = first.n_tokens - can_drop
                 k_deq = self.k_quantizer.dequantize(first.k_qx)[can_drop:]
                 v_deq = self.v_quantizer.dequantize(first.v_qx)[can_drop:]
                 new_chunk = self._quantize_flat(k_deq, v_deq)

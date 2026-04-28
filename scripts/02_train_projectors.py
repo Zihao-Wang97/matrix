@@ -102,9 +102,21 @@ def _run_single_group(cfg, layer_idx: int, clean_output_dir: bool = False) -> No
 
 
 def _run_rank_search(cfg) -> None:
+    rk_cands = getattr(cfg.rank_search, "r_k_candidates", None)
+    rv_cands = getattr(cfg.rank_search, "r_v_candidates", None)
+    pair_cands = getattr(cfg.rank_search, "rank_pair_candidates", None)
+    legacy = cfg.rank_search.rank_candidates
+
     print("=" * 60)
-    print(f"[rank_search] candidates={cfg.rank_search.rank_candidates}")
-    print(f"[rank_search] n_steps={cfg.rank_search.n_steps}  lr={cfg.projector.lr}  device={cfg.train.device}")
+    if pair_cands:
+        print(f"[rank_search] rank_pair_candidates={pair_cands}")
+    elif rk_cands and rv_cands:
+        print(f"[rank_search] r_k_candidates={rk_cands}  "
+              f"r_v_candidates={rv_cands}")
+    else:
+        print(f"[rank_search] rank_candidates (legacy symmetric)={legacy}")
+    print(f"[rank_search] n_steps={cfg.rank_search.n_steps}  "
+          f"lr={cfg.projector.lr}  device={cfg.train.device}")
     print(f"[rank_search] selection=constraint"
           f"  rel_tol={cfg.rank_search.relative_tolerance}"
           f"  logits_abs_tol={cfg.rank_search.logits_abs_tolerance}"
@@ -180,6 +192,9 @@ Examples:
 
     if args.ranks is not None:
         cfg.rank_search.rank_candidates = args.ranks
+        cfg.rank_search.r_k_candidates = None
+        cfg.rank_search.r_v_candidates = None
+        cfg.rank_search.rank_pair_candidates = None
     if args.relative_tolerance is not None:
         cfg.rank_search.relative_tolerance = args.relative_tolerance
     if args.logits_abs_tolerance is not None:

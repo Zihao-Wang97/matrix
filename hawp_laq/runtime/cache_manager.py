@@ -4,7 +4,7 @@ import torch
 
 from hawp_laq.config import HAWPLAQConfig, build_k_quantizer, build_v_quantizer
 from hawp_laq.runtime.latent_cache import LayerKVCache
-from hawp_laq.runtime.scheduler import TokenBudgetScheduler, TokenState
+from hawp_laq.runtime.scheduler import TokenBudgetScheduler
 from hawp_laq.utils.memory import format_nbytes
 
 
@@ -17,18 +17,14 @@ class CacheManager:
     Can be constructed either from a :class:`HAWPLAQConfig` or by
     passing quantizer instances directly.
 
-    .. note::
-        The current runtime cache only supports ``k_dim == v_dim``.
-        Asymmetric ``r_k != r_v`` is valid in training and projector
-        artifacts, but ``LayerKVCache`` has not yet been extended to
-        store K and V latent tensors with different column counts.
-        This is a known unimplemented limitation, not a user
-        configuration error.
+    Supports asymmetric ``k_dim != v_dim``: K and V latent dimensions
+    may differ, matching HAWPAttention and projector artifacts.
 
     Args:
         n_layers: Number of transformer layers.
         n_heads: Number of KV heads.
-        head_dim: Latent dimension per head.
+        head_dim: Original head dimension (for reference only, actual
+            latent dims are ``k_dim`` / ``v_dim``).
         k_dim: Latent K dimension per head (default: head_dim for full-rank).
         v_dim: Latent V dimension per head (default: head_dim for full-rank).
         scheduler: Token-budget scheduler (or a dummy one).
@@ -57,18 +53,20 @@ class CacheManager:
         self.n_layers = n_layers
         self.n_heads = n_heads
         self.head_dim = head_dim
-        self.k_dim = k_dim if k_dim is not None else head_dim
-        self.v_dim = v_dim if v_dim is not None else head_dim
+
+        # Resolve k_dim / v_dim: explicit arg > quantizer.dim > head_dim
+        self.k_dim = (
+            k_dim if k_dim is not None
+            else k_quantizer.dim if k_quantizer is not None
+            else head_dim
+        )
+        self.v_dim = (
+            v_dim if v_dim is not None
+            else v_quantizer.dim if v_quantizer is not None
+            else head_dim
+        )
+
         self.recent_window = recent_window if recent_window is not None else 0
-        if self.k_dim != self.v_dim:
-            raise NotImplementedError(
-                f"CacheManager requires k_dim == v_dim, but got k_dim={self.k_dim}, "
-                f"v_dim={self.v_dim}. LayerKVCache does not yet support asymmetric "
-                f"latent dimensions (r_k != r_v). This is a known unimplemented "
-                f"limitation — asymmetric r_k/r_v is valid in training and projector "
-                f"artifacts, but the runtime cache path has not been extended to store "
-                f"K and V latent tensors with different column counts."
-            )
         self.scheduler = scheduler or TokenBudgetScheduler(total_budget=999999)
 
         if k_quantizer is None or v_quantizer is None:
@@ -81,6 +79,21 @@ class CacheManager:
 
         self._k_quantizer = k_quantizer
         self._v_quantizer = v_quantizer
+
+        if self._k_quantizer is not None and self._k_quantizer.dim != self.k_dim:
+            raise ValueError(
+                f"k_quantizer.dim ({self._k_quantizer.dim}) does not match "
+                f"resolved k_dim ({self.k_dim}). "
+                f"Pass consistent k_dim and k_quantizer, or omit k_dim "
+                f"to infer from the quantizer."
+            )
+        if self._v_quantizer is not None and self._v_quantizer.dim != self.v_dim:
+            raise ValueError(
+                f"v_quantizer.dim ({self._v_quantizer.dim}) does not match "
+                f"resolved v_dim ({self.v_dim}). "
+                f"Pass consistent v_dim and v_quantizer, or omit v_dim "
+                f"to infer from the quantizer."
+            )
 
         self._caches: list[LayerKVCache] = []
         for layer_idx in range(n_layers):
@@ -102,7 +115,10 @@ class CacheManager:
                 use_rotation=v_quantizer.use_rotation,
                 group_size=v_quantizer.group_size,
             )
-            self._caches.append(LayerKVCache(n_heads, head_dim, kq, vq, dtype=dtype, recent_window=self.recent_window))
+            self._caches.append(LayerKVCache(
+                n_heads, head_dim, kq, vq, dtype=dtype,
+                k_dim=self.k_dim, v_dim=self.v_dim, recent_window=self.recent_window,
+            ))
 
     # ------------------------------------------------------------------
     # Append

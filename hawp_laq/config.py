@@ -77,13 +77,23 @@ class SchedConfig:
 
 @dataclass
 class RankSearchConfig:
-    rank_candidates: list = field(default_factory=lambda: [16, 32, 48 ,64])
+    rank_candidates: list = field(default_factory=lambda: [16, 32, 48, 64])
+    r_k_candidates: list | None = None
+    r_v_candidates: list | None = None
+    rank_pair_candidates: list | None = None
     output_dir: Path = Path("artifacts/ranks")
     n_steps: int = 1500
     relative_tolerance: float = 0.10
     logits_abs_tolerance: float = 1e-6
     attn_abs_tolerance: float = 1e-5
     value_abs_tolerance: float = 1e-4
+    # --- signal-normalized selection mode ---
+    selection_mode: str = "constraint"
+    logits_signal_tolerance: float = 0.01
+    attn_signal_tolerance: float = 0.01
+    value_signal_tolerance: float = 0.02
+    layer_tolerance_scale: list | None = None
+    layer_rank_floor: list | None = None
 
 
 @dataclass
