@@ -1,0 +1,169 @@
+mode: local
+
+data:
+  root: ./data
+  cache: ./cache
+
+model:
+  model_id: /data/wangzihao/work/matrix/models/opt-125m
+  torch_dtype: float32
+  load_in_4bit: false
+
+generation:
+  max_new_tokens: 64
+  do_sample: false
+  temperature: 1.0
+  top_p: 1.0
+  prompts:
+    - "Hello, my name is"
+    - "The capital of France is"
+    - "In a distant future, humans and AI"
+
+calib:
+  nsamples: 512
+  seq_len: 256
+  output_dir: artifacts/calib
+  dataset: wikitext2
+  capture_mode: auto
+
+projector:
+  rank: null
+  r_k: 64
+
+  # fallback rank：只有没有 selected_ranks.json / ranks.json 时才用
+  r_k: 64
+  r_v: 32
+
+  # legacy fields
+  lr: 0.0015
+  orthogonalize_every: 1
+  target_layer: 0
+  w_logits: 1.0
+  w_attn: 2.0
+  w_value: 0.25
+
+  output_dir: artifacts/projectors
+
+  # Riemannian-Adam projector training
+  optimizer: riemannian_adam
+
+  # 最终 projector 精训步数
+  n_steps: 1500
+  warmup_steps: 50
+  row_batch_size: 512
+
+  lr_pk: "5e-3"
+  lr_pv: "5e-3"
+  lr_xi: "1e-2"
+
+  beta1: 0.9
+  beta2: 0.99
+  grad_clip: 1.0
+
+  lambda_z: 1.0
+  lambda_o: 2.0
+  lambda_v: 0.05
+
+  eval_every: 50
+  early_stopping: true
+  patience: 5
+  min_delta: "1e-5"
+  min_delta_mode: relative
+
+  gamma_min: "1e-4"
+  eps_loss: "1e-8"
+  adam_eps: "1e-8"
+
+rank_search:
+  output_dir: artifacts/ranks
+  n_steps: 1000
+
+  # rank_search 是粗筛，每个 candidate 不建议太长
+  n_steps: 1000
+
+  relative_tolerance: 0.10
+  logits_abs_tolerance: "1.0e-5"
+  attn_abs_tolerance: "20"
+  value_abs_tolerance: "50"
+
+  selection_mode: signal_normalized
+
+  logits_signal_tolerance: 0.01
+  attn_signal_tolerance: 20
+  value_signal_tolerance: 50
+
+  # r_k >= r_v，优先保护 K，V 更强压缩
+  rank_pair_candidates:
+    - [64, 64]
+    - [64, 48]
+    - [64, 32]
+    - [56, 56]
+    - [56, 48]
+    - [56, 32]
+    - [48, 48]
+    - [48, 32]
+    - [40, 40]
+    - [40, 32]
+
+  # 浅层更严格，深层更宽松
+  layer_tolerance_scale:
+    - layers: [0, 1, 2, 3]
+      scale: 0.5
+
+    - layers: [4, 5, 6, 7, 8]
+      scale: 1.0
+
+    - layers: [9, 10, 11]
+      scale: 1.5
+
+  # 浅层保守压缩，中层适中，深层允许更强压缩
+  layer_rank_floor:
+    - layers: [0, 1, 2, 3]
+      min_r_k: 64
+      min_r_v: 48
+
+    - layers: [4, 5, 6, 7, 8]
+      min_r_k: 48
+      min_r_v: 32
+
+    - layers: [9, 10, 11]
+      min_r_k: 32
+      min_r_v: 24
+
+quant:
+  enabled: true
+  k_method: turbo_prod
+  v_method: turbo_mse
+  k_bits: 4
+  v_bits: 8
+
+  # 先关闭 rotation，保证主链路稳定；后续可单独打开做 ablation
+  use_rotation_for_k: true
+  use_rotation_for_v: false
+
+  k_group_size: 128
+  v_group_size: 128
+  outlier_threshold: null
+
+train:
+  batch_size: 4
+  epochs: 100
+  lr: "1.0e-4"
+  device: cuda
+
+sched:
+  total_budget: 32
+  recent_window: 0
+  high_ratio: 0.25
+  low_ratio: 0.50
+  drop_strategy: position
+
+log:
+  level: INFO
+  dir: ./logs
+
+hawp:
+  logit_scale_mode: "rk"
+  gamma_mode: "learned"
+  gamma_value: null
+  use_archive_k_ip_approx: true

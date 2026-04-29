@@ -11,3 +11,5 @@ artifacts/
 .mypy_cache/
 *.pt
 *.bin
+
+Llama-3.1-8B/

@@ -55,8 +55,8 @@ class LayerKVQuantCache:
         _, _, dv = v.shape
         k_flat = k.reshape(nkv * T, dk).float()
         v_flat = v.reshape(nkv * T, dv).float()
-        k_qx = self.k_quantizer.quantize(k_flat)
-        v_qx = self.v_quantizer.quantize(v_flat)
+        k_qx = self.k_quantizer.quantize(k_flat, logical_shape=(nkv, T, dk))
+        v_qx = self.v_quantizer.quantize(v_flat, logical_shape=(nkv, T, dv))
         k_norms = k.float().norm(dim=2).to(torch.float16)
         return _QuantChunk(k_qx, v_qx, T, k_norms)
 
@@ -78,13 +78,54 @@ class LayerKVQuantCache:
         k_demote = self._recent_k[:, :n_demote, :]
         v_demote = self._recent_v[:, :n_demote, :]
         chunk = self._quantize_to_chunk(k_demote, v_demote)
-        self._archive_chunks.append(chunk)
+        self._append_or_merge_archive_chunk(chunk)
         self._recent_k = self._recent_k[:, n_demote:, :]
         self._recent_v = self._recent_v[:, n_demote:, :]
 
     def _append_to_archive(self, k_new: torch.Tensor, v_new: torch.Tensor) -> None:
         chunk = self._quantize_to_chunk(k_new, v_new)
-        self._archive_chunks.append(chunk)
+        self._append_or_merge_archive_chunk(chunk)
+
+    def _merge_chunks_by_head(self, old_chunk: _QuantChunk, new_chunk: _QuantChunk) -> _QuantChunk:
+        nkv = self.n_kv_heads
+        _, old_T, _ = HAWPAttention._get_logical_nkv_T_dim(old_chunk.k_qx, nkv, self.head_dim)
+        _, new_T, _ = HAWPAttention._get_logical_nkv_T_dim(new_chunk.k_qx, nkv, self.head_dim)
+        _, old_v_T, _ = HAWPAttention._get_logical_nkv_T_dim(old_chunk.v_qx, nkv, self.head_dim)
+        _, new_v_T, _ = HAWPAttention._get_logical_nkv_T_dim(new_chunk.v_qx, nkv, self.head_dim)
+        if old_T != old_v_T or new_T != new_v_T:
+            raise RuntimeError(
+                f"K/V token count mismatch while merging pure quant chunks: "
+                f"K=({old_T},{new_T}) V=({old_v_T},{new_v_T})"
+            )
+
+        k_qx = HAWPAttention._merge_quantized_by_head(
+            old_chunk.k_qx, new_chunk.k_qx, nkv, self.head_dim,
+        )
+        v_qx = HAWPAttention._merge_quantized_by_head(
+            old_chunk.v_qx, new_chunk.v_qx, nkv, self.head_dim,
+        )
+
+        if old_chunk.k_norms is None and new_chunk.k_norms is None:
+            k_norms = None
+        elif old_chunk.k_norms is not None and new_chunk.k_norms is not None:
+            k_norms = torch.cat([old_chunk.k_norms, new_chunk.k_norms], dim=1)
+        else:
+            raise RuntimeError("k_norms mismatch while merging pure quant archive chunks")
+
+        return _QuantChunk(k_qx, v_qx, old_T + new_T, k_norms)
+
+    def _append_or_merge_archive_chunk(self, new_chunk: _QuantChunk) -> None:
+        if not self._archive_chunks:
+            self._archive_chunks.append(new_chunk)
+            return
+        if len(self._archive_chunks) == 1:
+            self._archive_chunks[0] = self._merge_chunks_by_head(
+                self._archive_chunks[0], new_chunk,
+            )
+            return
+        raise RuntimeError(
+            f"single archive chunk invariant violated: found {len(self._archive_chunks)} chunks"
+        )
 
     def get_kv(self) -> tuple[torch.Tensor, torch.Tensor]:
         k_parts = []

@@ -9,34 +9,48 @@ from transformers import AutoTokenizer
 
 
 def _load_wikitext2(tokenizer, seq_len: int, split: str = "test", nsamples: int | None = None):
-    try:
-        from datasets import load_dataset
+    def _load_local_txt() -> list[str] | None:
+        split_txt = Path(f"data/wikitext2_{split}.txt")
+        train_txt = Path("data/wikitext2_train.txt")
+        local_txt = split_txt if split_txt.exists() else train_txt
+        if local_txt.exists():
+            return [local_txt.read_text(encoding="utf-8")]
+        return None
+
+    local_txt = _load_local_txt()
+    if local_txt is not None:
+        dataset = local_txt
+    else:
+        dataset = None
+
+    if dataset is None:
         try:
-            dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
-        except Exception:
+            from datasets import load_dataset
+            try:
+                dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
+            except Exception:
+                local_parquet = Path("data/wikitext2/test.parquet")
+                if local_parquet.exists():
+                    dataset = load_dataset("parquet", data_files=str(local_parquet), split="train")
+                else:
+                    raise RuntimeError(
+                        "Cannot load wikitext-2: online fetch failed and no local "
+                        "data/wikitext2_test.txt, data/wikitext2_train.txt, or "
+                        "data/wikitext2/test.parquet found."
+                    )
+        except ImportError:
             local_parquet = Path("data/wikitext2/test.parquet")
             if local_parquet.exists():
-                dataset = load_dataset("parquet", data_files=str(local_parquet), split="train")
+                import pandas as pd
+                df = pd.read_parquet(local_parquet)
+                texts = df["text"].tolist() if "text" in df.columns else []
+                dataset = type("_DS", (), {"__getitem__": lambda s, k: texts[k], "__len__": lambda s: len(texts)})()
             else:
                 raise RuntimeError(
-                    "Cannot load wikitext-2: online fetch failed and no local "
-                    "data/wikitext2/test.parquet found. Either (1) install internet "
-                    "access, (2) download wikitext-2 and place it as "
-                    "data/wikitext2/test.parquet, or (3) pip install datasets."
+                    "Cannot load wikitext-2: 'datasets' package is not installed and no "
+                    "local data/wikitext2_test.txt, data/wikitext2_train.txt, or "
+                    "data/wikitext2/test.parquet found."
                 )
-    except ImportError:
-        local_parquet = Path("data/wikitext2/test.parquet")
-        if local_parquet.exists():
-            import pandas as pd
-            df = pd.read_parquet(local_parquet)
-            texts = df["text"].tolist() if "text" in df.columns else []
-            dataset = type("_DS", (), {"__getitem__": lambda s, k: texts[k], "__len__": lambda s: len(texts)})()
-        else:
-            raise RuntimeError(
-                "Cannot load wikitext-2: 'datasets' package is not installed and no "
-                "local data/wikitext2/test.parquet found. Either (1) pip install datasets, "
-                "or (2) download wikitext-2 and place it as data/wikitext2/test.parquet."
-            )
 
     if isinstance(dataset, list):
         text_list = dataset

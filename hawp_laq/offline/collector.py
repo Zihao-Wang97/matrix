@@ -325,6 +325,7 @@ def run_calibration(cfg: HAWPLAQConfig) -> Path:
         nsamples=cfg.calib.nsamples,
         seq_len=cfg.calib.seq_len,
         dataset_name=cfg.calib.dataset,
+        data_root=cfg.data.root,
     )
 
     collector = CalibrationCollector(model, tokenizer, cfg)
