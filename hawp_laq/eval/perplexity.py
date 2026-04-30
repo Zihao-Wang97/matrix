@@ -8,6 +8,27 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
 
+def _tokenize_texts_in_segments(tokenizer, text_list: list[str], max_chars: int = 20000) -> torch.Tensor:
+    token_ids: list[int] = []
+    sep_ids = tokenizer.encode("\n\n", add_special_tokens=False)
+
+    for text_idx, text in enumerate(text_list):
+        if text_idx > 0:
+            token_ids.extend(sep_ids)
+        if not text:
+            continue
+
+        # Avoid tokenizer/model-max-length warnings by never encoding a huge
+        # corpus as one sequence; the model still receives fixed-size chunks.
+        for start in range(0, len(text), max_chars):
+            segment = text[start:start + max_chars]
+            if not segment:
+                continue
+            token_ids.extend(tokenizer.encode(segment, add_special_tokens=False))
+
+    return torch.tensor(token_ids, dtype=torch.long).unsqueeze(0)
+
+
 def _load_wikitext2(tokenizer, seq_len: int, split: str = "test", nsamples: int | None = None):
     def _load_local_txt() -> list[str] | None:
         split_txt = Path(f"data/wikitext2_{split}.txt")
@@ -57,9 +78,7 @@ def _load_wikitext2(tokenizer, seq_len: int, split: str = "test", nsamples: int 
     else:
         text_list = dataset["text"]
 
-    text = "\n\n".join(text_list)
-    encodings = tokenizer(text, return_tensors="pt")
-    input_ids = encodings.input_ids
+    input_ids = _tokenize_texts_in_segments(tokenizer, text_list)
 
     total_len = input_ids.shape[1]
     n_chunks = total_len // seq_len

@@ -235,7 +235,13 @@ def _rank_search_layers(cfg, layers: list[int]) -> dict[int, tuple[int, int]]:
 
         signal_scales = None
         if selection_mode == "signal_normalized":
-            signal_scales = compute_signal_scales(q, k, v, n_heads=n_heads, d_model=d_model, head_dim=head_dim)
+            signal_scales = compute_signal_scales(
+                q, k, v,
+                n_heads=n_heads,
+                d_model=d_model,
+                head_dim=head_dim,
+                row_batch_size=getattr(cfg.projector, "row_batch_size", None),
+            )
             print(
                 f"[rank_search] signal logits={signal_scales['signal_logits']:.6f}"
                 f" attn={signal_scales['signal_attn']:.6f}"

@@ -157,13 +157,31 @@ def init_gamma(
     P_K: Tensor,
     r_k: int,
     delta: float = 1e-8,
+    row_idx: Optional[Tensor] = None,
+    batch_chunk_size: int = 32,
 ) -> float:
     d_h = Q.shape[-1]
-    Z = (Q @ K.transpose(-1, -2)) / math.sqrt(d_h)
-    B = Q @ P_K @ P_K.transpose(0, 1) @ K.transpose(-1, -2)
-    W = valid_mask.to(dtype=Z.dtype)
-    num = (W * Z * B).sum()
-    den = (W * B * B).sum() + delta
+    if row_idx is None:
+        Qs = Q
+        Ws = valid_mask
+    else:
+        Qs = Q[:, row_idx, :]
+        Ws = valid_mask[:, row_idx, :]
+
+    num = torch.zeros((), device=Q.device, dtype=Q.dtype)
+    den = torch.zeros((), device=Q.device, dtype=Q.dtype)
+    batch_chunk_size = max(1, int(batch_chunk_size))
+    for start in range(0, Q.shape[0], batch_chunk_size):
+        end = min(start + batch_chunk_size, Q.shape[0])
+        Qc = Qs[start:end]
+        Kc = K[start:end]
+        Wc = Ws[:1] if Ws.shape[0] == 1 else Ws[start:end]
+        Z = (Qc @ Kc.transpose(-1, -2)) / math.sqrt(d_h)
+        B = (Qc @ P_K) @ (Kc @ P_K).transpose(-1, -2)
+        W = Wc.to(dtype=Z.dtype)
+        num = num + (W * Z * B).sum()
+        den = den + (W * B * B).sum()
+    den = den + delta
     alpha0 = num / den
     gamma0 = math.sqrt(r_k) * alpha0.item()
     return max(gamma0, 1e-4)
@@ -297,12 +315,13 @@ def evaluate_full(
     P_V: Tensor,
     xi: Tensor,
     cfg: OptimConfig,
+    row_idx: Optional[Tensor] = None,
 ) -> Dict[str, float]:
     loss, raw = compute_objective(
         Q=Q, K=K, V=V,
         additive_mask=additive_mask, valid_mask=valid_mask,
         P_K=P_K, P_V=P_V, xi=xi, cfg=cfg,
-        row_idx=None, stage="full",
+        row_idx=row_idx, stage="full",
     )
     del loss
     pk_err = torch.linalg.norm(P_K.transpose(0, 1) @ P_K - torch.eye(P_K.shape[1], device=P_K.device, dtype=P_K.dtype))
@@ -334,13 +353,16 @@ def optimize_low_rank_attention_torch(
     K = K.to(device=device, dtype=dtype)
     V = V.to(device=device, dtype=dtype)
     mask = mask.to(device=device)
+    if mask.ndim == 2:
+        mask = mask.unsqueeze(0)
 
     if Q.ndim != 3 or K.ndim != 3 or V.ndim != 3:
         raise ValueError("Q, K, V must have shape [batch, seq_len, d_h].")
     if Q.shape != K.shape or Q.shape != V.shape:
         raise ValueError("Q, K, V must have identical shapes.")
-    if mask.shape != (Q.shape[0], Q.shape[1], Q.shape[1]):
-        raise ValueError("mask must have shape [batch, seq_len, seq_len].")
+    expected_tail = (Q.shape[1], Q.shape[1])
+    if mask.ndim != 3 or mask.shape[-2:] != expected_tail or mask.shape[0] not in (1, Q.shape[0]):
+        raise ValueError("mask must have shape [batch|1, seq_len, seq_len].")
     if cfg.r_k > Q.shape[-1] or cfg.r_v > Q.shape[-1]:
         raise ValueError("r_k and r_v must not exceed d_h.")
     if cfg.eval_every <= 0:
@@ -359,7 +381,11 @@ def optimize_low_rank_attention_torch(
     P_K = nn.Parameter(init_pk(Q, K, cfg.r_k).to(device=device, dtype=dtype))
     P_V = nn.Parameter(init_pv(V, cfg.r_v).to(device=device, dtype=dtype))
 
-    gamma0 = init_gamma(Q, K, valid_mask, P_K.detach(), cfg.r_k)
+    eval_row_idx = sample_rows(Q.shape[1], cfg.row_batch_size, device)
+    gamma0 = init_gamma(
+        Q, K, valid_mask, P_K.detach(), cfg.r_k,
+        row_idx=eval_row_idx,
+    )
     xi0 = inv_softplus(torch.tensor(gamma0 - cfg.gamma_min + 1e-8, device=device, dtype=dtype))
     xi = nn.Parameter(xi0)
 
@@ -436,7 +462,10 @@ def optimize_low_rank_attention_torch(
             or step == cfg.max_steps
         )
         if do_full_eval:
-            calib = evaluate_full(Q, K, V, additive_mask, valid_mask, P_K, P_V, xi, cfg)
+            calib = evaluate_full(
+                Q, K, V, additive_mask, valid_mask, P_K, P_V, xi, cfg,
+                row_idx=eval_row_idx,
+            )
             calib["kind"] = "full_calib"
             calib["step"] = step
             calib["stage"] = stage

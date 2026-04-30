@@ -77,6 +77,38 @@ class ProjectorConfig:
 
 
 @dataclass
+class AttentionDistillConfig:
+    input_dir: Path = Path("artifacts/projectors")
+    output_dir: Path = Path("artifacts/projectors_attn_distill")
+    n_steps: int = 300
+    sample_batch_size: Optional[int] = 128
+    row_batch_size: Optional[int] = 128
+    eval_every: int = 25
+    eval_batch_size: int = 32
+    eval_max_batches: Optional[int] = 16
+    lr_pk: float = 1e-3
+    lr_pv: float = 1e-3
+    lr_xi: float = 1e-3
+    optimizer: str = "riemannian_adam"
+    lr: float = 1e-3
+    orthogonalize_every: int = 1
+    beta1: float = 0.9
+    beta2: float = 0.99
+    grad_clip: float = 1.0
+    gamma_min: float = 1e-4
+    eps_loss: float = 1e-8
+    adam_eps: float = 1e-8
+    train_gamma: bool = True
+    loss_mode: str = "absolute"
+    early_stopping: bool = True
+    patience: int = 5
+    min_delta: float = 1e-5
+    min_delta_mode: str = "relative"
+    seed: int = 0
+    save_format: str = "auto"
+
+
+@dataclass
 class QuantConfig:
     enabled: bool = False
     k_method: str = "turbo_prod"
@@ -153,6 +185,43 @@ class HAWPConfig:
 
 
 @dataclass
+class EvalPPLConfig:
+    seq_len: int = 1024
+    nsamples: Optional[int] = 32
+
+
+@dataclass
+class EvalNeedleConfig:
+    context_lens: list[int] = field(default_factory=lambda: [512, 1024, 2048, 4096])
+    depths: list[int] = field(default_factory=lambda: [0, 25, 50, 75, 100])
+    max_new_tokens: int = 32
+
+
+@dataclass
+class EvalSpeedConfig:
+    seq_lens: list[int] = field(default_factory=lambda: [512, 1024, 2048, 4096])
+    max_new_tokens: int = 64
+
+
+@dataclass
+class EvalLongBenchConfig:
+    enabled: bool = False
+    data_dir: Path = Path("data/longbench")
+    tasks: list[str] = field(default_factory=list)
+    max_new_tokens: int = 128
+
+
+@dataclass
+class EvalConfig:
+    modes: list[str] = field(default_factory=lambda: ["baseline", "quant_only", "hawp_quant"])
+    output_dir: Path = Path("artifacts/eval")
+    ppl: EvalPPLConfig = field(default_factory=EvalPPLConfig)
+    needle: EvalNeedleConfig = field(default_factory=EvalNeedleConfig)
+    speed: EvalSpeedConfig = field(default_factory=EvalSpeedConfig)
+    longbench: EvalLongBenchConfig = field(default_factory=EvalLongBenchConfig)
+
+
+@dataclass
 class HAWPLAQConfig:
     mode: str = "local"
     data: DataConfig = field(default_factory=DataConfig)
@@ -160,6 +229,7 @@ class HAWPLAQConfig:
     generation: GenerationConfig = field(default_factory=GenerationConfig)
     calib: CalibConfig = field(default_factory=CalibConfig)
     projector: ProjectorConfig = field(default_factory=ProjectorConfig)
+    attention_distill: AttentionDistillConfig = field(default_factory=AttentionDistillConfig)
     quant: QuantConfig = field(default_factory=QuantConfig)
     sched: SchedConfig = field(default_factory=SchedConfig)
     rank_search: RankSearchConfig = field(default_factory=RankSearchConfig)
@@ -167,6 +237,7 @@ class HAWPLAQConfig:
     log: LogConfig = field(default_factory=LogConfig)
     serving: ServingConfig = field(default_factory=ServingConfig)
     hawp: HAWPConfig = field(default_factory=HAWPConfig)
+    eval: EvalConfig = field(default_factory=EvalConfig)
 
 
 def _is_optional_like(tp) -> bool:

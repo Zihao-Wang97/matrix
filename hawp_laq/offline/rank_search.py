@@ -351,6 +351,8 @@ def compute_signal_scales(
     n_heads: int,
     d_model: int | None = None,
     head_dim: int | None = None,
+    row_batch_size: int | None = None,
+    batch_chunk_size: int = 4,
 ) -> dict[str, float]:
     """Compute per-component signal strengths from full-precision Q/K/V.
 
@@ -378,21 +380,47 @@ def compute_signal_scales(
             f"k={k_mh.shape}, v={v_mh.shape}"
         )
 
-    logits_fp = torch.matmul(q_mh, k_mh.transpose(-2, -1)) / math.sqrt(head_dim)
-
     T = q_mh.shape[-2]
-    causal = torch.tril(
-        torch.ones(T, T, dtype=torch.bool, device=logits_fp.device)
-    )
-    causal = causal.unsqueeze(0).unsqueeze(0).expand_as(logits_fp)
-    logits_masked = logits_fp.masked_fill(~causal, float("-inf"))
-    attn_fp = torch.softmax(logits_masked, dim=-1)
-    value_fp = torch.matmul(attn_fp, v_mh)
+    if row_batch_size is not None and row_batch_size < T:
+        row_idx = torch.linspace(0, T - 1, steps=row_batch_size, device=q_mh.device).long()
+        q_rows = row_batch_size
+    else:
+        row_idx = None
+        q_rows = T
 
-    n_valid = int(causal.sum())
-    signal_logits = logits_fp[causal].pow(2).sum().item() / max(n_valid, 1)
-    signal_attn = attn_fp[causal].pow(2).sum().item() / max(n_valid, 1)
-    signal_value = value_fp.pow(2).mean().item()
+    row_positions = row_idx if row_idx is not None else torch.arange(T, device=q_mh.device)
+    causal = torch.arange(T, device=q_mh.device).unsqueeze(0) <= row_positions.unsqueeze(1)
+    batch_chunk_size = max(1, int(batch_chunk_size))
+
+    logits_sum = torch.zeros((), device=q_mh.device, dtype=torch.float32)
+    attn_sum = torch.zeros((), device=q_mh.device, dtype=torch.float32)
+    value_sum = torch.zeros((), device=q_mh.device, dtype=torch.float32)
+    valid_count = 0
+    value_count = 0
+
+    for start in range(0, q_mh.shape[0], batch_chunk_size):
+        end = min(start + batch_chunk_size, q_mh.shape[0])
+        qc = q_mh[start:end]
+        kc = k_mh[start:end]
+        vc = v_mh[start:end]
+        if row_idx is not None:
+            qc = qc[:, :, row_idx, :]
+
+        logits_fp = torch.matmul(qc, kc.transpose(-2, -1)) / math.sqrt(head_dim)
+        causal_exp = causal.unsqueeze(0).unsqueeze(0).expand_as(logits_fp)
+        logits_masked = logits_fp.masked_fill(~causal_exp, float("-inf"))
+        attn_fp = torch.softmax(logits_masked, dim=-1)
+        value_fp = torch.matmul(attn_fp, vc)
+
+        logits_sum = logits_sum + logits_fp[causal_exp].float().pow(2).sum()
+        attn_sum = attn_sum + attn_fp[causal_exp].float().pow(2).sum()
+        value_sum = value_sum + value_fp.float().pow(2).sum()
+        valid_count += int(causal.sum()) * logits_fp.shape[0] * logits_fp.shape[1]
+        value_count += value_fp.numel()
+
+    signal_logits = logits_sum.item() / max(valid_count, 1)
+    signal_attn = attn_sum.item() / max(valid_count, 1)
+    signal_value = value_sum.item() / max(value_count, 1)
 
     return {
         "signal_logits": signal_logits,
@@ -661,6 +689,7 @@ def search_rank_per_layer(
                 n_heads=n_heads,
                 d_model=d_model,
                 head_dim=head_dim,
+                row_batch_size=row_batch_size,
             )
             print(
                 f"[rank_search] signal logits={signal_scales['signal_logits']:.6f}"

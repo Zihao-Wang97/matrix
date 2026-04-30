@@ -284,7 +284,7 @@ class ProjectorTrainer:
 
         T = q_opt.shape[1]
         B_eff = q_opt.shape[0]
-        mask = self._make_bool_causal_mask(B_eff, T, device)
+        mask = self._make_bool_causal_mask(1, T, device)
 
         if self.rank_k > d_h:
             raise ValueError(

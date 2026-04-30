@@ -136,6 +136,8 @@ def convert_llama_to_hawp(
             gamma_value=gamma_value,
             use_archive_k_ip_approx=use_archive_k_ip_approx,
         )
+        if type(layer_mod).__name__ != "OPTDecoderLayer":
+            hawp_attn._hawp_parent_expects_2_outputs = True
         attn_attr = "self_attn" if hasattr(layer_mod, "self_attn") else "attention"
         setattr(layer_mod, attn_attr, hawp_attn)
         if type(layer_mod).__name__ == "OPTDecoderLayer":

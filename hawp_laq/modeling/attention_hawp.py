@@ -235,6 +235,7 @@ class HAWPAttention(nn.Module):
         self._quant_archive_chunks: list[_QuantChunk] = []
         self._hawp_parent_use_cache = False
         self._hawp_parent_use_cache_valid = False
+        self._hawp_parent_expects_2_outputs = False
 
     @property
     def _is_low_rank(self) -> bool:
@@ -248,6 +249,11 @@ class HAWPAttention(nn.Module):
         self._hawp_parent_use_cache = False
         self._hawp_parent_use_cache_valid = False
         return use_cache
+
+    def _format_attn_output(self, attn_output, attn_weights=None, past_key_value=None):
+        if getattr(self, "_hawp_parent_expects_2_outputs", False):
+            return attn_output, attn_weights
+        return attn_output, attn_weights, past_key_value
 
     def setup_quant_cache(self, k_quantizer, v_quantizer, recent_window: int = 64) -> None:
         self.use_cache_manager = True
@@ -872,7 +878,7 @@ class HAWPAttention(nn.Module):
                 past_kv = (raw_key_for_cache, raw_value_for_cache)
         else:
             past_kv = None
-        return attn_output, None, past_kv
+        return self._format_attn_output(attn_output, None, past_kv)
 
     def _opt_attn_forward(self, query_states, key_states, value_states, attention_mask, **kwargs):
         attn_output, attn_weights = self._eager_attn(
@@ -979,7 +985,7 @@ class HAWPAttention(nn.Module):
             cache_passthrough = _cache_passthrough(past_key_value)
             if self.is_opt:
                 return attn_output, attn_weights, cache_passthrough
-            return attn_output, None, cache_passthrough
+            return self._format_attn_output(attn_output, None, cache_passthrough)
 
         elif past_key_value is not None:
             if hasattr(past_key_value, "update"):
@@ -1043,7 +1049,7 @@ class HAWPAttention(nn.Module):
                 return attn_output, attn_weights, past_key_value
             return attn_output, attn_weights, (k_lat, v_lat)
         if self.use_cache_manager and self._tq_k_quantizer is not None and effective_use_cache and bsz == 1:
-            return attn_output, None, cache_passthrough
+            return self._format_attn_output(attn_output, None, cache_passthrough)
         if effective_use_cache:
             if past_key_value is not None and hasattr(past_key_value, "update"):
                 past_kv = past_key_value
@@ -1051,7 +1057,7 @@ class HAWPAttention(nn.Module):
                 past_kv = (k_lat, v_lat)
         else:
             past_kv = None
-        return attn_output, None, past_kv
+        return self._format_attn_output(attn_output, None, past_kv)
 
     def _apply_pk(self, k: torch.Tensor) -> torch.Tensor:
         if self.r_k >= self.head_dim and not self.p_k.requires_grad:

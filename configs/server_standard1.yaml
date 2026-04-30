@@ -74,6 +74,36 @@ projector:
   eps_loss: "1e-8"
   adam_eps: "1e-8"
 
+attention_distill:
+  input_dir: artifacts/projectors
+  output_dir: artifacts/projectors_attn_distill
+  n_steps: 300
+  sample_batch_size: 128
+  row_batch_size: 128
+  eval_every: 25
+  eval_batch_size: 32
+  eval_max_batches: 16
+  lr_pk: "1e-3"
+  lr_pv: "1e-3"
+  lr_xi: "1e-3"
+  optimizer: riemannian_adam
+  lr: "1e-3"
+  orthogonalize_every: 1
+  beta1: 0.9
+  beta2: 0.99
+  grad_clip: 1.0
+  gamma_min: "1e-4"
+  eps_loss: "1e-8"
+  adam_eps: "1e-8"
+  train_gamma: true
+  loss_mode: absolute
+  early_stopping: true
+  patience: 5
+  min_delta: "1e-5"
+  min_delta_mode: relative
+  seed: 0
+  save_format: auto
+
 rank_search:
   output_dir: artifacts/ranks
   n_steps: 1000
