@@ -5,7 +5,7 @@ data:
   cache: /data/wangzihao/work/matrix/cache
 
 model:
-  model_id: /data/wangzihao/work/matrix/Llama-3.1-8B
+  model_id: /data/wangzihao/work/matrix/Llama-3.1-8B-Instruct
   torch_dtype: float16
   load_in_4bit: false
 
@@ -21,7 +21,7 @@ generation:
 
 eval:
   modes: [baseline, quant_only, hawp_quant]
-  output_dir: /data/wangzihao/work/matrix/artifacts/eval_llama31_8b
+  output_dir: /data/wangzihao/work/matrix/artifacts/eval_llama31_8b_instruct_longbench_e
   ppl:
     seq_len: 1024
     nsamples: 32
@@ -33,72 +33,73 @@ eval:
     seq_lens: [512, 1024, 2048, 4096]
     max_new_tokens: 64
   distribution:
-    enabled: true
+    enabled: false
     seq_len: 512
     nsamples: 8
     top_k: [1, 5, 10]
     seed: 0
   longbench:
-    enabled: false
+    enabled: true
     data_dir: /data/wangzihao/work/matrix/data/longbench
-    tasks: []
-    max_new_tokens: 128
+    tasks:
+      - qasper
+      - multifieldqa_en
+      - hotpotqa
+      - 2wikimqa
+      - gov_report
+      - multi_news
+      - trec
+      - triviaqa
+      - samsum
+      - passage_count
+      - passage_retrieval_en
+      - lcc
+      - repobench-p
+    max_new_tokens: 512
 
 calib:
   nsamples: 64
   seq_len: 1024
-  output_dir: /data/wangzihao/work/matrix/artifacts/calib_llama31_8b
+  output_dir: /data/wangzihao/work/matrix/artifacts/calib_llama31_8b_instruct
   dataset: wikitext2
   capture_mode: auto
 
 projector:
   rank: null
-
   r_k: 96
   r_v: 64
-
   lr: 0.0005
   orthogonalize_every: 5
   target_layer: 0
   w_logits: 1.0
   w_attn: 1.0
   w_value: 0.5
-
-  output_dir: /data/wangzihao/work/matrix/artifacts/projectors_llama31_8b
-  
-  
-  
-
+  output_dir: /data/wangzihao/work/matrix/artifacts/projectors_llama31_8b_instruct
   optimizer: riemannian_adam
-
   n_steps: 1000
   warmup_steps: 50
   row_batch_size: 64
   lr_pk: "3e-3"
   lr_pv: "3e-3"
   lr_xi: "5e-3"
-
   beta1: 0.9
   beta2: 0.99
   grad_clip: 1.0
-
   lambda_z: 1.0
   lambda_o: 2.0
   lambda_v: 0.05
-
   eval_every: 50
   early_stopping: true
   patience: 5
   min_delta: "1e-5"
   min_delta_mode: relative
-
   gamma_min: "1e-4"
   eps_loss: "1e-8"
   adam_eps: "1e-8"
 
 attention_distill:
-  input_dir: /data/wangzihao/work/matrix/artifacts/projectors_llama31_8b
-  output_dir: /data/wangzihao/work/matrix/artifacts/projectors_llama31_8b_attn_distill
+  input_dir: /data/wangzihao/work/matrix/artifacts/projectors_llama31_8b_instruct
+  output_dir: /data/wangzihao/work/matrix/artifacts/projectors_llama31_8b_instruct_attn_distill
   n_steps: 400
   sample_batch_size: 64
   row_batch_size: 64
@@ -108,7 +109,7 @@ attention_distill:
   lr_pk: "1e-3"
   lr_pv: "1e-3"
   lr_xi: "1e-3"
-  optimizer: riemannian_adam  # adam % riemannian_adam
+  optimizer: riemannian_adam
   lr: "1e-3"
   orthogonalize_every: 1
   beta1: 0.9
@@ -117,8 +118,8 @@ attention_distill:
   gamma_min: "1e-4"
   eps_loss: "1e-8"
   adam_eps: "1e-8"
-  train_gamma: true 
-  loss_mode: normalized # absolute 或 normalized
+  train_gamma: true
+  loss_mode: normalized
   early_stopping: true
   patience: 5
   min_delta: 1e-5
@@ -146,36 +147,21 @@ sched:
   drop_strategy: position
 
 rank_search:
-  output_dir: /data/wangzihao/work/matrix/artifacts/ranks_llama31_8b
+  output_dir: /data/wangzihao/work/matrix/artifacts/ranks_llama31_8b_instruct
   n_steps: 300
-
   relative_tolerance: 0.10
-
   logits_abs_tolerance: "1.0e-5"
   attn_abs_tolerance: "20"
   value_abs_tolerance: "50"
-
   selection_mode: signal_normalized
-
   logits_signal_tolerance: 0.01
   attn_signal_tolerance: 20
   value_signal_tolerance: 50
-
   r_k_candidates: null
   r_v_candidates: null
   rank_pair_candidates:
     - [128, 128]
-    # - [128, 96]
     - [128, 64]
-    # - [96, 96]
-    # - [96, 64]
-    # - [96, 48]
-    # - [64, 64]
-    # - [64, 48]
-    # - [64, 32]
-    # - [48, 48]
-    # - [48, 32]
-    # - [32, 32]
   layer_tolerance_scale:
     - layers: [0, 1, 2, 3, 4, 5, 6, 7]
       scale: 0.75

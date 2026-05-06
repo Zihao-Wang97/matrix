@@ -29,7 +29,7 @@ def _tokenize_texts_in_segments(tokenizer, text_list: list[str], max_chars: int 
     return torch.tensor(token_ids, dtype=torch.long).unsqueeze(0)
 
 
-def _load_wikitext2(tokenizer, seq_len: int, split: str = "test", nsamples: int | None = None):
+def _load_wikitext2(tokenizer, seq_len: int, split: str = "test", nsamples: int | None = None, seed: int | None = None):
     def _load_local_txt() -> list[str] | None:
         split_txt = Path(f"data/wikitext2_{split}.txt")
         train_txt = Path("data/wikitext2_train.txt")
@@ -89,7 +89,12 @@ def _load_wikitext2(tokenizer, seq_len: int, split: str = "test", nsamples: int 
     chunks = input_ids.reshape(n_chunks, seq_len)
 
     if nsamples is not None and nsamples < n_chunks:
-        indices = torch.randperm(n_chunks)[:nsamples]
+        if seed is None:
+            indices = torch.randperm(n_chunks)[:nsamples]
+        else:
+            generator = torch.Generator()
+            generator.manual_seed(seed)
+            indices = torch.randperm(n_chunks, generator=generator)[:nsamples]
         chunks = chunks[indices]
 
     return chunks

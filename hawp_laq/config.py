@@ -204,6 +204,15 @@ class EvalSpeedConfig:
 
 
 @dataclass
+class EvalDistributionConfig:
+    enabled: bool = True
+    seq_len: int = 512
+    nsamples: Optional[int] = 8
+    top_k: list[int] = field(default_factory=lambda: [1, 5, 10])
+    seed: int = 0
+
+
+@dataclass
 class EvalLongBenchConfig:
     enabled: bool = False
     data_dir: Path = Path("data/longbench")
@@ -218,6 +227,7 @@ class EvalConfig:
     ppl: EvalPPLConfig = field(default_factory=EvalPPLConfig)
     needle: EvalNeedleConfig = field(default_factory=EvalNeedleConfig)
     speed: EvalSpeedConfig = field(default_factory=EvalSpeedConfig)
+    distribution: EvalDistributionConfig = field(default_factory=EvalDistributionConfig)
     longbench: EvalLongBenchConfig = field(default_factory=EvalLongBenchConfig)
 
 
