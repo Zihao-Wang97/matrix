@@ -1159,17 +1159,21 @@ class HAWPAttention(nn.Module):
 
         if self.is_opt:
             opt_undo = math.sqrt(self.head_dim)
-            scale = opt_undo * temp_scale
+            scale_value = opt_undo * temp_scale
         else:
-            scale = temp_scale
+            scale_value = temp_scale
 
+        scale = torch.as_tensor(scale_value, dtype=q_lat.dtype, device=q_lat.device)
         if self.gamma_mode == "learned":
-            scale = scale * self.gamma.item()
+            scale = scale * self.gamma.to(device=q_lat.device, dtype=q_lat.dtype).reshape(())
         elif self.gamma_mode == "fixed":
-            gamma = self.gamma.item() if self.gamma_value is None else self.gamma_value
+            if self.gamma_value is None:
+                gamma = self.gamma.to(device=q_lat.device, dtype=q_lat.dtype).reshape(())
+            else:
+                gamma = torch.as_tensor(self.gamma_value, dtype=q_lat.dtype, device=q_lat.device)
             scale = scale * gamma
 
-        return torch.tensor(scale, dtype=q_lat.dtype, device=q_lat.device)
+        return scale
 
     def _can_use_archive_k_ip_approx(self) -> bool:
         """Check whether the approx_inner_product fast path is available.

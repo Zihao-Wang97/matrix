@@ -104,6 +104,44 @@ attention_distill:
   seed: 0
   save_format: auto
 
+layer_distill:
+  data_dir: artifacts/layer_distill
+  input_dir: artifacts/projectors_attn_distill
+  output_dir: artifacts/projectors_layer_distill
+  nsamples: null
+  seq_len: null
+  batch_size: 1
+  storage_dtype: float16
+  n_steps: 300
+  sample_batch_size: null
+  eval_every: 25
+  eval_max_batches: 16
+  optimizer: riemannian_adam
+  lr: "1e-4"
+  lr_pk: "1e-5"
+  lr_pv: "1e-5"
+  lr_xi: "1e-6"
+  beta1: 0.9
+  beta2: 0.99
+  grad_clip: 1.0
+  train_gamma: true
+  gamma_min: "1e-4"
+  gamma_max: 2.0
+  eps_loss: "1e-8"
+  adam_eps: "1e-8"
+  orthogonalize_every: 1
+  alternate_pk_pv: true
+  finite_guard: true
+  bad_step_patience: 20
+  lr_backoff: 0.5
+  loss_mode: normalized
+  early_stopping: true
+  patience: 5
+  min_delta: "1e-5"
+  min_delta_mode: relative
+  seed: 0
+  save_format: auto
+
 rank_search:
   output_dir: artifacts/ranks
   n_steps: 1000

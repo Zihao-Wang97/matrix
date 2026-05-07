@@ -109,6 +109,46 @@ class AttentionDistillConfig:
 
 
 @dataclass
+class LayerDistillConfig:
+    data_dir: Path = Path("artifacts/layer_distill")
+    input_dir: Path = Path("artifacts/projectors_attn_distill")
+    output_dir: Path = Path("artifacts/projectors_layer_distill")
+    nsamples: Optional[int] = None
+    seq_len: Optional[int] = None
+    batch_size: int = 1
+    storage_dtype: str = "float16"
+    n_steps: int = 300
+    sample_batch_size: Optional[int] = None
+    eval_every: int = 25
+    eval_max_batches: Optional[int] = 16
+    optimizer: str = "adam"
+    lr: float = 1e-4
+    lr_pk: float = 1e-5
+    lr_pv: float = 1e-5
+    lr_xi: float = 1e-6
+    beta1: float = 0.9
+    beta2: float = 0.99
+    grad_clip: float = 1.0
+    train_gamma: bool = True
+    gamma_min: float = 1e-4
+    gamma_max: float = 2.0
+    eps_loss: float = 1e-8
+    adam_eps: float = 1e-8
+    orthogonalize_every: int = 1
+    alternate_pk_pv: bool = True
+    finite_guard: bool = True
+    bad_step_patience: int = 20
+    lr_backoff: float = 0.5
+    loss_mode: str = "normalized"
+    early_stopping: bool = True
+    patience: int = 5
+    min_delta: float = 1e-5
+    min_delta_mode: str = "relative"
+    seed: int = 0
+    save_format: str = "auto"
+
+
+@dataclass
 class QuantConfig:
     enabled: bool = False
     k_method: str = "turbo_prod"
@@ -240,6 +280,7 @@ class HAWPLAQConfig:
     calib: CalibConfig = field(default_factory=CalibConfig)
     projector: ProjectorConfig = field(default_factory=ProjectorConfig)
     attention_distill: AttentionDistillConfig = field(default_factory=AttentionDistillConfig)
+    layer_distill: LayerDistillConfig = field(default_factory=LayerDistillConfig)
     quant: QuantConfig = field(default_factory=QuantConfig)
     sched: SchedConfig = field(default_factory=SchedConfig)
     rank_search: RankSearchConfig = field(default_factory=RankSearchConfig)
