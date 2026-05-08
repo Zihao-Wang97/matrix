@@ -61,6 +61,78 @@ def _make_causal_mask(batch_size: int, seq_len: int, device: torch.device, dtype
     return mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, seq_len, seq_len)
 
 
+def _find_attention_module(layer: torch.nn.Module) -> torch.nn.Module | None:
+    for attr in ("self_attn", "attention"):
+        if hasattr(layer, attr):
+            return getattr(layer, attr)
+    return None
+
+
+def _get_or_create_rotary_embedding(layer: torch.nn.Module, device: torch.device) -> torch.nn.Module | None:
+    attn = _find_attention_module(layer)
+    for owner in (attn, layer):
+        rotary = getattr(owner, "rotary_emb", None) if owner is not None else None
+        if rotary is not None:
+            return rotary
+
+    cached = getattr(layer, "_hawp_layer_rotary_emb", None)
+    if cached is not None:
+        return cached
+
+    config = getattr(attn, "config", None) if attn is not None else None
+    config = config if config is not None else getattr(layer, "config", None)
+    model_type = str(getattr(config, "model_type", "")).lower()
+    if config is None or "llama" not in model_type:
+        return None
+
+    try:
+        from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
+    except Exception:
+        return None
+
+    try:
+        rotary = LlamaRotaryEmbedding(config=config, device=device)
+    except TypeError:
+        rotary = LlamaRotaryEmbedding(config, device=device)
+    rotary.to(device)
+    setattr(layer, "_hawp_layer_rotary_emb", rotary)
+    return rotary
+
+
+def _call_rotary_embedding(
+    rotary: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    position_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    seq_len = int(position_ids.max().item()) + 1 if position_ids.numel() else hidden_states.shape[1]
+    try:
+        sig = inspect.signature(rotary.forward)
+        params = sig.parameters
+    except (TypeError, ValueError):
+        params = {}
+
+    if "position_ids" in params:
+        return rotary(hidden_states, position_ids)
+    if "seq_len" in params:
+        return rotary(hidden_states, seq_len=seq_len)
+
+    try:
+        return rotary(hidden_states, position_ids)
+    except Exception:
+        return rotary(hidden_states, seq_len=seq_len)
+
+
+def _make_position_embeddings(
+    layer: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    position_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    rotary = _get_or_create_rotary_embedding(layer, hidden_states.device)
+    if rotary is None:
+        return None
+    return _call_rotary_embedding(rotary, hidden_states, position_ids)
+
+
 def _call_decoder_layer(layer: torch.nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
     bsz, seq_len, _ = hidden_states.shape
     device = hidden_states.device
@@ -75,10 +147,18 @@ def _call_decoder_layer(layer: torch.nn.Module, hidden_states: torch.Tensor) -> 
 
     if "attention_mask" in params:
         kwargs["attention_mask"] = _make_causal_mask(bsz, seq_len, device, dtype)
+    position_ids = None
     if "position_ids" in params:
-        kwargs["position_ids"] = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0).expand(bsz, -1)
+        position_ids = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0).expand(bsz, -1)
+        kwargs["position_ids"] = position_ids
     if "cache_position" in params:
         kwargs["cache_position"] = torch.arange(seq_len, device=device, dtype=torch.long)
+    if "position_embeddings" in params:
+        if position_ids is None:
+            position_ids = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0).expand(bsz, -1)
+        position_embeddings = _make_position_embeddings(layer, hidden_states, position_ids)
+        if position_embeddings is not None:
+            kwargs["position_embeddings"] = position_embeddings
     if "past_key_value" in params:
         kwargs["past_key_value"] = None
     if "output_attentions" in params:
@@ -763,8 +843,10 @@ def save_refined_layer_projector(
     out["gamma"] = module.gamma.detach().cpu()
     out["r_k"] = r_k
     out["r_v"] = r_v
+    out["logit_scale_mode"] = module.logit_scale_mode
     out["layer_distill"] = {
         "source_projector": str(source_path),
+        "logit_scale_mode": module.logit_scale_mode,
         "best_step": result.best_step,
         "actual_steps": result.actual_steps,
         "stopped_early": result.stopped_early,

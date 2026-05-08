@@ -24,6 +24,7 @@ def save_projectors(model: torch.nn.Module, output_dir: str | Path) -> Path:
                 "gamma": module.gamma.data.cpu(),
                 "r_k": module.r_k,
                 "r_v": module.r_v,
+                "logit_scale_mode": module.logit_scale_mode,
             }
             torch.save(data, layer_dir / "projector.pt")
             layer_data[str(module.layer_idx)] = {
@@ -34,7 +35,12 @@ def save_projectors(model: torch.nn.Module, output_dir: str | Path) -> Path:
     return output_dir
 
 
-def load_projectors(model: torch.nn.Module, projector_dir: str | Path, strict: bool = True) -> None:
+def load_projectors(
+    model: torch.nn.Module,
+    projector_dir: str | Path,
+    strict: bool = True,
+    expected_logit_scale_mode: str | None = None,
+) -> None:
     projector_dir = Path(projector_dir)
     for name, module in model.named_modules():
         if isinstance(module, HAWPAttention):
@@ -43,6 +49,15 @@ def load_projectors(model: torch.nn.Module, projector_dir: str | Path, strict: b
                 continue
             data = torch.load(pt_path, map_location="cpu", weights_only=True)
             data = normalize_projector_data(data, module.layer_idx)
+            artifact_scale = data.get("logit_scale_mode")
+            if expected_logit_scale_mode is not None and artifact_scale is not None:
+                if artifact_scale != expected_logit_scale_mode:
+                    raise ValueError(
+                        f"Layer {module.layer_idx}: projector logit_scale_mode={artifact_scale!r} "
+                        f"does not match configured hawp.logit_scale_mode="
+                        f"{expected_logit_scale_mode!r}. Retrain/refine projectors with the "
+                        f"same config used for inference."
+                    )
             if module.gamma_mode == "learned" and not data.get("causal_mask", False):
                 import warnings
                 warnings.warn(

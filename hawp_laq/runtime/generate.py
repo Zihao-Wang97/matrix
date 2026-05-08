@@ -612,7 +612,12 @@ def _convert_and_load_projectors(model, cfg, device, mode: str):
                     f"(2) use a new empty output_dir, or (3) retrain all layers."
                 )
 
-            load_projectors(model, projector_dir, strict=True)
+            load_projectors(
+                model,
+                projector_dir,
+                strict=True,
+                expected_logit_scale_mode=cfg.hawp.logit_scale_mode,
+            )
             n_hawp = sum(1 for m in model.modules() if isinstance(m, HAWPAttention))
             n_loaded = len(available_layers)
             print(f"[{mode}] loaded projectors from {projector_dir} ({n_loaded}/{n_hawp} layers)")

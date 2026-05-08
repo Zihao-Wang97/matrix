@@ -46,6 +46,7 @@ def _projector_train_kwargs(cfg) -> dict:
         "min_delta": cfg.projector.min_delta,
         "min_delta_mode": cfg.projector.min_delta_mode,
         "gamma_min": cfg.projector.gamma_min,
+        "logit_scale_mode": cfg.hawp.logit_scale_mode,
         "eps_loss": cfg.projector.eps_loss,
         "adam_eps": cfg.projector.adam_eps,
         "optimizer": cfg.projector.optimizer,

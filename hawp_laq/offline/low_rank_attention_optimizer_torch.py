@@ -63,6 +63,7 @@ class OptimConfig:
     warmup_steps: int = 50
     row_batch_size: Optional[int] = 256
     gamma_min: float = 1e-4
+    logit_scale_mode: str = "rk"
     grad_clip: float = 1.0
     # --- full-calib evaluation & early stopping ---
     eval_every: int = 50
@@ -156,11 +157,13 @@ def init_gamma(
     valid_mask: Tensor,
     P_K: Tensor,
     r_k: int,
+    logit_scale_mode: str = "rk",
     delta: float = 1e-8,
     row_idx: Optional[Tensor] = None,
     batch_chunk_size: int = 32,
 ) -> float:
     d_h = Q.shape[-1]
+    denom = low_rank_logit_scale_denominator(logit_scale_mode, d_h, r_k)
     if row_idx is None:
         Qs = Q
         Ws = valid_mask
@@ -183,8 +186,18 @@ def init_gamma(
         den = den + (W * B * B).sum()
     den = den + delta
     alpha0 = num / den
-    gamma0 = math.sqrt(r_k) * alpha0.item()
+    gamma0 = denom * alpha0.item()
     return max(gamma0, 1e-4)
+
+
+def low_rank_logit_scale_denominator(logit_scale_mode: str, head_dim: int, r_k: int) -> float:
+    if logit_scale_mode == "dh":
+        return math.sqrt(head_dim)
+    if logit_scale_mode == "rk":
+        return math.sqrt(r_k)
+    raise ValueError(
+        f"logit_scale_mode must be 'dh' or 'rk', got {logit_scale_mode!r}"
+    )
 
 
 def sample_rows(num_rows: int, row_batch_size: Optional[int], device: torch.device) -> Optional[Tensor]:
@@ -258,6 +271,9 @@ def compute_objective(
     stage: str = "full",
 ) -> Tuple[Tensor, Dict[str, float]]:
     d_h = Q.shape[-1]
+    scale_denom = low_rank_logit_scale_denominator(
+        cfg.logit_scale_mode, d_h, cfg.r_k,
+    )
 
     if row_idx is None:
         Qs = Q
@@ -278,7 +294,7 @@ def compute_objective(
     Kl = K @ P_K
     Vl = V @ P_V
 
-    Z_hat = (gamma / math.sqrt(cfg.r_k)) * (Ql @ Kl.transpose(-1, -2))
+    Z_hat = (gamma / scale_denom) * (Ql @ Kl.transpose(-1, -2))
     A_hat = stable_softmax(Z_hat, Ms, Ws)
     O_hat = (A_hat @ Vl) @ P_V.transpose(0, 1)
 
@@ -384,6 +400,7 @@ def optimize_low_rank_attention_torch(
     eval_row_idx = sample_rows(Q.shape[1], cfg.row_batch_size, device)
     gamma0 = init_gamma(
         Q, K, valid_mask, P_K.detach(), cfg.r_k,
+        logit_scale_mode=cfg.logit_scale_mode,
         row_idx=eval_row_idx,
     )
     xi0 = inv_softplus(torch.tensor(gamma0 - cfg.gamma_min + 1e-8, device=device, dtype=dtype))

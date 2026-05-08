@@ -200,7 +200,12 @@ def _load_student_model(config_path: str, input_dir: Path, device: str):
     )
     if not hasattr(model, "hf_device_map"):
         model = model.to(device)
-    load_projectors(model, input_dir, strict=True)
+    load_projectors(
+        model,
+        input_dir,
+        strict=True,
+        expected_logit_scale_mode=cfg.hawp.logit_scale_mode,
+    )
     model.eval()
     return model, cfg, ranks_per_layer
 

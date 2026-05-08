@@ -13,6 +13,7 @@ from hawp_laq.offline.losses import (
 )
 from hawp_laq.offline.low_rank_attention_optimizer_torch import (
     OptimConfig,
+    low_rank_logit_scale_denominator,
     optimize_low_rank_attention_torch,
 )
 from hawp_laq.utils.io import save_pt
@@ -52,13 +53,15 @@ def _complete_to_orthonormal_basis(basis: torch.Tensor, dim: int) -> torch.Tenso
 class ProjectorModule(nn.Module):
     def __init__(self, d_model: int, rank_k: int, rank_v: int, n_heads: int,
                  init_p_k: torch.Tensor | None = None,
-                 init_p_v: torch.Tensor | None = None):
+                 init_p_v: torch.Tensor | None = None,
+                 logit_scale_mode: str = "rk"):
         super().__init__()
         self.d_model = d_model
         self.rank_k = rank_k
         self.rank_v = rank_v
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
+        self.logit_scale_mode = logit_scale_mode
 
         if not (1 <= rank_k <= self.head_dim):
             raise ValueError(
@@ -108,7 +111,10 @@ class ProjectorModule(nn.Module):
         k_lat = k_mh @ self.p_k_basis
         v_lat = v_mh @ self.p_v_basis
 
-        lr_scale = self.gamma / math.sqrt(self.rank_k)
+        scale_denom = low_rank_logit_scale_denominator(
+            self.logit_scale_mode, self.head_dim, self.rank_k,
+        )
+        lr_scale = self.gamma / scale_denom
         logits_fp = (q_mh @ k_mh.transpose(-2, -1)) * (self.head_dim ** -0.5)
         logits_hat = (q_lat @ k_lat.transpose(-2, -1)) * lr_scale
 
@@ -257,6 +263,7 @@ class ProjectorTrainer:
         min_delta: float = 1e-4,
         min_delta_mode: str = "relative",
         gamma_min: float = 1e-4,
+        logit_scale_mode: str = "rk",
         eps_loss: float = 1e-8,
         adam_eps: float = 1e-8,
         seed: int = 0,
@@ -264,7 +271,10 @@ class ProjectorTrainer:
         device_override: str | None = None,
     ) -> dict:
         if optimizer != "riemannian_adam":
-            return self._train_one_group_legacy(q, k, v, n_steps)
+            return self._train_one_group_legacy(
+                q, k, v, n_steps,
+                logit_scale_mode=logit_scale_mode,
+            )
 
         device = torch.device(device_override) if device_override else torch.device(self.device)
 
@@ -309,6 +319,7 @@ class ProjectorTrainer:
             warmup_steps=warmup_steps,
             row_batch_size=row_batch_size,
             gamma_min=gamma_min,
+            logit_scale_mode=logit_scale_mode,
             grad_clip=grad_clip,
             eval_every=eval_every,
             early_stopping=early_stopping,
@@ -355,6 +366,7 @@ class ProjectorTrainer:
             "p_k": p_k_full,
             "p_v": p_v_full,
             "gamma": torch.tensor(gamma),
+            "logit_scale_mode": logit_scale_mode,
             "r_k": rk,
             "r_v": rv,
             "metrics": metrics,
@@ -374,6 +386,8 @@ class ProjectorTrainer:
         k: torch.Tensor,
         v: torch.Tensor,
         n_steps: int = 200,
+        *,
+        logit_scale_mode: str = "rk",
     ) -> dict:
         """Old Adam + orthogonalize_every path (optimizer != "riemannian_adam")."""
         q = q.to(self.device).float()
@@ -384,6 +398,7 @@ class ProjectorTrainer:
             self.d_model, self.rank_k, self.rank_v, self.n_heads,
             init_p_k=self._svd_init_basis(k, self.n_heads, self.rank_k),
             init_p_v=self._svd_init_basis(v, self.n_heads, self.rank_v),
+            logit_scale_mode=logit_scale_mode,
         ).to(self.device)
         optimizer = torch.optim.Adam(module.parameters(), lr=self.lr)
 
@@ -434,6 +449,7 @@ class ProjectorTrainer:
             "p_k": p_k_full,
             "p_v": p_v_full,
             "gamma": module.gamma.data.cpu().detach(),
+            "logit_scale_mode": module.logit_scale_mode,
             "r_k": self.rank_k,
             "r_v": self.rank_v,
             "metrics": metrics,
@@ -453,6 +469,7 @@ class ProjectorTrainer:
             "p_k": result["p_k"],
             "p_v": result["p_v"],
             "gamma": result["gamma"],
+            "logit_scale_mode": result.get("logit_scale_mode", "rk"),
             "r_k": result["r_k"],
             "r_v": result["r_v"],
             "best_step": result.get("best_step", 0),
@@ -468,6 +485,7 @@ class ProjectorTrainer:
             f"[save] {layer_dir / 'projector.pt'}  "
             f"p_k={tuple(result['p_k'].shape)} p_v={tuple(result['p_v'].shape)} "
             f"r_k={result['r_k']} r_v={result['r_v']} gamma={gamma_val:.4f}"
+            f" scale={to_save['logit_scale_mode']}"
             f"  best_step={result.get('best_step', '?')} stopped_early={result.get('stopped_early', False)}"
         )
         return layer_dir

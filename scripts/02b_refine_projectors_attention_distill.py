@@ -106,6 +106,7 @@ def _distill_kwargs(cfg) -> dict:
         "eps_loss": d.eps_loss,
         "adam_eps": d.adam_eps,
         "train_gamma": d.train_gamma,
+        "logit_scale_mode": cfg.hawp.logit_scale_mode,
         "loss_mode": d.loss_mode,
         "early_stopping": d.early_stopping,
         "patience": d.patience,
@@ -150,8 +151,10 @@ def _save_refined_projector(
     out["gamma"] = result.gamma
     out["r_k"] = r_k
     out["r_v"] = r_v
+    out["logit_scale_mode"] = result.metrics.get("logit_scale_mode", "rk")
     out["attention_distill"] = {
         "source_projector": str(source_path),
+        "logit_scale_mode": result.metrics.get("logit_scale_mode", "rk"),
         "best_step": result.best_step,
         "actual_steps": result.actual_steps,
         "stopped_early": result.stopped_early,

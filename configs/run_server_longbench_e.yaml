@@ -58,7 +58,7 @@ eval:
     max_new_tokens: 512
 
 calib:
-  nsamples: 64
+  nsamples: 128
   seq_len: 1024
   output_dir: /data/wangzihao/work/matrix/artifacts/calib_llama31_8b_instruct
   dataset: wikitext2
@@ -135,18 +135,18 @@ layer_distill:
   seq_len: null
   batch_size: 1
   storage_dtype: float16
-  n_steps: 300
+  n_steps: 3000
   sample_batch_size: null
   eval_every: 25
   eval_max_batches: 8
   optimizer: riemannian_adam
   lr: "1e-4"
-  lr_pk: "1e-5"
-  lr_pv: "1e-5"
-  lr_xi: "1e-6"
+  lr_pk: "5e-5"
+  lr_pv: "5e-5"
+  lr_xi: "1e-5"
   beta1: 0.9
   beta2: 0.99
-  grad_clip: 1.0
+  grad_clip: 5.0
   train_gamma: true
   gamma_min: "1e-4"
   gamma_max: 2.0
@@ -156,14 +156,37 @@ layer_distill:
   alternate_pk_pv: true
   finite_guard: true
   bad_step_patience: 20
-  lr_backoff: 0.5
+  lr_backoff: 0.7
   loss_mode: normalized
   early_stopping: true
-  patience: 5
+  patience: 10
   min_delta: "1e-5"
   min_delta_mode: relative
   seed: 0
   save_format: auto
+
+
+# data_dir：读取 01b 采集的 hidden_in / hidden_out
+# input_dir：读取初始 projectors。你如果要直接接 02_train_projectors_parallel.py 的结果，这里要改成 projectors_llama31_8b_instruct
+# output_dir：保存 C refine 后的 projectors
+# n_steps: 300：每层最多训练 300 步
+# optimizer: riemannian_adam：P_K/P_V 用 RiemannianAdam
+# lr_pk: 1e-5：P_K 学习率
+# lr_pv: 1e-5：P_V 学习率
+# lr_xi: 1e-6：gamma 学习率
+# gamma_max: 2.0：gamma 最大不超过 2
+# alternate_pk_pv: true：P_K/P_V 交替更新
+# finite_guard: true：遇到 NaN/Inf 的 step 会回滚跳过
+# bad_step_patience: 20：连续坏 20 步才停该层
+# lr_backoff: 0.5：遇到坏 step 后学习率减半
+# loss_mode: normalized：用相对误差作为 loss
+# eval_every: 25：每 25 步评估一次
+# eval_max_batches: 8：每次 eval 最多看 8 个 chunk
+# early_stopping: true + patience: 5：连续 5 次 eval 没明显改善就早停
+# logit_scale_mode: dh：attention logits 按原始 sqrt(head_dim) 缩放，不按 sqrt(r_k) 缩放
+# MSE = ||Y_student - Y_teacher||_F^2 / N
+# normlized = ||Y_student - Y_teacher||_F^2 / (||Y_teacher||_F^2 + eps)
+
 
 quant:
   enabled: true
@@ -238,3 +261,9 @@ hawp:
   gamma_mode: "learned"
   gamma_value: null
   use_archive_k_ip_approx: true
+
+  # gamma_mode: "fixed"
+  # gamma_value: 1.0
+
+
+

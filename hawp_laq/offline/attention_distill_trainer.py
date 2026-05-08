@@ -12,6 +12,7 @@ from hawp_laq.offline.low_rank_attention_optimizer_torch import (
     RiemannianAdam,
     clip_by_global_norm,
     inv_softplus,
+    low_rank_logit_scale_denominator,
     qr_retraction,
     sample_rows,
     stable_softmax,
@@ -95,6 +96,7 @@ def _attention_output_stats(
     gamma: Tensor,
     *,
     row_idx: Optional[Tensor],
+    logit_scale_mode: str = "rk",
 ) -> tuple[Tensor, Tensor, int]:
     seq_len = Q.shape[1]
     d_h = Q.shape[-1]
@@ -110,7 +112,10 @@ def _attention_output_stats(
     Kl = K @ P_K
     Vl = V @ P_V
 
-    Z_hat = (gamma / math.sqrt(P_K.shape[1])) * (Ql @ Kl.transpose(-1, -2))
+    scale_denom = low_rank_logit_scale_denominator(
+        logit_scale_mode, d_h, P_K.shape[1],
+    )
+    Z_hat = (gamma / scale_denom) * (Ql @ Kl.transpose(-1, -2))
     A_hat = stable_softmax(Z_hat, additive_mask, valid_mask)
     O_hat = (A_hat @ Vl) @ P_V.transpose(0, 1)
 
@@ -139,6 +144,7 @@ def _eval_projector(
     eps_loss: float,
     eval_batch_size: int,
     eval_max_batches: Optional[int],
+    logit_scale_mode: str = "rk",
 ) -> dict:
     num_items = Q.shape[0]
     if eval_max_batches is not None and eval_max_batches > 0:
@@ -154,6 +160,7 @@ def _eval_projector(
         idx = eval_indices[start:start + eval_batch_size]
         diff_sq, teacher_sq, count = _attention_output_stats(
             Q[idx], K[idx], V[idx], P_K, P_V, gamma, row_idx=None,
+            logit_scale_mode=logit_scale_mode,
         )
         total_diff = total_diff + diff_sq
         total_teacher = total_teacher + teacher_sq
@@ -197,6 +204,7 @@ def refine_attention_output_projector(
     eps_loss: float = 1e-8,
     adam_eps: float = 1e-8,
     train_gamma: bool = True,
+    logit_scale_mode: str = "rk",
     loss_mode: str = "absolute",
     early_stopping: bool = True,
     patience: int = 5,
@@ -281,6 +289,7 @@ def refine_attention_output_projector(
         gamma = F.softplus(xi) + gamma_min
         diff_sq, teacher_sq, count = _attention_output_stats(
             Qb, Kb, Vb, P_K, P_V, gamma, row_idx=row_idx,
+            logit_scale_mode=logit_scale_mode,
         )
         loss = _loss_from_stats(diff_sq, teacher_sq, count, loss_mode, eps_loss)
 
@@ -319,6 +328,7 @@ def refine_attention_output_projector(
                     eps_loss=eps_loss,
                     eval_batch_size=eval_batch_size,
                     eval_max_batches=eval_max_batches,
+                    logit_scale_mode=logit_scale_mode,
                 )
                 eval_loss = eval_stats["loss"]
                 eval_mse = eval_stats["mse"]
@@ -336,6 +346,7 @@ def refine_attention_output_projector(
                 "orthK": orth_k,
                 "orthV": orth_v,
                 "optimizer": optimizer,
+                "logit_scale_mode": logit_scale_mode,
             })
 
             if verbose:
@@ -375,7 +386,10 @@ def refine_attention_output_projector(
         p_k=best_P_K.detach().cpu(),
         p_v=best_P_V.detach().cpu(),
         gamma=best_gamma.detach().cpu().reshape(1),
-        metrics={"attention_distill": history},
+        metrics={
+            "attention_distill": history,
+            "logit_scale_mode": logit_scale_mode,
+        },
         best_step=best_step,
         actual_steps=step,
         stopped_early=stopped_early,
