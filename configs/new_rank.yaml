@@ -145,6 +145,20 @@ attention_distill:
   seed: 0
   save_format: auto
 
+dv_output_aware:
+  enabled: true
+  input_dir: /data/wangzihao/work/matrix/artifacts/projectors_new_rank
+  output_dir: /data/wangzihao/work/matrix/artifacts/projectors_new_rank_dv
+  teacher: compressed
+  quant_aware: true
+  current_token_fp: true
+  lambda_ridge: "1e-3"
+  sample_batch_size: 16
+  row_batch_size: 256
+  eval_max_batches: 8
+  quant_chunk_rows: 65536
+  save_format: auto
+
 layer_distill:
   data_dir: /data/wangzihao/work/matrix/artifacts/layer_distill_llama31_8b_instruct
   input_dir: /data/wangzihao/work/matrix/artifacts/projectors_llama31_8b_instruct_attn_distill
@@ -282,4 +296,3 @@ hawp:
 
   # gamma_mode: "fixed"
   # gamma_value: 1.0
-

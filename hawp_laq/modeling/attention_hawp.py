@@ -216,6 +216,7 @@ class HAWPAttention(nn.Module):
         self.p_k = nn.Parameter(torch.eye(self.head_dim, dtype=self._dtype), requires_grad=(r_k < self.head_dim))
         self.p_v = nn.Parameter(torch.eye(self.head_dim, dtype=self._dtype), requires_grad=(r_v < self.head_dim))
         self.gamma = nn.Parameter(torch.ones(1, dtype=self._dtype), requires_grad=False)
+        self.register_buffer("d_v", None, persistent=True)
 
         self.logit_scale_mode = logit_scale_mode
         self.gamma_mode = gamma_mode
@@ -974,7 +975,7 @@ class HAWPAttention(nn.Module):
             attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
             attn_output_lat = torch.matmul(attn_weights, v_full_expanded)
 
-            attn_output = attn_output_lat @ pv_down.T
+            attn_output = self._decode_value_latent(attn_output_lat, pv_down)
 
             attn_output = attn_output.transpose(1, 2).contiguous()
             attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
@@ -1031,7 +1032,7 @@ class HAWPAttention(nn.Module):
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output_lat = torch.matmul(attn_weights, v_lat_expanded)
 
-        attn_output = attn_output_lat @ pv_down.T
+        attn_output = self._decode_value_latent(attn_output_lat, pv_down)
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
@@ -1058,6 +1059,12 @@ class HAWPAttention(nn.Module):
         else:
             past_kv = None
         return self._format_attn_output(attn_output, None, past_kv)
+
+    def _decode_value_latent(self, attn_output_lat: torch.Tensor, pv_down: torch.Tensor) -> torch.Tensor:
+        if self.d_v is not None:
+            d_v = self.d_v.to(device=attn_output_lat.device, dtype=attn_output_lat.dtype)
+            return attn_output_lat @ d_v
+        return attn_output_lat @ pv_down.T
 
     def _apply_pk(self, k: torch.Tensor) -> torch.Tensor:
         if self.r_k >= self.head_dim and not self.p_k.requires_grad:
@@ -1108,6 +1115,27 @@ class HAWPAttention(nn.Module):
                 f"layer {self.layer_idx}: p_v shape {tuple(p_v.shape)} incompatible "
                 f"with expected ({self.head_dim},{self.head_dim}) or ({self.head_dim},{self.r_v}), skipping"
             )
+
+        d_v = data.get("d_v")
+        if d_v is not None:
+            if d_v.shape == (self.r_v, self.head_dim):
+                self.d_v = d_v.to(self.p_v.device, self.p_v.dtype).contiguous()
+            elif strict:
+                raise ValueError(
+                    f"layer {self.layer_idx}: d_v shape {d_v.shape} incompatible "
+                    f"with expected ({self.r_v},{self.head_dim})"
+                )
+            else:
+                import warnings
+                warnings.warn(
+                    f"layer {self.layer_idx}: d_v shape {tuple(d_v.shape)} incompatible "
+                    f"with expected ({self.r_v},{self.head_dim}), falling back to p_v.T",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                self.d_v = None
+        else:
+            self.d_v = None
 
         if "gamma" in data:
             self.gamma.data.copy_(data["gamma"].to(self.gamma.device, self.gamma.dtype))

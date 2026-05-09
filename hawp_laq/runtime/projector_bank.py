@@ -26,6 +26,8 @@ def save_projectors(model: torch.nn.Module, output_dir: str | Path) -> Path:
                 "r_v": module.r_v,
                 "logit_scale_mode": module.logit_scale_mode,
             }
+            if module.d_v is not None:
+                data["d_v"] = module.d_v.data.cpu()
             torch.save(data, layer_dir / "projector.pt")
             layer_data[str(module.layer_idx)] = {
                 "r_k": module.r_k,
@@ -265,8 +267,10 @@ def inspect_projector_dir(
             p_v.shape == (expected_head_dim, expected_head_dim)
             or p_v.shape == (expected_head_dim, layer_r_v)
         )
+        d_v = data.get("d_v")
+        dv_ok = d_v is None or d_v.shape == (layer_r_v, expected_head_dim)
 
-        if pk_ok and pv_ok:
+        if pk_ok and pv_ok and dv_ok:
             result["valid_layers"].append(layer_idx)
         else:
             result["shape_mismatch_layers"].append(layer_idx)

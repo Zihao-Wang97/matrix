@@ -127,6 +127,23 @@ class AttentionDistillConfig:
 
 
 @dataclass
+class DVOutputAwareConfig:
+    enabled: bool = False
+    input_dir: Path = Path("artifacts/projectors")
+    output_dir: Path = Path("artifacts/projectors_dv")
+    teacher: str = "compressed"
+    full_teacher_weight: float = 1.0
+    quant_aware: bool = True
+    current_token_fp: bool = True
+    lambda_ridge: float = 1e-3
+    sample_batch_size: Optional[int] = 16
+    row_batch_size: int = 256
+    eval_max_batches: Optional[int] = 8
+    quant_chunk_rows: int = 65536
+    save_format: str = "auto"
+
+
+@dataclass
 class LayerDistillConfig:
     data_dir: Path = Path("artifacts/layer_distill")
     input_dir: Path = Path("artifacts/projectors_attn_distill")
@@ -298,6 +315,7 @@ class HAWPLAQConfig:
     calib: CalibConfig = field(default_factory=CalibConfig)
     projector: ProjectorConfig = field(default_factory=ProjectorConfig)
     attention_distill: AttentionDistillConfig = field(default_factory=AttentionDistillConfig)
+    dv_output_aware: DVOutputAwareConfig = field(default_factory=DVOutputAwareConfig)
     layer_distill: LayerDistillConfig = field(default_factory=LayerDistillConfig)
     quant: QuantConfig = field(default_factory=QuantConfig)
     sched: SchedConfig = field(default_factory=SchedConfig)
