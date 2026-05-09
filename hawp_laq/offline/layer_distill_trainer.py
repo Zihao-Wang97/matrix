@@ -259,6 +259,8 @@ def _gamma_trainable(module: HAWPAttention, train_gamma: bool) -> bool:
 def _prepare_trainable_projectors_fp32(
     layer: torch.nn.Module,
     *,
+    train_pk: bool = True,
+    train_pv: bool = True,
     train_gamma: bool,
     gamma_min: float,
     gamma_max: float,
@@ -272,8 +274,8 @@ def _prepare_trainable_projectors_fp32(
         module.p_v.data = module.p_v.data.float()
         module.gamma.data = module.gamma.data.float().clamp_(min=gamma_min, max=gamma_max)
 
-        module.p_k.requires_grad_(module.r_k < module.head_dim)
-        module.p_v.requires_grad_(module.r_v < module.head_dim)
+        module.p_k.requires_grad_(train_pk and module.r_k < module.head_dim)
+        module.p_v.requires_grad_(train_pv and module.r_v < module.head_dim)
         module.gamma.requires_grad_(_gamma_trainable(module, train_gamma))
     return modules
 

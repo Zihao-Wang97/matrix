@@ -257,6 +257,15 @@ class ProjectorTrainer:
         lambda_z: float = 1.0,
         lambda_o: float = 2.0,
         lambda_v: float = 0.05,
+        lambda_topk: float = 0.0,
+        lambda_kl: float = 0.0,
+        lambda_logit_topm: float = 0.0,
+        topk_k: int = 8,
+        hard_neg_m: int = 32,
+        kl_top_m: int = 64,
+        topk_margin: float = 0.05,
+        topk_loss_start_after_warmup: bool = True,
+        topk_metric_ks: list[int] | tuple[int, ...] = (5, 10),
         eval_every: int = 50,
         early_stopping: bool = True,
         patience: int = 5,
@@ -311,6 +320,15 @@ class ProjectorTrainer:
         cfg = OptimConfig(
             r_k=rk, r_v=rv,
             lambda_z=lambda_z, lambda_o=lambda_o, lambda_v=lambda_v,
+            lambda_topk=lambda_topk,
+            lambda_kl=lambda_kl,
+            lambda_logit_topm=lambda_logit_topm,
+            topk_k=topk_k,
+            hard_neg_m=hard_neg_m,
+            kl_top_m=kl_top_m,
+            topk_margin=topk_margin,
+            topk_loss_start_after_warmup=topk_loss_start_after_warmup,
+            topk_metric_ks=tuple(topk_metric_ks),
             eps_loss=eps_loss,
             adam_eps=adam_eps,
             beta1=beta1, beta2=beta2,
@@ -349,18 +367,37 @@ class ProjectorTrainer:
         calib_logits = [float(e["logits"]) for e in calib_entries]
         calib_attn = [float(e["attn"]) for e in calib_entries]
         calib_value = [float(e["value"]) for e in calib_entries]
+        calib_topk = [float(e.get("topk", 0.0)) for e in calib_entries]
+        calib_kl_topm = [float(e.get("kl_topm", 0.0)) for e in calib_entries]
+        calib_logit_topm = [float(e.get("logit_topm", 0.0)) for e in calib_entries]
+        recall_keys = sorted({
+            key
+            for e in calib_entries
+            for key in e
+            if key.startswith("top") and key.endswith("_recall")
+        })
 
         metrics: dict[str, list] = {
             "calib_total": calib_total,
             "calib_logits": calib_logits,
             "calib_attn": calib_attn,
             "calib_value": calib_value,
+            "calib_topk": calib_topk,
+            "calib_kl_topm": calib_kl_topm,
+            "calib_logit_topm": calib_logit_topm,
             # backward-compat aliases for old rank_search code
             "total": calib_total,
             "logits": calib_logits,
             "attn": calib_attn,
             "value": calib_value,
+            "topk": calib_topk,
+            "kl_topm": calib_kl_topm,
+            "logit_topm": calib_logit_topm,
         }
+        for key in recall_keys:
+            values = [float(e[key]) for e in calib_entries if key in e]
+            metrics[key] = values
+            metrics[f"calib_{key}"] = values
 
         return {
             "p_k": p_k_full,
@@ -376,6 +413,10 @@ class ProjectorTrainer:
             "best_calib_logits": result["best_calib_logits"],
             "best_calib_attn": result["best_calib_attn"],
             "best_calib_value": result["best_calib_value"],
+            "best_calib_topk": result.get("best_calib_topk", 0.0),
+            "best_calib_kl_topm": result.get("best_calib_kl_topm", 0.0),
+            "best_calib_logit_topm": result.get("best_calib_logit_topm", 0.0),
+            "best_calib_top_recalls": result.get("best_calib_top_recalls", {}),
             "actual_steps": result["actual_steps"],
             "stopped_early": result["stopped_early"],
         }
@@ -474,6 +515,10 @@ class ProjectorTrainer:
             "r_v": result["r_v"],
             "best_step": result.get("best_step", 0),
             "best_calib_total": result.get("best_calib_total", 0.0),
+            "best_calib_topk": result.get("best_calib_topk", 0.0),
+            "best_calib_kl_topm": result.get("best_calib_kl_topm", 0.0),
+            "best_calib_logit_topm": result.get("best_calib_logit_topm", 0.0),
+            "best_calib_top_recalls": result.get("best_calib_top_recalls", {}),
             "actual_steps": result.get("actual_steps", 0),
             "stopped_early": result.get("stopped_early", False),
             "metrics": result.get("metrics", {}),

@@ -1,0 +1,285 @@
+mode: server
+
+data:
+  root: /data/wangzihao/work/matrix/data
+  cache: /data/wangzihao/work/matrix/cache
+
+model:
+  model_id: /data/wangzihao/work/matrix/Llama-3.1-8B-Instruct
+  torch_dtype: float16
+  load_in_4bit: false
+
+generation:
+  max_new_tokens: 128
+  do_sample: false
+  temperature: 1.0
+  top_p: 1.0
+  prompts:
+    - "Once upon a time"
+    - "The capital of France is"
+    - "In a future where artificial intelligence assists scientists"
+
+eval:
+  modes: [baseline, quant_only, hawp_quant]
+  output_dir: /data/wangzihao/work/matrix/artifacts/eval_llama31_8b_instruct_longbench_e
+  ppl:
+    seq_len: 1024
+    nsamples: 32
+  needle:
+    context_lens: [512, 1024, 2048, 4096]
+    depths: [0, 25, 50, 75, 100]
+    max_new_tokens: 32
+  speed:
+    seq_lens: [512, 1024, 2048, 4096]
+    max_new_tokens: 64
+  distribution:
+    enabled: false
+    seq_len: 2048
+    nsamples: 16
+    top_k: [1, 5, 10]
+    seed: 0
+  longbench:
+    enabled: true
+    data_dir: /data/wangzihao/work/matrix/data/longbench
+    tasks:
+      - qasper
+      - multifieldqa_en
+      - hotpotqa
+      - 2wikimqa
+      - gov_report
+      - multi_news
+      - trec
+      - triviaqa
+      - samsum
+      - passage_count
+      - passage_retrieval_en
+      - lcc
+      - repobench-p
+    max_new_tokens: 512
+
+calib:
+  nsamples: 64
+  seq_len: 2048
+  output_dir: /data/wangzihao/work/matrix/artifacts/calib_new_rank
+  dataset: wikitext2
+  capture_mode: auto
+
+projector:
+  rank: null
+  r_k: 96
+  r_v: 64
+  lr: 0.0005
+  orthogonalize_every: 5
+  target_layer: 0
+  w_logits: 2.0
+  w_attn: 1.0
+  w_value: 0.5
+  output_dir: /data/wangzihao/work/matrix/artifacts/projectors_new_rank
+  optimizer: riemannian_adam
+  n_steps: 2000
+  warmup_steps: 50
+  row_batch_size: 64
+  lr_pk: "1e-3"
+  lr_pv: "1e-3"
+  lr_xi: "3e-3"
+  beta1: 0.9
+  beta2: 0.99
+  grad_clip: 1.0
+  lambda_z: 2.0
+  lambda_o: 3.0
+  lambda_v: 0.05
+  lambda_topk: 0.05
+  lambda_kl: 0.05
+  lambda_logit_topm: 0.02
+  topk_k: 8
+  hard_neg_m: 32
+  kl_top_m: 64
+  topk_margin: 0.05
+  topk_loss_start_after_warmup: true
+  topk_metric_ks: [5, 10]
+  eval_every: 50
+  early_stopping: true
+  patience: 5
+  min_delta: "1e-5"
+  min_delta_mode: relative
+  gamma_min: "1e-4"
+  eps_loss: "1e-8"
+  adam_eps: "1e-8"
+
+attention_distill:
+  input_dir: /data/wangzihao/work/matrix/artifacts/projectors_new_rank
+  output_dir: /data/wangzihao/work/matrix/artifacts/projectors_new_rank_attn_distill
+  n_steps: 1200
+  sample_batch_size: 64
+  row_batch_size: 128
+  eval_every: 25
+  eval_batch_size: 16
+  eval_max_batches: 8
+  lr_pk: "5e-4"
+  lr_pv: "5e-4"
+  lr_xi: "5e-4"
+  optimizer: riemannian_adam
+  lr: "1e-3"
+  orthogonalize_every: 1
+  beta1: 0.9
+  beta2: 0.99
+  grad_clip: 1.0
+  gamma_min: "1e-4"
+  eps_loss: "1e-8"
+  adam_eps: "1e-8"
+  train_gamma: true
+  loss_mode: normalized
+  train_pk: false
+  lambda_topk: 0.03
+  lambda_kl: 0.03
+  lambda_logit_topm: 0.01
+  topk_k: 8
+  hard_neg_m: 32
+  kl_top_m: 64
+  topk_margin: 0.05
+  topk_metric_ks: [5, 10]
+  early_stopping: true
+  patience: 5
+  min_delta: 1e-5
+  min_delta_mode: relative
+  seed: 0
+  save_format: auto
+
+layer_distill:
+  data_dir: /data/wangzihao/work/matrix/artifacts/layer_distill_llama31_8b_instruct
+  input_dir: /data/wangzihao/work/matrix/artifacts/projectors_llama31_8b_instruct_attn_distill
+  output_dir: /data/wangzihao/work/matrix/artifacts/projectors_llama31_8b_instruct_layer_distill
+  nsamples: null
+  seq_len: null
+  batch_size: 1
+  storage_dtype: float16
+  n_steps: 3000
+  sample_batch_size: null
+  eval_every: 25
+  eval_max_batches: 8
+  optimizer: riemannian_adam
+  lr: "1e-4"
+  lr_pk: "5e-5"
+  lr_pv: "5e-5"
+  lr_xi: "1e-5"
+  beta1: 0.9
+  beta2: 0.99
+  grad_clip: 5.0
+  train_gamma: true
+  gamma_min: "1e-4"
+  gamma_max: 2.0
+  eps_loss: "1e-8"
+  adam_eps: "1e-8"
+  orthogonalize_every: 1
+  alternate_pk_pv: true
+  finite_guard: true
+  bad_step_patience: 20
+  lr_backoff: 0.7
+  loss_mode: normalized
+  early_stopping: true
+  patience: 10
+  min_delta: "1e-5"
+  min_delta_mode: relative
+  seed: 0
+  save_format: auto
+
+
+# data_dir：读取 01b 采集的 hidden_in / hidden_out
+# input_dir：读取初始 projectors。你如果要直接接 02_train_projectors_parallel.py 的结果，这里要改成 projectors_llama31_8b_instruct
+# output_dir：保存 C refine 后的 projectors
+# n_steps: 300：每层最多训练 300 步
+# optimizer: riemannian_adam：P_K/P_V 用 RiemannianAdam
+# lr_pk: 1e-5：P_K 学习率
+# lr_pv: 1e-5：P_V 学习率
+# lr_xi: 1e-6：gamma 学习率
+# gamma_max: 2.0：gamma 最大不超过 2
+# alternate_pk_pv: true：P_K/P_V 交替更新
+# finite_guard: true：遇到 NaN/Inf 的 step 会回滚跳过
+# bad_step_patience: 20：连续坏 20 步才停该层
+# lr_backoff: 0.5：遇到坏 step 后学习率减半
+# loss_mode: normalized：用相对误差作为 loss
+# eval_every: 25：每 25 步评估一次
+# eval_max_batches: 8：每次 eval 最多看 8 个 chunk
+# early_stopping: true + patience: 5：连续 5 次 eval 没明显改善就早停
+# logit_scale_mode: dh：attention logits 按原始 sqrt(head_dim) 缩放，不按 sqrt(r_k) 缩放
+# MSE = ||Y_student - Y_teacher||_F^2 / N
+# normlized = ||Y_student - Y_teacher||_F^2 / (||Y_teacher||_F^2 + eps)
+
+
+quant:
+  enabled: true
+  k_method: turbo_prod
+  v_method: turbo_mse
+  k_bits: 4
+  v_bits: 8
+  use_rotation_for_k: true
+  use_rotation_for_v: false
+  k_group_size: 128
+  v_group_size: 128
+  outlier_threshold: null
+
+sched:
+  total_budget: 4096
+  recent_window: 0
+  high_ratio: 0.25
+  low_ratio: 0.60
+  drop_strategy: position
+
+rank_search:
+  output_dir: /data/wangzihao/work/matrix/artifacts/ranks_new_rank
+  n_steps: 300
+  relative_tolerance: 0.10
+  logits_abs_tolerance: "1.0e-5"
+  attn_abs_tolerance: "20"
+  value_abs_tolerance: "50"
+  selection_mode: signal_normalized
+  logits_signal_tolerance: 0.01
+  attn_signal_tolerance: 20
+  value_signal_tolerance: 50
+  r_k_candidates: null
+  r_v_candidates: null
+  rank_pair_candidates:
+    - [128, 128]
+    - [128, 64]
+  layer_tolerance_scale:
+    - layers: [0, 1, 2, 3, 4, 5, 6, 7]
+      scale: 0.75
+    - layers: [8, 9, 10, 11, 12, 13, 14, 15]
+      scale: 1.0
+    - layers: [16, 17, 18, 19, 20, 21, 22, 23]
+      scale: 1.0
+    - layers: [24, 25, 26, 27, 28, 29, 30, 31]
+      scale: 1.25
+  layer_rank_floor:
+    - layers: [0, 1, 2, 3, 4, 5, 6, 7]
+      min_r_k: 64
+      min_r_v: 48
+    - layers: [8, 9, 10, 11, 12, 13, 14, 15]
+      min_r_k: 64
+      min_r_v: 48
+    - layers: [16, 17, 18, 19, 20, 21, 22, 23]
+      min_r_k: 48
+      min_r_v: 32
+    - layers: [24, 25, 26, 27, 28, 29, 30, 31]
+      min_r_k: 32
+      min_r_v: 32
+
+train:
+  batch_size: 4
+  epochs: 100
+  lr: "1.0e-4"
+  device: cuda
+
+log:
+  level: INFO
+  dir: /data/wangzihao/work/matrix/logs
+
+hawp:
+  logit_scale_mode: "dh"
+  gamma_mode: "learned"
+  gamma_value: null
+  use_archive_k_ip_approx: true
+
+  # gamma_mode: "fixed"
+  # gamma_value: 1.0
+

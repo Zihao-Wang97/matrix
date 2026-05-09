@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import math
 import multiprocessing as mp
 import shutil
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -52,7 +53,13 @@ from hawp_laq.offline.layer_distill_trainer import (
     _snapshot_riemannian_optimizer,
     _snapshot_torch_optimizer,
 )
-from hawp_laq.offline.low_rank_attention_optimizer_torch import RiemannianAdam, clip_by_global_norm
+from hawp_laq.offline.low_rank_attention_optimizer_torch import (
+    OptimConfig,
+    RiemannianAdam,
+    clip_by_global_norm,
+    topk_preservation_losses,
+    topk_recall_metrics,
+)
 from hawp_laq.runtime.generate import load_baseline_model
 from hawp_laq.runtime.projector_bank import normalize_projector_data, rebuild_ranks_json
 from hawp_laq.utils.io import load_pt, save_pt
@@ -67,6 +74,10 @@ class AttentionModuleDistillResult:
     best_eval_loss: float
     best_eval_mse: float
     best_eval_normalized: float
+    best_eval_topk: float = 0.0
+    best_eval_kl_topm: float = 0.0
+    best_eval_logit_topm: float = 0.0
+    best_eval_top_recalls: dict[str, float] | None = None
 
 
 def _chunk_layers(layers: list[int], workers: int) -> list[list[int]]:
@@ -157,6 +168,126 @@ class _ForwardCapture:
         return value
 
 
+class _RankSignalCapture:
+    def __init__(self, modules: list[HAWPAttention]) -> None:
+        self.modules = {m.layer_idx: m for m in modules}
+        self.records: list[tuple[HAWPAttention, torch.Tensor, torch.Tensor]] = []
+        self._old_callbacks: list[tuple[HAWPAttention, Any]] = []
+
+    def __enter__(self):
+        self.records.clear()
+        self._old_callbacks = [(m, getattr(m, "_calib_callback", None)) for m in self.modules.values()]
+        for module in self.modules.values():
+            module._calib_callback = self._hook
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb) -> None:
+        for module, old_callback in self._old_callbacks:
+            module._calib_callback = old_callback
+
+    def _hook(self, layer_idx: int, query: torch.Tensor, key: torch.Tensor, _value: torch.Tensor) -> None:
+        module = self.modules.get(layer_idx)
+        if module is not None:
+            self.records.append((module, query, key))
+
+
+def _causal_valid_mask(seq_len: int, device: torch.device) -> torch.Tensor:
+    return torch.tril(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool)).unsqueeze(0)
+
+
+def _module_rank_stats(
+    records: list[tuple[HAWPAttention, torch.Tensor, torch.Tensor]],
+    *,
+    eps_loss: float,
+    lambda_topk: float,
+    lambda_kl: float,
+    lambda_logit_topm: float,
+    topk_k: int,
+    hard_neg_m: int,
+    kl_top_m: int,
+    topk_margin: float,
+) -> dict[str, torch.Tensor]:
+    if not records:
+        zero = torch.zeros((), dtype=torch.float32)
+        return {"topk": zero, "kl_topm": zero, "logit_topm": zero}
+
+    losses: dict[str, torch.Tensor] | None = None
+    for module, query, key in records:
+        key_full = module._repeat_kv(key) if key.shape[1] != query.shape[1] else key
+        bsz, n_heads, seq_len, head_dim = query.shape
+        q = query.float()
+        k = key_full.float()
+
+        Z = q @ k.transpose(-1, -2)
+        if not module.is_opt:
+            Z = Z / math.sqrt(head_dim)
+
+        pk = module.p_k[:, :module.r_k].to(device=q.device, dtype=q.dtype)
+        q_lat = q @ pk
+        k_lat = k @ pk
+        Z_hat = (q_lat @ k_lat.transpose(-1, -2)) * module._compute_low_rank_logit_scale(q_lat)
+
+        valid_mask = _causal_valid_mask(seq_len, q.device)
+        cfg = OptimConfig(
+            r_k=module.r_k,
+            r_v=module.r_v,
+            lambda_topk=lambda_topk,
+            lambda_kl=lambda_kl,
+            lambda_logit_topm=lambda_logit_topm,
+            topk_k=topk_k,
+            hard_neg_m=hard_neg_m,
+            kl_top_m=kl_top_m,
+            topk_margin=topk_margin,
+            eps_loss=eps_loss,
+        )
+        module_losses = topk_preservation_losses(
+            Z.reshape(bsz * n_heads, seq_len, seq_len),
+            Z_hat.reshape(bsz * n_heads, seq_len, seq_len),
+            valid_mask,
+            cfg,
+        )
+        if losses is None:
+            losses = {k: v for k, v in module_losses.items()}
+        else:
+            for key_name, value in module_losses.items():
+                losses[key_name] = losses[key_name] + value
+
+    assert losses is not None
+    denom = float(len(records))
+    return {key: value / denom for key, value in losses.items()}
+
+
+@torch.no_grad()
+def _module_rank_recalls(
+    records: list[tuple[HAWPAttention, torch.Tensor, torch.Tensor]],
+    metric_ks: tuple[int, ...],
+) -> dict[str, float]:
+    if not records:
+        return {f"top{int(k)}_recall": 0.0 for k in metric_ks}
+    sums: dict[str, float] = {}
+    for module, query, key in records:
+        key_full = module._repeat_kv(key) if key.shape[1] != query.shape[1] else key
+        bsz, n_heads, seq_len, head_dim = query.shape
+        q = query.float()
+        k = key_full.float()
+        Z = q @ k.transpose(-1, -2)
+        if not module.is_opt:
+            Z = Z / math.sqrt(head_dim)
+        pk = module.p_k[:, :module.r_k].to(device=q.device, dtype=q.dtype)
+        q_lat = q @ pk
+        k_lat = k @ pk
+        Z_hat = (q_lat @ k_lat.transpose(-1, -2)) * module._compute_low_rank_logit_scale(q_lat)
+        recalls = topk_recall_metrics(
+            Z.reshape(bsz * n_heads, seq_len, seq_len),
+            Z_hat.reshape(bsz * n_heads, seq_len, seq_len),
+            _causal_valid_mask(seq_len, q.device),
+            metric_ks,
+        )
+        for key_name, value in recalls.items():
+            sums[key_name] = sums.get(key_name, 0.0) + value
+    return {key: value / len(records) for key, value in sums.items()}
+
+
 def _make_student_layer(
     model: torch.nn.Module,
     teacher_layer: torch.nn.Module,
@@ -208,6 +339,7 @@ def _distill_cfg(cfg) -> dict[str, Any]:
         "beta1": float(attn.beta1),
         "beta2": float(attn.beta2),
         "grad_clip": float(attn.grad_clip),
+        "train_pk": bool(getattr(attn, "train_pk", True)),
         "train_gamma": bool(attn.train_gamma),
         "gamma_min": float(attn.gamma_min),
         "gamma_max": float(getattr(layer, "gamma_max", 2.0)),
@@ -219,6 +351,14 @@ def _distill_cfg(cfg) -> dict[str, Any]:
         "bad_step_patience": int(getattr(layer, "bad_step_patience", 20)),
         "lr_backoff": float(getattr(layer, "lr_backoff", 0.5)),
         "loss_mode": str(attn.loss_mode),
+        "lambda_topk": float(getattr(attn, "lambda_topk", 0.0)),
+        "lambda_kl": float(getattr(attn, "lambda_kl", 0.0)),
+        "lambda_logit_topm": float(getattr(attn, "lambda_logit_topm", 0.0)),
+        "topk_k": int(getattr(attn, "topk_k", 8)),
+        "hard_neg_m": int(getattr(attn, "hard_neg_m", 32)),
+        "kl_top_m": int(getattr(attn, "kl_top_m", 64)),
+        "topk_margin": float(getattr(attn, "topk_margin", 0.05)),
+        "topk_metric_ks": tuple(getattr(attn, "topk_metric_ks", (5, 10))),
         "early_stopping": bool(attn.early_stopping),
         "patience": int(attn.patience),
         "min_delta": float(attn.min_delta),
@@ -263,24 +403,76 @@ def _eval_attention_module(
     eval_max_batches: Optional[int],
     loss_mode: str,
     eps_loss: float,
+    lambda_topk: float = 0.0,
+    lambda_kl: float = 0.0,
+    lambda_logit_topm: float = 0.0,
+    topk_k: int = 8,
+    hard_neg_m: int = 32,
+    kl_top_m: int = 64,
+    topk_margin: float = 0.05,
+    topk_metric_ks: tuple[int, ...] = (5, 10),
 ) -> dict[str, float]:
     paths = chunk_paths[:eval_max_batches] if eval_max_batches is not None and eval_max_batches > 0 else chunk_paths
     total_diff = torch.zeros((), device=device, dtype=torch.float32)
     total_teacher = torch.zeros((), device=device, dtype=torch.float32)
+    total_topk = torch.zeros((), device=device, dtype=torch.float32)
+    total_kl_topm = torch.zeros((), device=device, dtype=torch.float32)
+    total_logit_topm = torch.zeros((), device=device, dtype=torch.float32)
     total_count = 0
+    total_rank_batches = 0
+    recall_sums: dict[str, float] = {}
+    modules = _hawp_modules(student_layer)
     for path in paths:
         hidden_in = _load_hidden_in(path, device, dtype, sample_batch_size)
-        student, teacher = _attention_outputs(teacher_layer, student_layer, hidden_in)
+        with _RankSignalCapture(modules) as rank_cap:
+            student, teacher = _attention_outputs(teacher_layer, student_layer, hidden_in)
         total_diff = total_diff + (student.float() - teacher.float()).pow(2).sum()
         total_teacher = total_teacher + teacher.float().pow(2).sum()
         total_count += teacher.numel()
+        if lambda_topk != 0.0 or lambda_kl != 0.0 or lambda_logit_topm != 0.0:
+            rank_stats = _module_rank_stats(
+                rank_cap.records,
+                eps_loss=eps_loss,
+                lambda_topk=lambda_topk,
+                lambda_kl=lambda_kl,
+                lambda_logit_topm=lambda_logit_topm,
+                topk_k=topk_k,
+                hard_neg_m=hard_neg_m,
+                kl_top_m=kl_top_m,
+                topk_margin=topk_margin,
+            )
+            total_topk = total_topk + rank_stats["topk"].to(total_topk.device)
+            total_kl_topm = total_kl_topm + rank_stats["kl_topm"].to(total_kl_topm.device)
+            total_logit_topm = total_logit_topm + rank_stats["logit_topm"].to(total_logit_topm.device)
+            total_rank_batches += 1
+        for key, value in _module_rank_recalls(rank_cap.records, topk_metric_ks).items():
+            recall_sums[key] = recall_sums.get(key, 0.0) + value
     mse = total_diff / max(total_count, 1)
     normalized = total_diff / (total_teacher + eps_loss)
     loss = mse if loss_mode == "absolute" else normalized
+    if total_rank_batches > 0:
+        L_topk = total_topk / total_rank_batches
+        L_kl_topm = total_kl_topm / total_rank_batches
+        L_logit_topm = total_logit_topm / total_rank_batches
+        loss = (
+            loss
+            + lambda_topk * L_topk
+            + lambda_kl * L_kl_topm
+            + lambda_logit_topm * L_logit_topm
+        )
+    else:
+        L_topk = total_topk
+        L_kl_topm = total_kl_topm
+        L_logit_topm = total_logit_topm
+    recall_den = max(len(paths), 1)
     return {
         "loss": float(loss.detach().cpu()),
         "mse": float(mse.detach().cpu()),
         "normalized": float(normalized.detach().cpu()),
+        "topk": float(L_topk.detach().cpu()),
+        "kl_topm": float(L_kl_topm.detach().cpu()),
+        "logit_topm": float(L_logit_topm.detach().cpu()),
+        **{key: value / recall_den for key, value in recall_sums.items()},
     }
 
 
@@ -302,6 +494,7 @@ def _refine_attention_module(
     beta1: float,
     beta2: float,
     grad_clip: float,
+    train_pk: bool,
     train_gamma: bool,
     gamma_min: float,
     gamma_max: float,
@@ -313,6 +506,14 @@ def _refine_attention_module(
     bad_step_patience: int,
     lr_backoff: float,
     loss_mode: str,
+    lambda_topk: float,
+    lambda_kl: float,
+    lambda_logit_topm: float,
+    topk_k: int,
+    hard_neg_m: int,
+    kl_top_m: int,
+    topk_margin: float,
+    topk_metric_ks: tuple[int, ...],
     early_stopping: bool,
     patience: int,
     min_delta: float,
@@ -338,6 +539,7 @@ def _refine_attention_module(
     dtype = _param_dtype(student_layer)
     modules = _prepare_trainable_projectors_fp32(
         student_layer,
+        train_pk=train_pk,
         train_gamma=train_gamma,
         gamma_min=gamma_min,
         gamma_max=gamma_max,
@@ -358,7 +560,7 @@ def _refine_attention_module(
     )
     pk_opts = {
         m.layer_idx: RiemannianAdam((m.head_dim, m.r_k), dev, torch.float32, lr_pk, beta1, beta2, adam_eps)
-        for m in modules if m.r_k < m.head_dim
+        for m in modules if train_pk and m.r_k < m.head_dim
     }
     pv_opts = {
         m.layer_idx: RiemannianAdam((m.head_dim, m.r_v), dev, torch.float32, lr_pv, beta1, beta2, adam_eps)
@@ -374,6 +576,10 @@ def _refine_attention_module(
     best_eval_loss = float("inf")
     best_eval_mse = 0.0
     best_eval_normalized = 0.0
+    best_eval_topk = 0.0
+    best_eval_kl_topm = 0.0
+    best_eval_logit_topm = 0.0
+    best_eval_top_recalls: dict[str, float] = {}
     best_state = _snapshot_hawp_state(student_layer)
     best_step = 0
     stale_checks = 0
@@ -392,7 +598,8 @@ def _refine_attention_module(
         gamma_state = _snapshot_torch_optimizer(gamma_optimizer)
         adam_state = _snapshot_torch_optimizer(adam_optimizer)
 
-        student, teacher = _attention_outputs(teacher_layer, student_layer, hidden_in)
+        with _RankSignalCapture(modules) as rank_cap:
+            student, teacher = _attention_outputs(teacher_layer, student_layer, hidden_in)
         if finite_guard and not _all_finite_tensors([student, teacher]):
             _restore_hawp_state(student_layer, state_before)
             bad_steps += 1
@@ -409,6 +616,25 @@ def _refine_attention_module(
             continue
 
         loss, _mse, _normalized = _loss_stats(student.float(), teacher.float(), loss_mode, eps_loss)
+        if lambda_topk != 0.0 or lambda_kl != 0.0 or lambda_logit_topm != 0.0:
+            rank_stats = _module_rank_stats(
+                rank_cap.records,
+                eps_loss=eps_loss,
+                lambda_topk=lambda_topk,
+                lambda_kl=lambda_kl,
+                lambda_logit_topm=lambda_logit_topm,
+                topk_k=topk_k,
+                hard_neg_m=hard_neg_m,
+                kl_top_m=kl_top_m,
+                topk_margin=topk_margin,
+            )
+            if rank_cap.records:
+                loss = (
+                    loss
+                    + lambda_topk * rank_stats["topk"].to(loss.device)
+                    + lambda_kl * rank_stats["kl_topm"].to(loss.device)
+                    + lambda_logit_topm * rank_stats["logit_topm"].to(loss.device)
+                )
         if not loss.requires_grad:
             raise RuntimeError("Attention module distill loss has no gradient path")
         if finite_guard and not _is_finite_tensor(loss):
@@ -444,6 +670,9 @@ def _refine_attention_module(
             adam_optimizer.step()
         else:
             update_pk, update_pv = _active_update_blocks(modules, step, alternate_pk_pv)
+            update_pk = update_pk and train_pk
+            if not train_pk and not update_pv:
+                update_pv = True
             grad_params: list[torch.nn.Parameter] = []
             grad_specs: list[tuple[str, HAWPAttention]] = []
             for module in modules:
@@ -453,7 +682,7 @@ def _refine_attention_module(
                 if update_pv and module.r_v < module.head_dim:
                     grad_params.append(module.p_v)
                     grad_specs.append(("pv", module))
-            if gamma_params and update_pk:
+            if gamma_params and (update_pk or not train_pk):
                 for module in modules:
                     if _gamma_trainable(module, train_gamma):
                         grad_params.append(module.gamma)
@@ -551,6 +780,14 @@ def _refine_attention_module(
                 eval_max_batches=eval_max_batches,
                 loss_mode=loss_mode,
                 eps_loss=eps_loss,
+                lambda_topk=lambda_topk,
+                lambda_kl=lambda_kl,
+                lambda_logit_topm=lambda_logit_topm,
+                topk_k=topk_k,
+                hard_neg_m=hard_neg_m,
+                kl_top_m=kl_top_m,
+                topk_margin=topk_margin,
+                topk_metric_ks=topk_metric_ks,
             )
             gamma_val = float(modules[0].gamma.detach().float().cpu())
             orth_k = max((_orth_err(m.p_k, m.r_k) for m in modules), default=0.0)
@@ -558,11 +795,19 @@ def _refine_attention_module(
             eval_loss = eval_stats["loss"]
             eval_mse = eval_stats["mse"]
             eval_norm = eval_stats["normalized"]
+            eval_topk = eval_stats["topk"]
+            eval_kl_topm = eval_stats["kl_topm"]
+            eval_logit_topm = eval_stats["logit_topm"]
             history.append({
                 "step": step,
                 "eval_loss": eval_loss,
                 "eval_mse": eval_mse,
                 "eval_normalized": eval_norm,
+                "eval_topk": eval_topk,
+                "eval_kl_topm": eval_kl_topm,
+                "eval_logit_topm": eval_logit_topm,
+                "train_pk": train_pk,
+                **{k: v for k, v in eval_stats.items() if k.startswith("top") and k.endswith("_recall")},
                 "gamma": gamma_val,
                 "orthK": orth_k,
                 "orthV": orth_v,
@@ -572,6 +817,7 @@ def _refine_attention_module(
             print(
                 f"step={step:04d} attn_module_loss={eval_loss:.6e} "
                 f"mse={eval_mse:.6e} normalized={eval_norm:.6e} "
+                f"topk={eval_topk:.6e} kl_topm={eval_kl_topm:.6e} "
                 f"gamma={gamma_val:.5f} orthK={orth_k:.2e} orthV={orth_v:.2e}",
                 flush=True,
             )
@@ -581,6 +827,14 @@ def _refine_attention_module(
                 best_eval_loss = eval_loss
                 best_eval_mse = eval_mse
                 best_eval_normalized = eval_norm
+                best_eval_topk = eval_topk
+                best_eval_kl_topm = eval_kl_topm
+                best_eval_logit_topm = eval_logit_topm
+                best_eval_top_recalls = {
+                    k: float(v)
+                    for k, v in eval_stats.items()
+                    if k.startswith("top") and k.endswith("_recall")
+                }
                 best_state = _snapshot_hawp_state(student_layer)
                 best_step = step
                 if prev_best == float("inf"):
@@ -601,13 +855,24 @@ def _refine_attention_module(
     _restore_hawp_state(student_layer, best_state)
     student_layer.eval()
     return AttentionModuleDistillResult(
-        metrics={"attention_module_distill": history},
+        metrics={
+            "attention_module_distill": history,
+            "train_pk": train_pk,
+            "best_eval_topk": best_eval_topk,
+            "best_eval_kl_topm": best_eval_kl_topm,
+            "best_eval_logit_topm": best_eval_logit_topm,
+            "best_eval_top_recalls": best_eval_top_recalls,
+        },
         best_step=best_step,
         actual_steps=step,
         stopped_early=stopped_early,
         best_eval_loss=best_eval_loss,
         best_eval_mse=best_eval_mse,
         best_eval_normalized=best_eval_normalized,
+        best_eval_topk=best_eval_topk,
+        best_eval_kl_topm=best_eval_kl_topm,
+        best_eval_logit_topm=best_eval_logit_topm,
+        best_eval_top_recalls=best_eval_top_recalls,
     )
 
 
@@ -654,6 +919,10 @@ def _save_projector(
         "best_eval_loss": result.best_eval_loss,
         "best_eval_mse": result.best_eval_mse,
         "best_eval_normalized": result.best_eval_normalized,
+        "best_eval_topk": result.best_eval_topk,
+        "best_eval_kl_topm": result.best_eval_kl_topm,
+        "best_eval_logit_topm": result.best_eval_logit_topm,
+        "best_eval_top_recalls": result.best_eval_top_recalls or {},
         "metrics": result.metrics,
     }
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -706,7 +975,8 @@ def _refine_one_layer(
     params = _distill_cfg(cfg)
     print(
         f"\n[attn_module_distill] layer {layer_idx}: chunks={len(chunk_paths)} "
-        f"r_k={module.r_k} r_v={module.r_v} head_dim={module.head_dim} device={device}",
+        f"r_k={module.r_k} r_v={module.r_v} head_dim={module.head_dim} "
+        f"train_pk={params['train_pk']} device={device}",
         flush=True,
     )
     result = _refine_attention_module(
@@ -726,6 +996,7 @@ def _refine_one_layer(
         beta1=params["beta1"],
         beta2=params["beta2"],
         grad_clip=params["grad_clip"],
+        train_pk=params["train_pk"],
         train_gamma=params["train_gamma"],
         gamma_min=params["gamma_min"],
         gamma_max=params["gamma_max"],
@@ -737,6 +1008,14 @@ def _refine_one_layer(
         bad_step_patience=params["bad_step_patience"],
         lr_backoff=params["lr_backoff"],
         loss_mode=params["loss_mode"],
+        lambda_topk=params["lambda_topk"],
+        lambda_kl=params["lambda_kl"],
+        lambda_logit_topm=params["lambda_logit_topm"],
+        topk_k=params["topk_k"],
+        hard_neg_m=params["hard_neg_m"],
+        kl_top_m=params["kl_top_m"],
+        topk_margin=params["topk_margin"],
+        topk_metric_ks=params["topk_metric_ks"],
         early_stopping=params["early_stopping"],
         patience=params["patience"],
         min_delta=params["min_delta"],

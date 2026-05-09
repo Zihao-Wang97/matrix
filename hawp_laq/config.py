@@ -66,6 +66,15 @@ class ProjectorConfig:
     lambda_z: float = 1.0
     lambda_o: float = 2.0
     lambda_v: float = 0.05
+    lambda_topk: float = 0.0
+    lambda_kl: float = 0.0
+    lambda_logit_topm: float = 0.0
+    topk_k: int = 8
+    hard_neg_m: int = 32
+    kl_top_m: int = 64
+    topk_margin: float = 0.05
+    topk_loss_start_after_warmup: bool = True
+    topk_metric_ks: list[int] = field(default_factory=lambda: [5, 10])
     eval_every: int = 50
     early_stopping: bool = True
     patience: int = 5
@@ -98,8 +107,17 @@ class AttentionDistillConfig:
     gamma_min: float = 1e-4
     eps_loss: float = 1e-8
     adam_eps: float = 1e-8
+    train_pk: bool = True
     train_gamma: bool = True
     loss_mode: str = "absolute"
+    lambda_topk: float = 0.0
+    lambda_kl: float = 0.0
+    lambda_logit_topm: float = 0.0
+    topk_k: int = 8
+    hard_neg_m: int = 32
+    kl_top_m: int = 64
+    topk_margin: float = 0.05
+    topk_metric_ks: list[int] = field(default_factory=lambda: [5, 10])
     early_stopping: bool = True
     patience: int = 5
     min_delta: float = 1e-5

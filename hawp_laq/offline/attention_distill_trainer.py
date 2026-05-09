@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from hawp_laq.offline.low_rank_attention_optimizer_torch import (
+    OptimConfig,
     RiemannianAdam,
     clip_by_global_norm,
     inv_softplus,
@@ -16,6 +17,8 @@ from hawp_laq.offline.low_rank_attention_optimizer_torch import (
     qr_retraction,
     sample_rows,
     stable_softmax,
+    topk_preservation_losses,
+    topk_recall_metrics,
 )
 from hawp_laq.offline.projector_trainer import ProjectorTrainer
 
@@ -124,6 +127,71 @@ def _attention_output_stats(
     return diff_sq, teacher_sq, O.numel()
 
 
+def _rank_preservation_stats(
+    Q: Tensor,
+    K: Tensor,
+    P_K: Tensor,
+    gamma: Tensor,
+    *,
+    row_idx: Optional[Tensor],
+    logit_scale_mode: str,
+    eps_loss: float,
+    lambda_topk: float,
+    lambda_kl: float,
+    lambda_logit_topm: float,
+    topk_k: int,
+    hard_neg_m: int,
+    kl_top_m: int,
+    topk_margin: float,
+) -> dict[str, Tensor]:
+    seq_len = Q.shape[1]
+    d_h = Q.shape[-1]
+    _, valid_mask = _make_causal_masks(seq_len, row_idx, Q.device, Q.dtype)
+    Qs = Q if row_idx is None else Q[:, row_idx, :]
+
+    Z = (Qs @ K.transpose(-1, -2)) / math.sqrt(d_h)
+    Ql = Qs @ P_K
+    Kl = K @ P_K
+    scale_denom = low_rank_logit_scale_denominator(
+        logit_scale_mode, d_h, P_K.shape[1],
+    )
+    Z_hat = (gamma / scale_denom) * (Ql @ Kl.transpose(-1, -2))
+    cfg = OptimConfig(
+        r_k=P_K.shape[1],
+        r_v=1,
+        lambda_topk=lambda_topk,
+        lambda_kl=lambda_kl,
+        lambda_logit_topm=lambda_logit_topm,
+        topk_k=topk_k,
+        hard_neg_m=hard_neg_m,
+        kl_top_m=kl_top_m,
+        topk_margin=topk_margin,
+        eps_loss=eps_loss,
+    )
+    return topk_preservation_losses(Z, Z_hat, valid_mask, cfg)
+
+
+@torch.no_grad()
+def _rank_recall_stats(
+    Q: Tensor,
+    K: Tensor,
+    P_K: Tensor,
+    gamma: Tensor,
+    *,
+    logit_scale_mode: str,
+    metric_ks: tuple[int, ...],
+) -> dict[str, float]:
+    seq_len = Q.shape[1]
+    d_h = Q.shape[-1]
+    _, valid_mask = _make_causal_masks(seq_len, None, Q.device, Q.dtype)
+    Z = (Q @ K.transpose(-1, -2)) / math.sqrt(d_h)
+    scale_denom = low_rank_logit_scale_denominator(
+        logit_scale_mode, d_h, P_K.shape[1],
+    )
+    Z_hat = (gamma / scale_denom) * ((Q @ P_K) @ (K @ P_K).transpose(-1, -2))
+    return topk_recall_metrics(Z, Z_hat, valid_mask, metric_ks)
+
+
 def _loss_from_stats(diff_sq: Tensor, teacher_sq: Tensor, count: int, loss_mode: str, eps_loss: float) -> Tensor:
     if loss_mode == "absolute":
         return diff_sq / max(count, 1)
@@ -145,6 +213,14 @@ def _eval_projector(
     eval_batch_size: int,
     eval_max_batches: Optional[int],
     logit_scale_mode: str = "rk",
+    lambda_topk: float = 0.0,
+    lambda_kl: float = 0.0,
+    lambda_logit_topm: float = 0.0,
+    topk_k: int = 8,
+    hard_neg_m: int = 32,
+    kl_top_m: int = 64,
+    topk_margin: float = 0.05,
+    topk_metric_ks: tuple[int, ...] = (5, 10),
 ) -> dict:
     num_items = Q.shape[0]
     if eval_max_batches is not None and eval_max_batches > 0:
@@ -155,7 +231,13 @@ def _eval_projector(
 
     total_diff = torch.zeros((), device=Q.device, dtype=Q.dtype)
     total_teacher = torch.zeros((), device=Q.device, dtype=Q.dtype)
+    total_topk = torch.zeros((), device=Q.device, dtype=Q.dtype)
+    total_kl_topm = torch.zeros((), device=Q.device, dtype=Q.dtype)
+    total_logit_topm = torch.zeros((), device=Q.device, dtype=Q.dtype)
     total_count = 0
+    total_rank_batches = 0
+    recall_sums: dict[str, float] = {}
+    recall_batches = 0
     for start in range(0, eval_indices.numel(), eval_batch_size):
         idx = eval_indices[start:start + eval_batch_size]
         diff_sq, teacher_sq, count = _attention_output_stats(
@@ -165,14 +247,58 @@ def _eval_projector(
         total_diff = total_diff + diff_sq
         total_teacher = total_teacher + teacher_sq
         total_count += count
+        if lambda_topk != 0.0 or lambda_kl != 0.0 or lambda_logit_topm != 0.0:
+            rank_stats = _rank_preservation_stats(
+                Q[idx], K[idx], P_K, gamma,
+                row_idx=None,
+                logit_scale_mode=logit_scale_mode,
+                eps_loss=eps_loss,
+                lambda_topk=lambda_topk,
+                lambda_kl=lambda_kl,
+                lambda_logit_topm=lambda_logit_topm,
+                topk_k=topk_k,
+                hard_neg_m=hard_neg_m,
+                kl_top_m=kl_top_m,
+                topk_margin=topk_margin,
+            )
+            total_topk = total_topk + rank_stats["topk"]
+            total_kl_topm = total_kl_topm + rank_stats["kl_topm"]
+            total_logit_topm = total_logit_topm + rank_stats["logit_topm"]
+            total_rank_batches += 1
+        for key, value in _rank_recall_stats(
+            Q[idx], K[idx], P_K, gamma,
+            logit_scale_mode=logit_scale_mode,
+            metric_ks=topk_metric_ks,
+        ).items():
+            recall_sums[key] = recall_sums.get(key, 0.0) + value
+        recall_batches += 1
 
     mse = total_diff / max(total_count, 1)
     normalized = total_diff / (total_teacher + eps_loss)
     loss = _loss_from_stats(total_diff, total_teacher, total_count, loss_mode, eps_loss)
+    if total_rank_batches > 0:
+        L_topk = total_topk / total_rank_batches
+        L_kl_topm = total_kl_topm / total_rank_batches
+        L_logit_topm = total_logit_topm / total_rank_batches
+        loss = (
+            loss
+            + lambda_topk * L_topk
+            + lambda_kl * L_kl_topm
+            + lambda_logit_topm * L_logit_topm
+        )
+    else:
+        L_topk = total_topk
+        L_kl_topm = total_kl_topm
+        L_logit_topm = total_logit_topm
+    recall = {key: value / max(recall_batches, 1) for key, value in recall_sums.items()}
     return {
         "loss": float(loss.detach().cpu()),
         "mse": float(mse.detach().cpu()),
         "normalized": float(normalized.detach().cpu()),
+        "topk": float(L_topk.detach().cpu()),
+        "kl_topm": float(L_kl_topm.detach().cpu()),
+        "logit_topm": float(L_logit_topm.detach().cpu()),
+        **recall,
     }
 
 
@@ -206,6 +332,14 @@ def refine_attention_output_projector(
     train_gamma: bool = True,
     logit_scale_mode: str = "rk",
     loss_mode: str = "absolute",
+    lambda_topk: float = 0.0,
+    lambda_kl: float = 0.0,
+    lambda_logit_topm: float = 0.0,
+    topk_k: int = 8,
+    hard_neg_m: int = 32,
+    kl_top_m: int = 64,
+    topk_margin: float = 0.05,
+    topk_metric_ks: tuple[int, ...] = (5, 10),
     early_stopping: bool = True,
     patience: int = 5,
     min_delta: float = 1e-5,
@@ -271,6 +405,10 @@ def refine_attention_output_projector(
     best_eval_loss = float("inf")
     best_eval_mse = 0.0
     best_eval_normalized = 0.0
+    best_eval_topk = 0.0
+    best_eval_kl_topm = 0.0
+    best_eval_logit_topm = 0.0
+    best_eval_top_recalls: dict[str, float] = {}
     best_P_K = P_K.detach().clone()
     best_P_V = P_V.detach().clone()
     best_xi = xi.detach().clone()
@@ -292,6 +430,26 @@ def refine_attention_output_projector(
             logit_scale_mode=logit_scale_mode,
         )
         loss = _loss_from_stats(diff_sq, teacher_sq, count, loss_mode, eps_loss)
+        if lambda_topk != 0.0 or lambda_kl != 0.0 or lambda_logit_topm != 0.0:
+            rank_stats = _rank_preservation_stats(
+                Qb, Kb, P_K, gamma,
+                row_idx=row_idx,
+                logit_scale_mode=logit_scale_mode,
+                eps_loss=eps_loss,
+                lambda_topk=lambda_topk,
+                lambda_kl=lambda_kl,
+                lambda_logit_topm=lambda_logit_topm,
+                topk_k=topk_k,
+                hard_neg_m=hard_neg_m,
+                kl_top_m=kl_top_m,
+                topk_margin=topk_margin,
+            )
+            loss = (
+                loss
+                + lambda_topk * rank_stats["topk"]
+                + lambda_kl * rank_stats["kl_topm"]
+                + lambda_logit_topm * rank_stats["logit_topm"]
+            )
 
         if optimizer == "riemannian_adam":
             params = [P_K, P_V] + ([xi] if train_gamma else [])
@@ -329,10 +487,21 @@ def refine_attention_output_projector(
                     eval_batch_size=eval_batch_size,
                     eval_max_batches=eval_max_batches,
                     logit_scale_mode=logit_scale_mode,
+                    lambda_topk=lambda_topk,
+                    lambda_kl=lambda_kl,
+                    lambda_logit_topm=lambda_logit_topm,
+                    topk_k=topk_k,
+                    hard_neg_m=hard_neg_m,
+                    kl_top_m=kl_top_m,
+                    topk_margin=topk_margin,
+                    topk_metric_ks=tuple(topk_metric_ks),
                 )
                 eval_loss = eval_stats["loss"]
                 eval_mse = eval_stats["mse"]
                 eval_norm = eval_stats["normalized"]
+                eval_topk = eval_stats["topk"]
+                eval_kl_topm = eval_stats["kl_topm"]
+                eval_logit_topm = eval_stats["logit_topm"]
                 gamma_val = float((F.softplus(xi) + gamma_min).detach().cpu())
                 orth_k = _orth_err(P_K)
                 orth_v = _orth_err(P_V)
@@ -342,6 +511,10 @@ def refine_attention_output_projector(
                 "eval_loss": eval_loss,
                 "eval_mse": eval_mse,
                 "eval_normalized": eval_norm,
+                "eval_topk": eval_topk,
+                "eval_kl_topm": eval_kl_topm,
+                "eval_logit_topm": eval_logit_topm,
+                **{k: v for k, v in eval_stats.items() if k.startswith("top") and k.endswith("_recall")},
                 "gamma": gamma_val,
                 "orthK": orth_k,
                 "orthV": orth_v,
@@ -353,6 +526,7 @@ def refine_attention_output_projector(
                 print(
                     f"step={step:04d} distill_loss={eval_loss:.6e} "
                     f"mse={eval_mse:.6e} normalized={eval_norm:.6e} "
+                    f"topk={eval_topk:.6e} kl_topm={eval_kl_topm:.6e} "
                     f"gamma={gamma_val:.5f} orthK={orth_k:.2e} orthV={orth_v:.2e}"
                 )
 
@@ -361,6 +535,14 @@ def refine_attention_output_projector(
                 best_eval_loss = eval_loss
                 best_eval_mse = eval_mse
                 best_eval_normalized = eval_norm
+                best_eval_topk = eval_topk
+                best_eval_kl_topm = eval_kl_topm
+                best_eval_logit_topm = eval_logit_topm
+                best_eval_top_recalls = {
+                    k: float(v)
+                    for k, v in eval_stats.items()
+                    if k.startswith("top") and k.endswith("_recall")
+                }
                 best_P_K = P_K.detach().clone()
                 best_P_V = P_V.detach().clone()
                 best_xi = xi.detach().clone()
@@ -389,6 +571,10 @@ def refine_attention_output_projector(
         metrics={
             "attention_distill": history,
             "logit_scale_mode": logit_scale_mode,
+            "best_eval_topk": best_eval_topk,
+            "best_eval_kl_topm": best_eval_kl_topm,
+            "best_eval_logit_topm": best_eval_logit_topm,
+            "best_eval_top_recalls": best_eval_top_recalls,
         },
         best_step=best_step,
         actual_steps=step,

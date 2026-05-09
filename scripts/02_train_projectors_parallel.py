@@ -65,6 +65,15 @@ def _projector_train_kwargs(cfg) -> dict:
         "lambda_z": cfg.projector.lambda_z,
         "lambda_o": cfg.projector.lambda_o,
         "lambda_v": cfg.projector.lambda_v,
+        "lambda_topk": cfg.projector.lambda_topk,
+        "lambda_kl": cfg.projector.lambda_kl,
+        "lambda_logit_topm": cfg.projector.lambda_logit_topm,
+        "topk_k": cfg.projector.topk_k,
+        "hard_neg_m": cfg.projector.hard_neg_m,
+        "kl_top_m": cfg.projector.kl_top_m,
+        "topk_margin": cfg.projector.topk_margin,
+        "topk_loss_start_after_warmup": cfg.projector.topk_loss_start_after_warmup,
+        "topk_metric_ks": cfg.projector.topk_metric_ks,
         "eval_every": cfg.projector.eval_every,
         "early_stopping": cfg.projector.early_stopping,
         "patience": cfg.projector.patience,
@@ -277,6 +286,15 @@ def _rank_search_layers(cfg, layers: list[int]) -> dict[int, tuple[int, int]]:
                 lambda_z=getattr(cfg.projector, "lambda_z", 1.0),
                 lambda_o=getattr(cfg.projector, "lambda_o", 2.0),
                 lambda_v=getattr(cfg.projector, "lambda_v", 0.05),
+                lambda_topk=getattr(cfg.projector, "lambda_topk", 0.0),
+                lambda_kl=getattr(cfg.projector, "lambda_kl", 0.0),
+                lambda_logit_topm=getattr(cfg.projector, "lambda_logit_topm", 0.0),
+                topk_k=getattr(cfg.projector, "topk_k", 8),
+                hard_neg_m=getattr(cfg.projector, "hard_neg_m", 32),
+                kl_top_m=getattr(cfg.projector, "kl_top_m", 64),
+                topk_margin=getattr(cfg.projector, "topk_margin", 0.05),
+                topk_loss_start_after_warmup=getattr(cfg.projector, "topk_loss_start_after_warmup", True),
+                topk_metric_ks=getattr(cfg.projector, "topk_metric_ks", (5, 10)),
                 eval_every=getattr(cfg.projector, "eval_every", 50),
                 early_stopping=getattr(cfg.projector, "early_stopping", True),
                 patience=getattr(cfg.projector, "patience", 5),
@@ -295,6 +313,8 @@ def _rank_search_layers(cfg, layers: list[int]) -> dict[int, tuple[int, int]]:
                 f"  calib_logits={r['best_calib_logits']:.6f}"
                 f"  calib_attn={r['best_calib_attn']:.6f}"
                 f"  calib_value={r['best_calib_value']:.6f}"
+                f"  topk={r.get('best_calib_topk', 0.0):.6f}"
+                f"  top10={r.get('best_calib_top_recalls', {}).get('top10_recall', 0.0):.4f}"
                 f"  cost={r['rank_cost']}  step={r['best_step']} stopped={r['stopped_early']}"
             )
 
@@ -431,6 +451,10 @@ def _rank_search_layers(cfg, layers: list[int]) -> dict[int, tuple[int, int]]:
             "best_calib_logits": best.get("best_calib_logits", 0.0),
             "best_calib_attn": best.get("best_calib_attn", 0.0),
             "best_calib_value": best.get("best_calib_value", 0.0),
+            "best_calib_topk": best.get("best_calib_topk", 0.0),
+            "best_calib_kl_topm": best.get("best_calib_kl_topm", 0.0),
+            "best_calib_logit_topm": best.get("best_calib_logit_topm", 0.0),
+            "best_calib_top_recalls": best.get("best_calib_top_recalls", {}),
             "best_step": best.get("best_step", 0),
             "actual_steps": best.get("actual_steps", 0),
             "stopped_early": best.get("stopped_early", False),

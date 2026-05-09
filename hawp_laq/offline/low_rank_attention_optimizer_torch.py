@@ -52,6 +52,15 @@ class OptimConfig:
     lambda_z: float = 1.0
     lambda_o: float = 2.0
     lambda_v: float = 0.05
+    lambda_topk: float = 0.0
+    lambda_kl: float = 0.0
+    lambda_logit_topm: float = 0.0
+    topk_k: int = 8
+    hard_neg_m: int = 32
+    kl_top_m: int = 64
+    topk_margin: float = 0.05
+    topk_loss_start_after_warmup: bool = True
+    topk_metric_ks: Tuple[int, ...] = (5, 10)
     eps_loss: float = 1e-8
     adam_eps: float = 1e-8
     beta1: float = 0.9
@@ -229,6 +238,102 @@ def clip_by_global_norm(grads: List[Optional[Tensor]], max_norm: float) -> List[
     return [None if g is None else g * scale for g in grads]
 
 
+def _expand_valid_mask(valid_mask: Tensor, logits: Tensor) -> Tensor:
+    if valid_mask.shape == logits.shape:
+        return valid_mask
+    return valid_mask.expand_as(logits)
+
+
+def _masked_teacher_logits(logits: Tensor, valid_mask: Tensor) -> Tensor:
+    valid = _expand_valid_mask(valid_mask, logits)
+    return logits.masked_fill(~valid, torch.finfo(logits.dtype).min)
+
+
+def topk_preservation_losses(
+    Z: Tensor,
+    Z_hat: Tensor,
+    valid_mask: Tensor,
+    cfg: OptimConfig,
+) -> Dict[str, Tensor]:
+    """Compute ranking-focused losses on causal-valid teacher top tokens."""
+    valid = _expand_valid_mask(valid_mask, Z)
+    teacher = _masked_teacher_logits(Z, valid)
+    T = Z.shape[-1]
+    zero = Z_hat.sum() * 0.0
+
+    losses: Dict[str, Tensor] = {
+        "topk": zero,
+        "kl_topm": zero,
+        "logit_topm": zero,
+    }
+
+    topk_k = min(max(int(cfg.topk_k), 0), T)
+    hard_neg_m = min(max(int(cfg.hard_neg_m), 0), T)
+    if topk_k > 0 and hard_neg_m > 0:
+        top_idx = torch.topk(teacher, k=topk_k, dim=-1).indices
+        top_valid = torch.gather(valid, -1, top_idx)
+
+        neg_teacher = teacher.scatter(-1, top_idx, torch.finfo(teacher.dtype).min)
+        neg_idx = torch.topk(neg_teacher, k=hard_neg_m, dim=-1).indices
+        neg_valid = torch.gather(valid, -1, neg_idx)
+
+        top_hat = torch.gather(Z_hat, -1, top_idx)
+        neg_hat = torch.gather(Z_hat, -1, neg_idx)
+        pair_valid = top_valid.unsqueeze(-1) & neg_valid.unsqueeze(-2)
+        margin = torch.as_tensor(cfg.topk_margin, dtype=Z_hat.dtype, device=Z_hat.device)
+        violation = F.relu(margin - (top_hat.unsqueeze(-1) - neg_hat.unsqueeze(-2)))
+        denom = pair_valid.to(dtype=Z_hat.dtype).sum().clamp_min(1.0)
+        losses["topk"] = (violation * pair_valid.to(dtype=Z_hat.dtype)).sum() / denom
+
+    top_m = min(max(int(cfg.kl_top_m), 0), T)
+    if top_m > 0:
+        topm_idx = torch.topk(teacher, k=top_m, dim=-1).indices
+        topm_valid = torch.gather(valid, -1, topm_idx)
+        teacher_sel = torch.gather(Z, -1, topm_idx)
+        student_sel = torch.gather(Z_hat, -1, topm_idx)
+        neg_large = torch.finfo(teacher_sel.dtype).min
+        teacher_sel = teacher_sel.masked_fill(~topm_valid, neg_large)
+        student_sel = student_sel.masked_fill(~topm_valid, neg_large)
+
+        row_valid = topm_valid.any(dim=-1)
+        if row_valid.any():
+            p = F.softmax(teacher_sel, dim=-1)
+            log_q = F.log_softmax(student_sel, dim=-1)
+            kl_row = F.kl_div(log_q, p, reduction="none").sum(dim=-1)
+            losses["kl_topm"] = kl_row[row_valid].mean()
+
+        valid_f = topm_valid.to(dtype=Z_hat.dtype)
+        denom = (teacher_sel.masked_fill(~topm_valid, 0.0).pow(2) * valid_f).sum().clamp_min(cfg.eps_loss)
+        diff = (torch.gather(Z, -1, topm_idx) - torch.gather(Z_hat, -1, topm_idx)).pow(2)
+        losses["logit_topm"] = (diff * valid_f).sum() / denom
+
+    return losses
+
+
+@torch.no_grad()
+def topk_recall_metrics(
+    Z: Tensor,
+    Z_hat: Tensor,
+    valid_mask: Tensor,
+    metric_ks: Tuple[int, ...],
+) -> Dict[str, float]:
+    valid = _expand_valid_mask(valid_mask, Z)
+    teacher = _masked_teacher_logits(Z, valid)
+    student = _masked_teacher_logits(Z_hat, valid)
+    T = Z.shape[-1]
+    metrics: Dict[str, float] = {}
+    for k_raw in metric_ks:
+        k = min(max(int(k_raw), 1), T)
+        teacher_idx = torch.topk(teacher, k=k, dim=-1).indices
+        student_idx = torch.topk(student, k=k, dim=-1).indices
+        teacher_valid = torch.gather(valid, -1, teacher_idx)
+        matched = (teacher_idx.unsqueeze(-1) == student_idx.unsqueeze(-2)).any(dim=-1)
+        denom = teacher_valid.to(dtype=torch.float32).sum().clamp_min(1.0)
+        recall = (matched & teacher_valid).to(dtype=torch.float32).sum() / denom
+        metrics[f"top{k}_recall"] = float(recall.cpu())
+    return metrics
+
+
 class RiemannianAdam:
     def __init__(self, shape: Tuple[int, ...], device: torch.device, dtype: torch.dtype, lr: float, beta1: float, beta2: float, eps: float):
         self.lr = lr
@@ -305,16 +410,45 @@ def compute_objective(
     L_o = (O - O_hat).pow(2).sum() / (O.pow(2).sum() + cfg.eps_loss)
     L_v = (V - V_rec).pow(2).sum() / (V.pow(2).sum() + cfg.eps_loss)
 
+    rank_loss_enabled = (
+        cfg.lambda_topk != 0.0
+        or cfg.lambda_kl != 0.0
+        or cfg.lambda_logit_topm != 0.0
+    )
+    if rank_loss_enabled:
+        rank_losses = topk_preservation_losses(Z, Z_hat, Ws, cfg)
+        L_topk = rank_losses["topk"]
+        L_kl_topm = rank_losses["kl_topm"]
+        L_logit_topm = rank_losses["logit_topm"]
+    else:
+        L_topk = Z_hat.sum() * 0.0
+        L_kl_topm = Z_hat.sum() * 0.0
+        L_logit_topm = Z_hat.sum() * 0.0
+    use_rank_losses = (
+        not cfg.topk_loss_start_after_warmup
+        or stage != "warmup"
+    )
+
     if stage == "warmup":
         loss = L_z + 0.1 * L_o + 0.05 * L_v
     else:
         loss = cfg.lambda_z * L_z + cfg.lambda_o * L_o + cfg.lambda_v * L_v
+    if use_rank_losses:
+        loss = (
+            loss
+            + cfg.lambda_topk * L_topk
+            + cfg.lambda_kl * L_kl_topm
+            + cfg.lambda_logit_topm * L_logit_topm
+        )
 
     metrics = {
         "loss": float(loss.detach().cpu()),
         "L_z": float(L_z.detach().cpu()),
         "L_o": float(L_o.detach().cpu()),
         "L_v": float(L_v.detach().cpu()),
+        "L_topk": float(L_topk.detach().cpu()),
+        "L_kl_topm": float(L_kl_topm.detach().cpu()),
+        "L_logit_topm": float(L_logit_topm.detach().cpu()),
         "gamma": float(gamma.detach().cpu()),
     }
     return loss, metrics
@@ -340,6 +474,20 @@ def evaluate_full(
         row_idx=row_idx, stage="full",
     )
     del loss
+    if row_idx is None:
+        Qs = Q
+        Ws = valid_mask
+    else:
+        Qs = Q[:, row_idx, :]
+        Ws = valid_mask[:, row_idx, :]
+    d_h = Q.shape[-1]
+    gamma = F.softplus(xi) + cfg.gamma_min
+    scale_denom = low_rank_logit_scale_denominator(
+        cfg.logit_scale_mode, d_h, cfg.r_k,
+    )
+    Z = (Qs @ K.transpose(-1, -2)) / math.sqrt(d_h)
+    Z_hat = (gamma / scale_denom) * ((Qs @ P_K) @ (K @ P_K).transpose(-1, -2))
+    recall = topk_recall_metrics(Z, Z_hat, Ws, tuple(cfg.topk_metric_ks))
     pk_err = torch.linalg.norm(P_K.transpose(0, 1) @ P_K - torch.eye(P_K.shape[1], device=P_K.device, dtype=P_K.dtype))
     pv_err = torch.linalg.norm(P_V.transpose(0, 1) @ P_V - torch.eye(P_V.shape[1], device=P_V.device, dtype=P_V.dtype))
     return {
@@ -347,6 +495,10 @@ def evaluate_full(
         "logits": float(raw["L_z"]),
         "attn": float(raw["L_o"]),
         "value": float(raw["L_v"]),
+        "topk": float(raw["L_topk"]),
+        "kl_topm": float(raw["L_kl_topm"]),
+        "logit_topm": float(raw["L_logit_topm"]),
+        **recall,
         "gamma": float(raw["gamma"]),
         "pk_orth_err": float(pk_err.cpu()),
         "pv_orth_err": float(pv_err.cpu()),
@@ -419,6 +571,10 @@ def optimize_low_rank_attention_torch(
     best_calib_logits = 0.0
     best_calib_attn = 0.0
     best_calib_value = 0.0
+    best_calib_topk = 0.0
+    best_calib_kl_topm = 0.0
+    best_calib_logit_topm = 0.0
+    best_calib_top_recalls: Dict[str, float] = {}
     stale_steps = 0
 
     history: List[Dict[str, object]] = []
@@ -469,6 +625,9 @@ def optimize_low_rank_attention_torch(
             "L_z": float(raw_v["L_z"]),
             "L_o": float(raw_v["L_o"]),
             "L_v": float(raw_v["L_v"]),
+            "L_topk": float(raw_v["L_topk"]),
+            "L_kl_topm": float(raw_v["L_kl_topm"]),
+            "L_logit_topm": float(raw_v["L_logit_topm"]),
             "gamma": float(raw_v["gamma"]),
         })
 
@@ -497,6 +656,8 @@ def optimize_low_rank_attention_torch(
                     f"logits={calib['logits']:.6e} "
                     f"attn={calib['attn']:.6e} "
                     f"value={calib['value']:.6e} "
+                    f"topk={calib['topk']:.6e} "
+                    f"kl_topm={calib['kl_topm']:.6e} "
                     f"gamma={calib['gamma']:.5f} "
                     f"orthK={calib['pk_orth_err']:.2e} "
                     f"orthV={calib['pv_orth_err']:.2e}"
@@ -511,6 +672,14 @@ def optimize_low_rank_attention_torch(
                 best_calib_logits = calib["logits"]
                 best_calib_attn = calib["attn"]
                 best_calib_value = calib["value"]
+                best_calib_topk = calib["topk"]
+                best_calib_kl_topm = calib["kl_topm"]
+                best_calib_logit_topm = calib["logit_topm"]
+                best_calib_top_recalls = {
+                    k: float(v)
+                    for k, v in calib.items()
+                    if k.startswith("top") and k.endswith("_recall")
+                }
                 best_P_K = P_K.detach().clone()
                 best_P_V = P_V.detach().clone()
                 best_xi = xi.detach().clone()
@@ -549,6 +718,10 @@ def optimize_low_rank_attention_torch(
         "best_calib_logits": best_calib_logits,
         "best_calib_attn": best_calib_attn,
         "best_calib_value": best_calib_value,
+        "best_calib_topk": best_calib_topk,
+        "best_calib_kl_topm": best_calib_kl_topm,
+        "best_calib_logit_topm": best_calib_logit_topm,
+        "best_calib_top_recalls": best_calib_top_recalls,
     }
 
 
