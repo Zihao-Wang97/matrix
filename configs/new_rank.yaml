@@ -85,12 +85,18 @@ projector:
   beta1: 0.9
   beta2: 0.99
   grad_clip: 1.0
+  # lambda_z: 2.0
+  # lambda_o: 3.0
+  # lambda_v: 0.05
+  # lambda_topk: 0.05
+  # lambda_kl: 0.05
+  # lambda_logit_topm: 0.02
   lambda_z: 2.0
-  lambda_o: 3.0
+  lambda_o: 1.5
   lambda_v: 0.05
-  lambda_topk: 0.05
-  lambda_kl: 0.05
-  lambda_logit_topm: 0.02
+  lambda_topk: 0.15
+  lambda_kl: 0.10
+  lambda_logit_topm: 0.05
   topk_k: 8
   hard_neg_m: 32
   kl_top_m: 64
@@ -144,6 +150,7 @@ attention_distill:
   min_delta_mode: relative
   seed: 0
   save_format: auto
+
 
 dv_output_aware:
   enabled: true
@@ -240,7 +247,7 @@ sched:
   drop_strategy: position
 
 rank_search:
-  output_dir: /data/wangzihao/work/matrix/artifacts/ranks_new_rank
+  output_dir: /data/wangzihao/work/matrix/artifacts/ranks_llama31_8b_instruct
   n_steps: 300
   relative_tolerance: 0.10
   logits_abs_tolerance: "1.0e-5"
@@ -296,3 +303,5 @@ hawp:
 
   # gamma_mode: "fixed"
   # gamma_value: 1.0
+
+
