@@ -11,6 +11,7 @@ from hawp_laq.config import HAWPLAQConfig, load_config, build_k_quantizer, build
 from hawp_laq.modeling.attention_hawp import HAWPAttention
 from hawp_laq.modeling.modeling_llama_hawp import convert_llama_to_hawp, _align_hawp_params_device_dtype
 from hawp_laq.runtime.forward_utils import prefill_forward_last_logits
+from hawp_laq.runtime.mlp_chunking import install_prefill_mlp_chunking
 from hawp_laq.runtime.pure_quant_hook import PureQuantKVManager, install_pure_quant_hooks
 
 _DTYPE_MAP = {
@@ -465,6 +466,24 @@ def _setup_quant_cache_per_layer(model, cfg: HAWPLAQConfig, recent_window: int) 
             module.setup_quant_cache(k_q, v_q, recent_window=recent_window)
 
 
+def _setup_prefill_mlp_chunking(model, cfg: HAWPLAQConfig, mode: str) -> int:
+    chunk_size = int(getattr(cfg.hawp, "prefill_mlp_chunk_size", 0) or 0)
+    if chunk_size <= 0:
+        return 0
+    min_seq_len = int(getattr(cfg.hawp, "prefill_mlp_min_seq_len", 0) or 0)
+    n_installed = install_prefill_mlp_chunking(
+        model,
+        chunk_size=chunk_size,
+        min_seq_len=min_seq_len,
+    )
+    print(
+        f"[{mode}] prefill MLP token chunking: "
+        f"chunk_size={chunk_size} min_seq_len={min_seq_len or chunk_size + 1} "
+        f"modules={n_installed}"
+    )
+    return n_installed
+
+
 def _count_model_layers(model) -> int:
     n = 0
     for _, mod in model.named_modules():
@@ -649,6 +668,7 @@ def _convert_and_load_projectors(model, cfg, device, mode: str):
 def _setup_hawp_quant_on_model(model, cfg, device):
     model, r_k, r_v = _convert_and_load_projectors(model, cfg, device, "hawp_quant")
     _setup_quant_cache_per_layer(model, cfg, recent_window=cfg.sched.recent_window)
+    _setup_prefill_mlp_chunking(model, cfg, "hawp_quant")
     print(f"[hawp_quant] recent_window={cfg.sched.recent_window}")
     return model
 
@@ -656,6 +676,7 @@ def _setup_hawp_quant_on_model(model, cfg, device):
 def _setup_hawp_quant_all_on_model(model, cfg, device):
     model, r_k, r_v = _convert_and_load_projectors(model, cfg, device, "hawp_quant_all")
     _setup_quant_cache_per_layer(model, cfg, recent_window=0)
+    _setup_prefill_mlp_chunking(model, cfg, "hawp_quant_all")
     print(f"[hawp_quant_all] recent_window=0 (all tokens quantized)")
     return model
 
@@ -676,6 +697,7 @@ def _setup_quant_only_on_model(model, cfg, device):
     model.eval()
 
     _setup_quant_cache_per_layer(model, cfg, recent_window=cfg.sched.recent_window)
+    _setup_prefill_mlp_chunking(model, cfg, "quant_only")
 
     print(f"[quant_only] head_dim={head_dim}  recent_window={cfg.sched.recent_window}  (explicit full-rank, no low-rank projection)")
 

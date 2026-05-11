@@ -261,11 +261,15 @@ class HAWPAttention(nn.Module):
         self.use_archive_k_ip_approx = use_archive_k_ip_approx
         self.use_decode_blockwise_attention = True
         self.decode_archive_block_size = 1024
+        self.use_prefill_grouped_attention = True
+        self.use_prefill_fused_value_o_proj = True
+        self.prefill_fused_o_proj_chunk_size = 2048
 
         self.use_quantizer = False
         self.use_cache_manager = False
         self.recent_window = 64
         self._calib_callback = None
+        self._memory_marker_callback = None
         self._tq_k_quantizer = None
         self._tq_v_quantizer = None
         self._recent_k_buffer = None
@@ -294,6 +298,11 @@ class HAWPAttention(nn.Module):
         if getattr(self, "_hawp_parent_expects_2_outputs", False):
             return attn_output, attn_weights
         return attn_output, attn_weights, past_key_value
+
+    def _mark_memory(self, name: str, **meta) -> None:
+        callback = getattr(self, "_memory_marker_callback", None)
+        if callback is not None:
+            callback(self, name, meta)
 
     def setup_quant_cache(self, k_quantizer, v_quantizer, recent_window: int = 64) -> None:
         self.use_cache_manager = True
@@ -355,17 +364,46 @@ class HAWPAttention(nn.Module):
         v_new = v_lat[0].detach()
         nkv, T, rk = k_new.shape
         _, _, rv = v_new.shape
+        self._mark_memory(
+            "quantize_to_chunk.detach.after",
+            T=int(T),
+            nkv=int(nkv),
+            r_k=int(rk),
+            r_v=int(rv),
+        )
         k_flat = k_new.reshape(nkv * T, rk).float()
+        self._mark_memory(
+            "quantize_to_chunk.k_flat.after",
+            T=int(T),
+            shape=tuple(k_flat.shape),
+            dtype=str(k_flat.dtype).replace("torch.", ""),
+        )
         v_flat = v_new.reshape(nkv * T, rv).float()
+        self._mark_memory(
+            "quantize_to_chunk.v_flat.after",
+            T=int(T),
+            shape=tuple(v_flat.shape),
+            dtype=str(v_flat.dtype).replace("torch.", ""),
+        )
+        self._mark_memory("quantize_to_chunk.k_quant.before", T=int(T))
         k_qx = self._tq_k_quantizer.quantize(
             k_flat,
             logical_shape=(nkv, T, rk),
         )
+        self._mark_memory("quantize_to_chunk.k_quant.after", T=int(T))
+        self._mark_memory("quantize_to_chunk.v_quant.before", T=int(T))
         v_qx = self._tq_v_quantizer.quantize(
             v_flat,
             logical_shape=(nkv, T, rv),
         )
+        self._mark_memory("quantize_to_chunk.v_quant.after", T=int(T))
         k_norms = k_new.float().norm(dim=2).to(torch.float16)
+        self._mark_memory(
+            "quantize_to_chunk.k_norms.after",
+            T=int(T),
+            shape=tuple(k_norms.shape),
+            dtype=str(k_norms.dtype).replace("torch.", ""),
+        )
         return _QuantChunk(k_qx, v_qx, T, k_norms)
 
     def _ensure_recent_buffer(self, k_new: torch.Tensor, v_new: torch.Tensor) -> None:
@@ -1023,10 +1061,18 @@ class HAWPAttention(nn.Module):
 
         pk_down = self.p_k[:, :self.r_k].to(device=query_states.device, dtype=query_states.dtype)
         pv_down = self.p_v[:, :self.r_v].to(device=query_states.device, dtype=query_states.dtype)
+        self._mark_memory(
+            "low_rank.proj_weights.after",
+            q_len=int(q_len),
+            is_prefill=bool(q_len > 1),
+        )
 
         q_lat = query_states @ pk_down
+        self._mark_memory("low_rank.q_lat.after", q_len=int(q_len), shape=tuple(q_lat.shape))
         k_lat = key_states @ pk_down
+        self._mark_memory("low_rank.k_lat.after", q_len=int(q_len), shape=tuple(k_lat.shape))
         v_lat = value_states @ pv_down
+        self._mark_memory("low_rank.v_lat.after", q_len=int(q_len), shape=tuple(v_lat.shape))
 
         use_internal_quant_cache = (
             self.use_cache_manager
@@ -1050,22 +1096,96 @@ class HAWPAttention(nn.Module):
                 and q_len > 1
                 and _attention_mask_is_fully_visible(attention_mask, key_states.shape[-2])
             ):
-                k_lat_expanded = self._repeat_kv(k_lat)
-                v_lat_expanded = self._repeat_kv(v_lat)
-                attn_output_lat = _scaled_dot_product_attention_with_logit_scale(
-                    q_lat,
-                    k_lat_expanded,
-                    v_lat_expanded,
-                    logit_scale=logit_scale,
-                    is_causal=True,
+                if (
+                    getattr(self, "use_prefill_grouped_attention", True)
+                    and self.num_key_value_groups > 1
+                ):
+                    self._mark_memory("prefill.fast_path.grouped_sdpa.before", q_len=int(q_len))
+                    self._mark_memory("prefill.fast_path.sdpa.before", q_len=int(q_len))
+                    attn_output_lat = self._compute_prefill_attention_grouped(
+                        q_lat,
+                        k_lat,
+                        v_lat,
+                        logit_scale,
+                    )
+                else:
+                    self._mark_memory("prefill.fast_path.before_repeat", q_len=int(q_len))
+                    k_lat_expanded = self._repeat_kv(k_lat)
+                    self._mark_memory(
+                        "prefill.fast_path.k_repeat.after",
+                        q_len=int(q_len),
+                        shape=tuple(k_lat_expanded.shape),
+                    )
+                    v_lat_expanded = self._repeat_kv(v_lat)
+                    self._mark_memory(
+                        "prefill.fast_path.v_repeat.after",
+                        q_len=int(q_len),
+                        shape=tuple(v_lat_expanded.shape),
+                    )
+                    self._mark_memory("prefill.fast_path.sdpa.before", q_len=int(q_len))
+                    attn_output_lat = _scaled_dot_product_attention_with_logit_scale(
+                        q_lat,
+                        k_lat_expanded,
+                        v_lat_expanded,
+                        logit_scale=logit_scale,
+                        is_causal=True,
+                    )
+                    del k_lat_expanded, v_lat_expanded
+                    self._mark_memory("prefill.fast_path.repeat_kv.release.after", q_len=int(q_len))
+                self._mark_memory(
+                    "prefill.fast_path.sdpa.after",
+                    q_len=int(q_len),
+                    shape=tuple(attn_output_lat.shape),
                 )
 
-                attn_output = self._decode_value_latent(attn_output_lat, pv_down)
-                attn_output = attn_output.transpose(1, 2).contiguous()
-                attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-                attn_output = self.o_proj(attn_output)
+                if (
+                    getattr(self, "use_prefill_fused_value_o_proj", True)
+                    and self._can_use_fused_value_o_proj()
+                ):
+                    self._mark_memory("prefill.fast_path.fused_value_o_proj.before", q_len=int(q_len))
+                    attn_output = self._decode_value_and_o_proj_chunked(
+                        attn_output_lat,
+                        pv_down,
+                    )
+                    self._mark_memory(
+                        "prefill.fast_path.fused_value_o_proj.after",
+                        q_len=int(q_len),
+                        shape=tuple(attn_output.shape),
+                    )
+                    del attn_output_lat
+                    self._mark_memory("prefill.fast_path.attn_output_lat.release.after", q_len=int(q_len))
+                else:
+                    attn_output = self._decode_value_latent(attn_output_lat, pv_down)
+                    self._mark_memory(
+                        "prefill.fast_path.value_decode.after",
+                        q_len=int(q_len),
+                        shape=tuple(attn_output.shape),
+                    )
+                    del attn_output_lat
+                    self._mark_memory("prefill.fast_path.attn_output_lat.release.after", q_len=int(q_len))
+                    attn_output = attn_output.transpose(1, 2).contiguous()
+                    self._mark_memory(
+                        "prefill.fast_path.transpose_contiguous.after",
+                        q_len=int(q_len),
+                        shape=tuple(attn_output.shape),
+                    )
+                    attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+                    self._mark_memory(
+                        "prefill.fast_path.reshape.after",
+                        q_len=int(q_len),
+                        shape=tuple(attn_output.shape),
+                    )
+                    attn_output = self.o_proj(attn_output)
+                    self._mark_memory(
+                        "prefill.fast_path.o_proj.after",
+                        q_len=int(q_len),
+                        shape=tuple(attn_output.shape),
+                    )
 
+                self._mark_memory("prefill.fast_path.cache_append.before", q_len=int(q_len))
                 self._quant_cache_append_latent(k_lat, v_lat)
+                self._mark_memory("prefill.fast_path.cache_append.after", q_len=int(q_len))
+                del q_lat, k_lat, v_lat
 
                 cache_passthrough = _cache_passthrough(past_key_value)
                 return self._format_attn_output(attn_output, None, cache_passthrough)
@@ -1223,6 +1343,79 @@ class HAWPAttention(nn.Module):
             d_v = self.d_v.to(device=attn_output_lat.device, dtype=attn_output_lat.dtype)
             return attn_output_lat @ d_v
         return attn_output_lat @ pv_down.T
+
+    def _can_use_fused_value_o_proj(self) -> bool:
+        weight = getattr(self.o_proj, "weight", None)
+        if not isinstance(weight, torch.Tensor):
+            return False
+        if weight.dim() != 2 or tuple(weight.shape) != (self.hidden_size, self.hidden_size):
+            return False
+        return bool(weight.dtype.is_floating_point)
+
+    def _decode_value_and_o_proj_chunked(
+        self,
+        attn_output_lat: torch.Tensor,
+        pv_down: torch.Tensor,
+    ) -> torch.Tensor:
+        bsz, num_heads, q_len, rv = attn_output_lat.shape
+        if num_heads != self.num_heads or rv != self.r_v:
+            raise RuntimeError(
+                "Fused value/o_proj shape mismatch: "
+                f"attn_output_lat={tuple(attn_output_lat.shape)}, "
+                f"num_heads={self.num_heads}, r_v={self.r_v}"
+            )
+
+        dtype = attn_output_lat.dtype
+        device = attn_output_lat.device
+        if self.d_v is not None:
+            decode_weight = self.d_v.to(device=device, dtype=dtype)
+        else:
+            decode_weight = pv_down.T
+            if decode_weight.device != device or decode_weight.dtype != dtype:
+                decode_weight = decode_weight.to(device=device, dtype=dtype)
+
+        o_weight = self.o_proj.weight
+        if o_weight.device != device or o_weight.dtype != dtype:
+            o_weight = o_weight.to(device=device, dtype=dtype)
+
+        attn_output = attn_output_lat.new_empty((bsz, q_len, self.hidden_size))
+        bias = getattr(self.o_proj, "bias", None)
+        if bias is not None:
+            bias = bias.to(device=device, dtype=dtype)
+            attn_output.copy_(bias.view(1, 1, self.hidden_size).expand_as(attn_output))
+        else:
+            attn_output.zero_()
+        self._mark_memory(
+            "prefill.fused_value_o_proj.output_alloc.after",
+            q_len=int(q_len),
+            shape=tuple(attn_output.shape),
+        )
+
+        chunk_size = max(1, int(getattr(self, "prefill_fused_o_proj_chunk_size", 2048)))
+        for head_idx in range(num_heads):
+            head_start = head_idx * self.head_dim
+            head_end = head_start + self.head_dim
+            fused_weight = decode_weight @ o_weight[:, head_start:head_end].transpose(0, 1)
+            fused_weight_t = fused_weight.transpose(0, 1).contiguous()
+            for start in range(0, q_len, chunk_size):
+                end = min(start + chunk_size, q_len)
+                projected = F.linear(
+                    attn_output_lat[:, head_idx, start:end, :],
+                    fused_weight_t,
+                    bias=None,
+                )
+                attn_output[:, start:end, :].add_(projected)
+                del projected
+            if head_idx == 0 or head_idx == num_heads - 1:
+                self._mark_memory(
+                    "prefill.fused_value_o_proj.head.after",
+                    q_len=int(q_len),
+                    head_idx=int(head_idx),
+                    chunk_size=int(chunk_size),
+                )
+            del fused_weight, fused_weight_t
+
+        return attn_output
 
     def _apply_pk(self, k: torch.Tensor) -> torch.Tensor:
         if self.r_k >= self.head_dim and not self.p_k.requires_grad:
@@ -1426,6 +1619,66 @@ class HAWPAttention(nn.Module):
         k_block: torch.Tensor,
     ) -> torch.Tensor:
         return torch.einsum("ngr,ntr->ngt", q_grouped.float(), k_block.float())
+
+    def _compute_prefill_attention_grouped(
+        self,
+        q_lat: torch.Tensor,
+        k_lat: torch.Tensor,
+        v_lat: torch.Tensor,
+        logit_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run causal prefill attention per KV-head group without full K/V repeat."""
+        if self.num_key_value_groups == 1:
+            return _scaled_dot_product_attention_with_logit_scale(
+                q_lat,
+                k_lat,
+                v_lat,
+                logit_scale=logit_scale,
+                is_causal=True,
+            )
+
+        bsz, num_heads, q_len, rk = q_lat.shape
+        _, nkv, k_len, _ = k_lat.shape
+        g = self.num_key_value_groups
+        rv = v_lat.shape[-1]
+        if nkv != self.num_key_value_heads or num_heads != nkv * g:
+            raise RuntimeError(
+                "Grouped prefill attention shape mismatch: "
+                f"num_heads={num_heads}, num_key_value_heads={nkv}, groups={g}"
+            )
+
+        q_grouped = q_lat.reshape(bsz, nkv, g, q_len, rk)
+        attn_output_lat = q_lat.new_empty((bsz, num_heads, q_len, rv))
+        self._mark_memory(
+            "prefill.grouped_sdpa.output_alloc.after",
+            q_len=int(q_len),
+            shape=tuple(attn_output_lat.shape),
+        )
+
+        for kv_idx in range(nkv):
+            head_start = kv_idx * g
+            head_end = head_start + g
+            q_part = q_grouped[:, kv_idx, :, :, :]
+            k_part = k_lat[:, kv_idx : kv_idx + 1, :, :].expand(bsz, g, k_len, rk)
+            v_part = v_lat[:, kv_idx : kv_idx + 1, :, :].expand(bsz, g, k_len, rv)
+            out_part = _scaled_dot_product_attention_with_logit_scale(
+                q_part,
+                k_part,
+                v_part,
+                logit_scale=logit_scale,
+                is_causal=True,
+            )
+            attn_output_lat[:, head_start:head_end, :, :] = out_part
+            if kv_idx == 0 or kv_idx == nkv - 1:
+                self._mark_memory(
+                    "prefill.grouped_sdpa.group.after",
+                    q_len=int(q_len),
+                    kv_idx=int(kv_idx),
+                    shape=tuple(out_part.shape),
+                )
+            del q_part, k_part, v_part, out_part
+
+        return attn_output_lat
 
     def _compute_archive_k_logits_block_approx_grouped(
         self,

@@ -300,8 +300,9 @@ hawp:
   gamma_mode: "learned"
   gamma_value: null
   use_archive_k_ip_approx: true
+  prefill_mlp_chunk_size: 2048
+  prefill_mlp_min_seq_len: 2049
 
   # gamma_mode: "fixed"
   # gamma_value: 1.0
-
 

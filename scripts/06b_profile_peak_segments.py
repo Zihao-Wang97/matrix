@@ -139,6 +139,38 @@ def _shape_meta(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _collect_tensor_shapes(value: Any, *, limit: int = 4) -> list[tuple[int, ...]]:
+    shapes: list[tuple[int, ...]] = []
+
+    def visit(obj: Any) -> None:
+        if len(shapes) >= limit:
+            return
+        if isinstance(obj, torch.Tensor):
+            shapes.append(tuple(obj.shape))
+        elif isinstance(obj, (tuple, list)):
+            for item in obj:
+                visit(item)
+                if len(shapes) >= limit:
+                    break
+        elif hasattr(obj, "logits") and isinstance(obj.logits, torch.Tensor):
+            visit(obj.logits)
+        elif hasattr(obj, "last_hidden_state") and isinstance(obj.last_hidden_state, torch.Tensor):
+            visit(obj.last_hidden_state)
+
+    visit(value)
+    return shapes
+
+
+def _io_meta(value: Any, *, prefix: str) -> dict[str, Any]:
+    if isinstance(value, torch.Tensor):
+        meta = _shape_meta(value)
+        return {f"{prefix}_{k}": v for k, v in meta.items()}
+    shapes = _collect_tensor_shapes(value)
+    if shapes:
+        return {f"{prefix}_shapes": shapes}
+    return {}
+
+
 def _method_meta(method_name: str, args: tuple[Any, ...]) -> dict[str, Any]:
     meta: dict[str, Any] = {}
     if args:
@@ -177,6 +209,19 @@ def install_hawp_probes(model, tracer: MemoryTracer, *, include_repeat_kv: bool)
         if not isinstance(mod, HAWPAttention):
             continue
         layer_idx = getattr(mod, "layer_idx", None)
+
+        def marker_callback(_module, name, meta, __layer=layer_idx):
+            tracer.record(
+                f"hawp.layer{__layer}.marker.{name}",
+                layer=__layer,
+                method="_forward_low_rank_marker",
+                marker=name,
+                **meta,
+            )
+
+        mod._memory_marker_callback = marker_callback
+        n_wrapped += 1
+
         for method_name in methods:
             if not hasattr(mod, method_name):
                 continue
@@ -196,6 +241,87 @@ def install_hawp_probes(model, tracer: MemoryTracer, *, include_repeat_kv: bool)
             n_wrapped += 1
 
     return n_wrapped
+
+
+def _get_nested_attr(obj: Any, path: str) -> Any:
+    cur = obj
+    for part in path.split("."):
+        if cur is None or not hasattr(cur, part):
+            return None
+        cur = getattr(cur, part)
+    return cur
+
+
+def _find_transformer_layers(model) -> Any:
+    for path in ("model.layers", "model.decoder.layers", "transformer.h", "gpt_neox.layers"):
+        layers = _get_nested_attr(model, path)
+        if layers is not None:
+            return layers
+    return None
+
+
+def _find_final_norm(model) -> tuple[str, Any] | tuple[None, None]:
+    for path in (
+        "model.norm",
+        "model.decoder.final_layer_norm",
+        "model.final_layer_norm",
+        "transformer.ln_f",
+        "gpt_neox.final_layer_norm",
+    ):
+        mod = _get_nested_attr(model, path)
+        if mod is not None:
+            return path, mod
+    return None, None
+
+
+def install_model_block_probes(model, tracer: MemoryTracer) -> int:
+    """Install coarse model-level probes around blocks, MLP, final norm, and lm_head."""
+    n_hooks = 0
+
+    def add_hooks(module, label: str, **meta: Any) -> None:
+        nonlocal n_hooks
+
+        def pre_hook(_module, args):
+            tracer.record(f"{label}.before", **meta, **_io_meta(args, prefix="input"))
+
+        def post_hook(_module, args, output):
+            tracer.record(f"{label}.after", **meta, **_io_meta(output, prefix="output"))
+
+        module.register_forward_pre_hook(pre_hook)
+        module.register_forward_hook(post_hook)
+        n_hooks += 2
+
+    layers = _find_transformer_layers(model)
+    if layers is not None:
+        for layer_idx, layer in enumerate(layers):
+            add_hooks(layer, f"model.layer{layer_idx}.block", layer=layer_idx, block_part="block")
+            self_attn = getattr(layer, "self_attn", None) or getattr(layer, "attention", None) or getattr(layer, "attn", None)
+            if self_attn is not None:
+                add_hooks(self_attn, f"model.layer{layer_idx}.self_attn", layer=layer_idx, block_part="self_attn")
+            mlp = getattr(layer, "mlp", None) or getattr(layer, "feed_forward", None) or getattr(layer, "ffn", None)
+            if mlp is not None:
+                add_hooks(mlp, f"model.layer{layer_idx}.mlp", layer=layer_idx, block_part="mlp")
+                if hasattr(mlp, "_hawp_mlp_marker_callback"):
+                    def mlp_marker_callback(_module, name, meta, __layer=layer_idx):
+                        tracer.record(
+                            f"model.layer{__layer}.mlp.marker.{name}",
+                            layer=__layer,
+                            block_part="mlp",
+                            marker=name,
+                            **meta,
+                        )
+
+                    mlp._hawp_mlp_marker_callback = mlp_marker_callback
+
+    norm_path, final_norm = _find_final_norm(model)
+    if final_norm is not None:
+        add_hooks(final_norm, "model.final_norm", module_path=norm_path, block_part="final_norm")
+
+    lm_head = getattr(model, "lm_head", None)
+    if lm_head is not None:
+        add_hooks(lm_head, "model.lm_head", block_part="lm_head")
+
+    return n_hooks
 
 
 @torch.inference_mode()
@@ -368,6 +494,7 @@ def main() -> None:
     parser.add_argument("--trace-decode-steps", type=int, default=4)
     parser.add_argument("--top-n", type=int, default=12)
     parser.add_argument("--no-hawp-internals", action="store_true")
+    parser.add_argument("--no-model-block-probes", action="store_true")
     parser.add_argument("--trace-repeat-kv", action="store_true")
     parser.add_argument("--no-synchronize", action="store_true")
     args = parser.parse_args()
@@ -391,6 +518,11 @@ def main() -> None:
     model, coordinator, kv_manager = setup_mode(model, cfg, device, args.mode)
     model.eval()
     tracer.record("mode.setup.after", mode=args.mode)
+
+    n_model_probes = 0
+    if not args.no_model_block_probes:
+        n_model_probes = install_model_block_probes(model, tracer)
+        tracer.record("model.block_probes.installed", n_model_probes=n_model_probes)
 
     n_probes = 0
     if not args.no_hawp_internals:
@@ -422,6 +554,7 @@ def main() -> None:
         "actual_seq_len": actual_seq_len,
         "max_new_tokens": cfg.generation.max_new_tokens,
         "n_hawp_probes": n_probes,
+        "n_model_block_probes": n_model_probes,
         "generated_token_count": int(gen_ids.numel()),
         "stats": {
             "cache_runtime_bytes": stats.cache_runtime_bytes,

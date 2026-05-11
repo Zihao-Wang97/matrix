@@ -257,6 +257,8 @@ class HAWPConfig:
     gamma_mode: str = "learned"
     gamma_value: float | None = None
     use_archive_k_ip_approx: bool = True
+    prefill_mlp_chunk_size: int = 0
+    prefill_mlp_min_seq_len: int = 0
 
 
 @dataclass
