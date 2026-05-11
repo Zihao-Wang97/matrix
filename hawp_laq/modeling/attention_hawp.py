@@ -116,6 +116,43 @@ def _prepare_attention_mask(
     return attention_mask.to(device=device, dtype=dtype)
 
 
+def _attention_mask_is_fully_visible(
+    attention_mask: Optional[torch.Tensor],
+    kv_len: int,
+) -> bool:
+    """Return True when a 2-D mask has no padding in the visible KV prefix."""
+    if attention_mask is None:
+        return True
+    if attention_mask.dim() != 2 or attention_mask.shape[1] < kv_len:
+        return False
+    return bool(torch.all(attention_mask[:, :kv_len] != 0).item())
+
+
+def _scaled_dot_product_attention_with_logit_scale(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    logit_scale: torch.Tensor,
+    is_causal: bool,
+) -> torch.Tensor:
+    """SDPA wrapper for arbitrary low-rank logit scales.
+
+    ``scaled_dot_product_attention`` applies ``1 / sqrt(dim)`` internally.
+    Multiplying the query by ``logit_scale * sqrt(dim)`` preserves the existing
+    HAWP logits while letting PyTorch use its memory-efficient attention kernel.
+    """
+    scale_factor = logit_scale * math.sqrt(query.shape[-1])
+    return F.scaled_dot_product_attention(
+        query * scale_factor,
+        key,
+        value,
+        attn_mask=None,
+        dropout_p=0.0,
+        is_causal=is_causal,
+    )
+
+
 def _cache_passthrough(past_key_value):
     if past_key_value is None:
         return None
@@ -222,6 +259,8 @@ class HAWPAttention(nn.Module):
         self.gamma_mode = gamma_mode
         self.gamma_value = gamma_value
         self.use_archive_k_ip_approx = use_archive_k_ip_approx
+        self.use_decode_blockwise_attention = True
+        self.decode_archive_block_size = 1024
 
         self.use_quantizer = False
         self.use_cache_manager = False
@@ -493,6 +532,70 @@ class HAWPAttention(nn.Module):
         if hasattr(qx, "mse"):
             return qx.mse.q.shape[0]
         return qx.q.shape[0]
+
+    @staticmethod
+    def _token_block_row_indices(
+        qx,
+        nkv: int,
+        dim: int,
+        start: int,
+        end: int,
+    ) -> tuple[torch.Tensor, int]:
+        _, n_tokens, _ = HAWPAttention._get_logical_nkv_T_dim(qx, nkv, dim)
+        if not (0 <= start <= end <= n_tokens):
+            raise RuntimeError(
+                f"Invalid token block [{start}, {end}) for archive length {n_tokens}"
+            )
+        block_len = end - start
+        if hasattr(qx, "mse"):
+            device = qx.mse.q.device
+        else:
+            device = qx.q.device
+        base = torch.arange(nkv, device=device).unsqueeze(1) * n_tokens
+        offsets = torch.arange(start, end, device=device).unsqueeze(0)
+        return (base + offsets).reshape(-1), block_len
+
+    @staticmethod
+    def _slice_quantized_token_block(qx, nkv: int, dim: int, start: int, end: int):
+        from hawp_laq.runtime.turboquant import TurboQuantProdResult, TurboQuantizedTensor
+
+        rows, block_len = HAWPAttention._token_block_row_indices(qx, nkv, dim, start, end)
+        logical_shape = (nkv, block_len, dim)
+
+        if isinstance(qx, TurboQuantProdResult):
+            mse = qx.mse
+            sliced_mse = TurboQuantizedTensor(
+                q=mse.q.index_select(0, rows),
+                scale=mse.scale.index_select(0, rows),
+                zero_point=mse.zero_point.index_select(0, rows),
+                rotation=mse.rotation,
+                shape_orig=(nkv * block_len, dim),
+                bits=mse.bits,
+                group_size=mse.group_size,
+                logical_shape=logical_shape,
+            )
+            return TurboQuantProdResult(
+                mse=sliced_mse,
+                residual_sign=qx.residual_sign.index_select(0, rows),
+                residual_norm=qx.residual_norm.index_select(0, rows),
+                shape_orig=(nkv * block_len, dim),
+                dim=dim,
+                logical_shape=logical_shape,
+            )
+
+        if isinstance(qx, TurboQuantizedTensor):
+            return TurboQuantizedTensor(
+                q=qx.q.index_select(0, rows),
+                scale=qx.scale.index_select(0, rows),
+                zero_point=qx.zero_point.index_select(0, rows),
+                rotation=qx.rotation,
+                shape_orig=(nkv * block_len, dim),
+                bits=qx.bits,
+                group_size=qx.group_size,
+                logical_shape=logical_shape,
+            )
+
+        raise RuntimeError(f"Unsupported quantized tensor type: {type(qx).__name__}")
 
     @staticmethod
     def _get_logical_nkv_T_dim(qx, nkv: int, dim: int) -> tuple[int, int, int]:
@@ -939,6 +1042,61 @@ class HAWPAttention(nn.Module):
             has_recent = recent_k is not None
 
             logit_scale = self._compute_low_rank_logit_scale(q_lat)
+
+            if (
+                not self.is_opt
+                and not has_archive
+                and not has_recent
+                and q_len > 1
+                and _attention_mask_is_fully_visible(attention_mask, key_states.shape[-2])
+            ):
+                k_lat_expanded = self._repeat_kv(k_lat)
+                v_lat_expanded = self._repeat_kv(v_lat)
+                attn_output_lat = _scaled_dot_product_attention_with_logit_scale(
+                    q_lat,
+                    k_lat_expanded,
+                    v_lat_expanded,
+                    logit_scale=logit_scale,
+                    is_causal=True,
+                )
+
+                attn_output = self._decode_value_latent(attn_output_lat, pv_down)
+                attn_output = attn_output.transpose(1, 2).contiguous()
+                attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+                attn_output = self.o_proj(attn_output)
+
+                self._quant_cache_append_latent(k_lat, v_lat)
+
+                cache_passthrough = _cache_passthrough(past_key_value)
+                return self._format_attn_output(attn_output, None, cache_passthrough)
+
+            total_kv_len = self.n_archive_tokens + self._recent_count + q_len
+            if (
+                not self.is_opt
+                and self.use_decode_blockwise_attention
+                and has_archive
+                and q_len == 1
+                and _attention_mask_is_fully_visible(attention_mask, total_kv_len)
+            ):
+                attn_output_lat = self._compute_decode_attention_blockwise(
+                    q_lat,
+                    k_lat,
+                    v_lat,
+                    recent_k,
+                    recent_v,
+                    logit_scale,
+                )
+
+                attn_output = self._decode_value_latent(attn_output_lat.to(query_states.dtype), pv_down)
+                attn_output = attn_output.transpose(1, 2).contiguous()
+                attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+                attn_output = self.o_proj(attn_output)
+
+                self._quant_cache_append_latent(k_lat, v_lat)
+
+                cache_passthrough = _cache_passthrough(past_key_value)
+                return self._format_attn_output(attn_output, None, cache_passthrough)
+
             logit_parts = []
             v_parts_for_attn = []
 
@@ -1241,6 +1399,134 @@ class HAWPAttention(nn.Module):
             parts.append(deq)
         return torch.cat(parts, dim=1)
 
+    @staticmethod
+    def _stream_softmax_block(
+        logits: torch.Tensor,
+        values: torch.Tensor,
+        running_max: torch.Tensor,
+        running_sum: torch.Tensor,
+        running_out: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        logits = logits.float()
+        values = values.float()
+        block_max = logits.max(dim=-1).values
+        new_max = torch.maximum(running_max, block_max)
+        old_scale = torch.exp(running_max - new_max)
+        block_scale = torch.exp(block_max - new_max)
+        exp_logits = torch.exp(logits - block_max.unsqueeze(-1))
+        block_sum = exp_logits.sum(dim=-1)
+        block_out = torch.einsum("ngt,ntr->ngr", exp_logits, values)
+        running_out = running_out * old_scale.unsqueeze(-1) + block_out * block_scale.unsqueeze(-1)
+        running_sum = running_sum * old_scale + block_sum * block_scale
+        return new_max, running_sum, running_out
+
+    def _compute_grouped_k_logits(
+        self,
+        q_grouped: torch.Tensor,
+        k_block: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.einsum("ngr,ntr->ngt", q_grouped.float(), k_block.float())
+
+    def _compute_archive_k_logits_block_approx_grouped(
+        self,
+        q_grouped: torch.Tensor,
+        k_qx,
+        block_len: int,
+    ) -> torch.Tensor:
+        nkv = self.num_key_value_heads
+        g = self.num_key_value_groups
+        rk = self.r_k
+        x_hat = self._tq_k_quantizer.dequantize_mse(k_qx, logical=True)
+        if x_hat.dim() == 2:
+            x_hat = x_hat.reshape(nkv, block_len, rk)
+        x_hat = x_hat.to(device=q_grouped.device, dtype=torch.float32)
+        mse_ip = torch.einsum("ngr,ntr->ngt", q_grouped.float(), x_hat)
+
+        sign_unpacked = unpack_bool(k_qx.residual_sign, rk)
+        sign_unpacked = sign_unpacked.reshape(nkv, block_len, rk)
+        sign_float = sign_unpacked.to(device=q_grouped.device, dtype=torch.float32)
+        sign_float.mul_(2.0).sub_(1.0)
+        scale = (k_qx.residual_norm / math.sqrt(rk)).reshape(nkv, block_len)
+        scale = scale.to(device=q_grouped.device, dtype=torch.float32)
+        sign_ip = torch.einsum("ngr,ntr->ngt", q_grouped.float(), sign_float)
+        sign_ip = sign_ip * scale.unsqueeze(1)
+        if g != q_grouped.shape[1]:
+            raise RuntimeError("Grouped query shape mismatch while computing archive logits")
+        return mse_ip + sign_ip
+
+    def _compute_decode_attention_blockwise(
+        self,
+        q_lat: torch.Tensor,
+        k_lat: torch.Tensor,
+        v_lat: torch.Tensor,
+        recent_k: torch.Tensor | None,
+        recent_v: torch.Tensor | None,
+        logit_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        nkv = self.num_key_value_heads
+        g = self.num_key_value_groups
+        q_grouped = q_lat[0].reshape(nkv, g, 1, self.r_k)[:, :, 0, :]
+        running_max = torch.full(
+            (nkv, g), -float("inf"), device=q_lat.device, dtype=torch.float32,
+        )
+        running_sum = torch.zeros((nkv, g), device=q_lat.device, dtype=torch.float32)
+        running_out = torch.zeros((nkv, g, self.r_v), device=q_lat.device, dtype=torch.float32)
+        scale = logit_scale.to(device=q_lat.device, dtype=torch.float32)
+        block_size = max(1, int(self.decode_archive_block_size))
+
+        for chunk in self._quant_archive_chunks:
+            _, n_tokens, _ = self._get_logical_nkv_T_dim(chunk.k_qx, nkv, self.r_k)
+            for start in range(0, n_tokens, block_size):
+                end = min(start + block_size, n_tokens)
+                block_len = end - start
+                k_qx = self._slice_quantized_token_block(chunk.k_qx, nkv, self.r_k, start, end)
+                v_qx = self._slice_quantized_token_block(chunk.v_qx, nkv, self.r_v, start, end)
+
+                if self._can_use_archive_k_ip_approx():
+                    logits = self._compute_archive_k_logits_block_approx_grouped(
+                        q_grouped, k_qx, block_len,
+                    )
+                else:
+                    k_block = self._tq_k_quantizer.dequantize(k_qx).reshape(
+                        nkv, block_len, self.r_k,
+                    )
+                    logits = self._compute_grouped_k_logits(q_grouped, k_block)
+
+                v_block = self._tq_v_quantizer.dequantize(v_qx).reshape(
+                    nkv, block_len, self.r_v,
+                )
+                running_max, running_sum, running_out = self._stream_softmax_block(
+                    logits * scale,
+                    v_block,
+                    running_max,
+                    running_sum,
+                    running_out,
+                )
+
+        if recent_k is not None and recent_v is not None:
+            recent_logits = self._compute_grouped_k_logits(q_grouped, recent_k)
+            running_max, running_sum, running_out = self._stream_softmax_block(
+                recent_logits * scale,
+                recent_v,
+                running_max,
+                running_sum,
+                running_out,
+            )
+
+        current_k = k_lat[0]
+        current_v = v_lat[0]
+        current_logits = self._compute_grouped_k_logits(q_grouped, current_k)
+        running_max, running_sum, running_out = self._stream_softmax_block(
+            current_logits * scale,
+            current_v,
+            running_max,
+            running_sum,
+            running_out,
+        )
+
+        attn_output = running_out / running_sum.clamp_min(1e-20).unsqueeze(-1)
+        return attn_output.reshape(1, self.num_heads, 1, self.r_v).to(q_lat.dtype)
+
     def _compute_archive_k_logits_approx(
         self,
         q_lat: torch.Tensor,
@@ -1461,7 +1747,7 @@ class HAWPAttention(nn.Module):
 
         if hasattr(instance, "rotary_emb") and attn_module is not None and hasattr(attn_module, "rotary_emb") and hasattr(attn_module.rotary_emb, "inv_freq"):
             instance.rotary_emb.inv_freq.data.copy_(attn_module.rotary_emb.inv_freq.data)
-            instance.rotary_emb._set_cos_sin_cache(instance.rotary_emb.max_seq_len_cached)
+            instance.rotary_emb._set_cos_sin_cache(0)
 
         return instance
 

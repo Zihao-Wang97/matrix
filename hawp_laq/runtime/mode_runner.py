@@ -23,6 +23,7 @@ from hawp_laq.runtime.cache_stats import (
     collect_cache_stats_from_tracker,
     compute_baseline_kv_bytes,
 )
+from hawp_laq.runtime.forward_utils import prefill_forward_last_logits
 from hawp_laq.runtime.past_kv_tracker import PastKVTracker
 
 
@@ -159,7 +160,8 @@ def profile_generate_by_mode(
         prefill_mask = torch.ones(bsz, prompt_len, device=model.device, dtype=torch.long)
         prefill_pos = torch.arange(prompt_len, device=model.device, dtype=torch.long).unsqueeze(0)
 
-        outputs = model(
+        outputs = prefill_forward_last_logits(
+            model,
             input_ids=input_ids,
             attention_mask=prefill_mask,
             position_ids=prefill_pos,

@@ -31,6 +31,7 @@ class LlamaRotaryEmbedding(nn.Module):
         max_position_embeddings: int = 2048,
         base: float = 10000.0,
         rope_scaling: dict | None = None,
+        init_cache_len: int = 0,
     ):
         super().__init__()
         self.dim = dim
@@ -59,7 +60,7 @@ class LlamaRotaryEmbedding(nn.Module):
 
         inv_freq = self._compute_inv_freq(seq_len=max_position_embeddings)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._set_cos_sin_cache(seq_len=max_position_embeddings)
+        self._set_cos_sin_cache(seq_len=init_cache_len)
 
     def _compute_inv_freq(self, seq_len: int | None = None) -> torch.Tensor:
         base = self.base

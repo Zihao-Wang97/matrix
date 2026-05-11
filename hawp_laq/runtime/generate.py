@@ -10,6 +10,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from hawp_laq.config import HAWPLAQConfig, load_config, build_k_quantizer, build_v_quantizer, resolve_projector_ranks, load_projector_ranks_from_dir
 from hawp_laq.modeling.attention_hawp import HAWPAttention
 from hawp_laq.modeling.modeling_llama_hawp import convert_llama_to_hawp, _align_hawp_params_device_dtype
+from hawp_laq.runtime.forward_utils import prefill_forward_last_logits
 from hawp_laq.runtime.pure_quant_hook import PureQuantKVManager, install_pure_quant_hooks
 
 _DTYPE_MAP = {
@@ -203,7 +204,8 @@ def stepwise_greedy_generate(
             prompt_len, device=model.device, dtype=torch.long,
         ).unsqueeze(0)
 
-        outputs = model(
+        outputs = prefill_forward_last_logits(
+            model,
             input_ids=input_ids,
             attention_mask=prefill_mask,
             position_ids=prefill_pos,
@@ -298,7 +300,8 @@ def generate_hawp_quant(
             prompt_len, device=model.device, dtype=torch.long,
         ).unsqueeze(0)
 
-        outputs = model(
+        outputs = prefill_forward_last_logits(
+            model,
             input_ids=input_ids,
             attention_mask=prefill_mask,
             position_ids=prefill_pos,
@@ -378,7 +381,8 @@ def generate_pure_quant_only(
             prompt_len, device=model.device, dtype=torch.long,
         ).unsqueeze(0)
 
-        outputs = model(
+        outputs = prefill_forward_last_logits(
+            model,
             input_ids=input_ids,
             attention_mask=prefill_mask,
             position_ids=prefill_pos,
