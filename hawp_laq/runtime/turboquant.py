@@ -5,7 +5,6 @@ import math
 
 import torch
 
-from hawp_laq.utils.math_utils import orthogonalize
 from hawp_laq.utils.packbits import pack_uint4, unpack_uint4, pack_uint2, unpack_uint2, pack_bool, unpack_bool
 
 
@@ -43,6 +42,7 @@ class TurboQuantState:
     group_size: int
     dim: int
     use_rotation: bool
+    rotation_seed: int | None = None
 
 
 @dataclass
@@ -109,6 +109,7 @@ class TurboQuantMSE:
         use_rotation: bool = True,
         group_size: int | None = None,
         device: torch.device | str | None = None,
+        rotation_seed: int | None = None,
     ) -> None:
         if dim <= 0:
             raise ValueError(f"dim must be positive, got {dim}")
@@ -122,29 +123,85 @@ class TurboQuantMSE:
         if self.group_size <= 0:
             raise ValueError(f"group_size must be positive, got {self.group_size}")
         self.device = torch.device(device) if device is not None else None
+        if rotation_seed is not None:
+            self.rotation_seed = int(rotation_seed)
+        elif self.use_rotation:
+            self.rotation_seed = int(torch.empty((), dtype=torch.int64).random_().item())
+        else:
+            self.rotation_seed = 0
 
-        self._rotation: torch.Tensor | None = None
-        if self.use_rotation:
-            self.build_rotation()
+        self._rotation_cache: torch.Tensor | None = None
 
     # ------------------------------------------------------------------
     # Rotation
     # ------------------------------------------------------------------
 
-    def build_rotation(self) -> torch.Tensor:
-        """Generate a new random orthogonal rotation matrix of shape [dim, dim].
+    @property
+    def _rotation(self) -> torch.Tensor | None:
+        """Lazily materialized orthogonal rotation matrix.
 
-        Overwrites any previously stored rotation.  Can be called multiple
-        times to re-initialize.
+        Kept as ``_rotation`` for compatibility with existing tests and callers.
+        """
+        if not self.use_rotation:
+            return None
+        dev = self.device or torch.device("cpu")
+        return self._materialize_rotation(dev)
+
+    @_rotation.setter
+    def _rotation(self, value: torch.Tensor | None) -> None:
+        self._rotation_cache = value
+
+    def _make_generator(self, device: torch.device) -> torch.Generator:
+        if device.type == "cuda":
+            generator = torch.Generator(device=device)
+        else:
+            generator = torch.Generator()
+        generator.manual_seed(int(self.rotation_seed))
+        return generator
+
+    def _materialize_rotation(self, device: torch.device) -> torch.Tensor:
+        if (
+            self._rotation_cache is not None
+            and self._rotation_cache.device == device
+        ):
+            return self._rotation_cache
+
+        generator = self._make_generator(device)
+        weight = torch.randn(
+            self.dim,
+            self.dim,
+            device=device,
+            dtype=torch.float32,
+            generator=generator,
+        )
+        q, r = torch.linalg.qr(weight, mode="reduced")
+        signs = torch.where(
+            torch.diagonal(r) < 0,
+            torch.full((), -1.0, device=device, dtype=q.dtype),
+            torch.full((), 1.0, device=device, dtype=q.dtype),
+        )
+        self._rotation_cache = q * signs.unsqueeze(0)
+        return self._rotation_cache
+
+    def build_rotation(self, seed: int | None = None) -> torch.Tensor:
+        """Generate and cache an orthogonal rotation matrix of shape [dim, dim].
+
+        When ``seed`` is omitted, a fresh seed is sampled so explicit rebuilds
+        keep their historical "new random rotation" behavior. Normal quantize
+        and dequantize paths use the existing seed and lazy cache.
 
         Returns:
             The newly created rotation matrix.
         """
+        if not self.use_rotation:
+            self._rotation_cache = None
+            return None
+        if seed is None:
+            seed = int(torch.empty((), dtype=torch.int64).random_().item())
+        self.rotation_seed = int(seed)
+        self._rotation_cache = None
         dev = self.device or torch.device("cpu")
-        R = torch.randn(self.dim, self.dim, device=dev)
-        R = orthogonalize(R)
-        self._rotation = R
-        return R
+        return self._materialize_rotation(dev)
 
     # ------------------------------------------------------------------
     # State export / import
@@ -153,11 +210,12 @@ class TurboQuantMSE:
     def get_state(self) -> TurboQuantState:
         """Return a serialisable snapshot of the quantiser configuration."""
         return TurboQuantState(
-            rotation=self._rotation.detach().clone() if self._rotation is not None else None,
+            rotation=None,
             bits=self.bits,
             group_size=self.group_size,
             dim=self.dim,
             use_rotation=self.use_rotation,
+            rotation_seed=self.rotation_seed,
         )
 
     @classmethod
@@ -170,6 +228,7 @@ class TurboQuantMSE:
             use_rotation=state.use_rotation,
             group_size=state.group_size,
             device=dev,
+            rotation_seed=getattr(state, "rotation_seed", None),
         )
         if state.rotation is not None:
             tq._rotation = state.rotation
@@ -218,8 +277,8 @@ class TurboQuantMSE:
 
         # --- Step 1: optional rotation ---
         rotation: torch.Tensor | None = None
-        if self.use_rotation and self._rotation is not None:
-            rotation = self._rotation.to(x_2d.device, torch.float32)
+        if self.use_rotation:
+            rotation = self._materialize_rotation(x_2d.device).to(torch.float32)
             x_2d = x_2d @ rotation.T
 
         # --- Step 2: group-based affine quantization ---
@@ -242,13 +301,19 @@ class TurboQuantMSE:
         # Extend range to include 0 so that zero_point is always valid
         x_min = x_grouped.amin(dim=-1, keepdim=True)
         x_max = x_grouped.amax(dim=-1, keepdim=True)
-        x_min = torch.minimum(x_min, torch.zeros_like(x_min))
-        x_max = torch.maximum(x_max, torch.zeros_like(x_max))
+        x_min.clamp_(max=0.0)
+        x_max.clamp_(min=0.0)
 
-        scale = (x_max - x_min).clamp(min=1e-8) / max_val
-        zero_point = torch.round(-x_min / scale).clamp(0, max_val)
+        scale = x_max.sub_(x_min).clamp_(min=1e-8).div_(max_val)
+        zero_point = x_min.neg_().div_(scale).round_().clamp_(0, max_val)
 
-        q_grouped = torch.round(x_grouped / scale + zero_point).clamp(0, max_val).to(torch.uint8)
+        q_work = torch.empty_like(x_grouped)
+        torch.div(x_grouped, scale, out=q_work)
+        q_work.add_(zero_point)
+        q_work.round_()
+        q_work.clamp_(0, max_val)
+        q_grouped = q_work.to(torch.uint8)
+        del q_work
 
         # Remove padding and squeeze group dim
         q_flat = q_grouped.reshape(N, D_padded)[:, :D]
@@ -271,7 +336,7 @@ class TurboQuantMSE:
             q=q_out,
             scale=scale_out,
             zero_point=zero_point_out,
-            rotation=rotation.detach().clone() if rotation is not None else None,
+            rotation=None,
             shape_orig=shape_orig,
             bits=self.bits,
             group_size=gs,
@@ -324,8 +389,11 @@ class TurboQuantMSE:
         x_2d = x_grouped.reshape(N, D_padded)[:, :D]
 
         # Inverse rotation
-        if qx.rotation is not None:
-            rot = qx.rotation.to(x_2d.device, x_2d.dtype)
+        rotation = qx.rotation
+        if rotation is None and self.use_rotation:
+            rotation = self._materialize_rotation(x_2d.device)
+        if rotation is not None:
+            rot = rotation.to(x_2d.device, x_2d.dtype)
             x_2d = x_2d @ rot
 
         return x_2d.reshape(qx.shape_orig)
@@ -371,7 +439,7 @@ class TurboQuantMSE:
         scale_bytes = N * n_groups * 4  # float32
         zp_bytes = N * n_groups * 1  # uint8
 
-        # Rotation matrix (shared, counted once)
+        # Rotation is owned by the quantizer and shared across chunks.
         rot_bytes = 0
         if qx.rotation is not None:
             rot_bytes = qx.rotation.nelement() * 4  # float32
@@ -448,6 +516,7 @@ class TurboQuantProd:
         use_rotation: bool = True,
         group_size: int | None = None,
         device: torch.device | str | None = None,
+        rotation_seed: int | None = None,
     ) -> None:
         if dim <= 0:
             raise ValueError(f"dim must be positive, got {dim}")
@@ -462,15 +531,24 @@ class TurboQuantProd:
             use_rotation=use_rotation,
             group_size=self.group_size,
             device=device,
+            rotation_seed=rotation_seed,
         )
 
-    def build_rotation(self) -> torch.Tensor:
+    def build_rotation(self, seed: int | None = None) -> torch.Tensor:
         """Rebuild the random orthogonal rotation (delegated to MSE stage)."""
-        return self._mse_quantizer.build_rotation()
+        return self._mse_quantizer.build_rotation(seed=seed)
 
     @property
     def _rotation(self) -> torch.Tensor | None:
         return self._mse_quantizer._rotation
+
+    @_rotation.setter
+    def _rotation(self, value: torch.Tensor | None) -> None:
+        self._mse_quantizer._rotation = value
+
+    @property
+    def rotation_seed(self) -> int:
+        return self._mse_quantizer.rotation_seed
 
     def quantize(
         self,
@@ -514,11 +592,12 @@ class TurboQuantProd:
         x_hat = self._mse_quantizer.dequantize(mse_result)
         x_hat_flat = x_hat.reshape(-1, self.dim)
 
-        # Stage 2: 1-bit residual
-        residual = x_flat - x_hat_flat
-        residual_sign = residual >= 0  # bool [N, D]
+        # Stage 2: 1-bit residual. Reuse x_hat's storage as residual scratch.
+        x_hat_flat.neg_().add_(x_flat)
+        residual_sign = x_hat_flat >= 0  # bool [N, D]
         residual_sign_packed = pack_bool(residual_sign)
-        residual_norm = residual.norm(dim=-1)  # [N]
+        del residual_sign
+        residual_norm = x_hat_flat.norm(dim=-1)  # [N]
 
         return TurboQuantProdResult(
             mse=mse_result,

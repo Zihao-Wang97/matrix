@@ -8,6 +8,7 @@ build/
 *.egg
 artifacts/
 data/
+pingfen/
 .pytest_cache/
 .mypy_cache/
 *.pt

@@ -205,11 +205,13 @@ class HAWPAttention(nn.Module):
             self.q_proj = None
             self.k_proj = None
             self.v_proj = None
+            self.v_lat_proj = None
             self.o_proj = None
         else:
             self.q_proj = nn.Linear(self.hidden_size, q_out, bias=use_bias)
             self.k_proj = nn.Linear(self.hidden_size, kv_out, bias=use_bias)
             self.v_proj = nn.Linear(self.hidden_size, kv_out, bias=use_bias)
+            self.v_lat_proj = None
             self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=use_bias)
 
         self._use_rope = not (self.is_opt or self.is_gpt_neox)
@@ -263,7 +265,12 @@ class HAWPAttention(nn.Module):
         self.decode_archive_block_size = 1024
         self.use_prefill_grouped_attention = True
         self.use_prefill_fused_value_o_proj = True
+        self.use_prefill_fused_v_latent = True
         self.prefill_fused_o_proj_chunk_size = 2048
+        self._full_v_proj_offloaded = False
+        self._fused_v_lat_weight = None
+        self._fused_v_lat_bias = None
+        self._fused_v_lat_cache_key = None
 
         self.use_quantizer = False
         self.use_cache_manager = False
@@ -310,6 +317,66 @@ class HAWPAttention(nn.Module):
         self._tq_k_quantizer = k_quantizer
         self._tq_v_quantizer = v_quantizer
         self.reset_quant_cache()
+
+    def materialize_v_lat_proj(self, *, offload_full_v_proj: bool = True) -> bool:
+        """Build an inference-only V->latent projection and optionally move full V off GPU."""
+        if self.r_v >= self.head_dim:
+            return False
+        if self.v_proj is None:
+            return self.v_lat_proj is not None
+
+        weight = self.v_proj.weight
+        bias = getattr(self.v_proj, "bias", None)
+        device = weight.device
+        dtype = _resolve_compute_dtype(self.v_proj)
+        use_bias = bias is not None
+
+        with torch.no_grad():
+            v_weight = weight.detach().to(device=device, dtype=dtype)
+            v_weight = v_weight.view(self.num_key_value_heads, self.head_dim, self.hidden_size)
+            pv_down = self.p_v.detach()[:, :self.r_v].to(device=device, dtype=dtype)
+            fused_weight = torch.einsum("odh,dr->orh", v_weight, pv_down).reshape(
+                self.num_key_value_heads * self.r_v,
+                self.hidden_size,
+            ).contiguous()
+
+            fused_bias = None
+            if use_bias:
+                v_bias = bias.detach().to(device=device, dtype=dtype).view(
+                    self.num_key_value_heads,
+                    self.head_dim,
+                )
+                fused_bias = torch.einsum("od,dr->or", v_bias, pv_down).reshape(
+                    self.num_key_value_heads * self.r_v,
+                ).contiguous()
+
+            v_lat_proj = nn.Linear(
+                self.hidden_size,
+                self.num_key_value_heads * self.r_v,
+                bias=use_bias,
+                device=device,
+                dtype=dtype,
+            )
+            v_lat_proj.weight.copy_(fused_weight)
+            if use_bias and fused_bias is not None:
+                v_lat_proj.bias.copy_(fused_bias)
+
+        self.v_lat_proj = v_lat_proj
+        self._fused_v_lat_weight = None
+        self._fused_v_lat_bias = None
+        self._fused_v_lat_cache_key = None
+
+        if offload_full_v_proj:
+            try:
+                self.v_proj.to("cpu")
+                self._full_v_proj_offloaded = True
+            except Exception as exc:
+                logger.warning("Failed to offload full v_proj to CPU; keeping it on %s: %s", device, exc)
+                self._full_v_proj_offloaded = False
+        else:
+            self._full_v_proj_offloaded = False
+
+        return True
 
     def reset_quant_cache(self) -> None:
         self._recent_k_buffer = None
@@ -378,25 +445,13 @@ class HAWPAttention(nn.Module):
             shape=tuple(k_flat.shape),
             dtype=str(k_flat.dtype).replace("torch.", ""),
         )
-        v_flat = v_new.reshape(nkv * T, rv).float()
-        self._mark_memory(
-            "quantize_to_chunk.v_flat.after",
-            T=int(T),
-            shape=tuple(v_flat.shape),
-            dtype=str(v_flat.dtype).replace("torch.", ""),
-        )
         self._mark_memory("quantize_to_chunk.k_quant.before", T=int(T))
         k_qx = self._tq_k_quantizer.quantize(
             k_flat,
             logical_shape=(nkv, T, rk),
         )
         self._mark_memory("quantize_to_chunk.k_quant.after", T=int(T))
-        self._mark_memory("quantize_to_chunk.v_quant.before", T=int(T))
-        v_qx = self._tq_v_quantizer.quantize(
-            v_flat,
-            logical_shape=(nkv, T, rv),
-        )
-        self._mark_memory("quantize_to_chunk.v_quant.after", T=int(T))
+        del k_flat
         k_norms = k_new.float().norm(dim=2).to(torch.float16)
         self._mark_memory(
             "quantize_to_chunk.k_norms.after",
@@ -404,6 +459,20 @@ class HAWPAttention(nn.Module):
             shape=tuple(k_norms.shape),
             dtype=str(k_norms.dtype).replace("torch.", ""),
         )
+        v_flat = v_new.reshape(nkv * T, rv).float()
+        self._mark_memory(
+            "quantize_to_chunk.v_flat.after",
+            T=int(T),
+            shape=tuple(v_flat.shape),
+            dtype=str(v_flat.dtype).replace("torch.", ""),
+        )
+        self._mark_memory("quantize_to_chunk.v_quant.before", T=int(T))
+        v_qx = self._tq_v_quantizer.quantize(
+            v_flat,
+            logical_shape=(nkv, T, rv),
+        )
+        self._mark_memory("quantize_to_chunk.v_quant.after", T=int(T))
+        del v_flat
         return _QuantChunk(k_qx, v_qx, T, k_norms)
 
     def _ensure_recent_buffer(self, k_new: torch.Tensor, v_new: torch.Tensor) -> None:
@@ -560,9 +629,11 @@ class HAWPAttention(nn.Module):
             )
         old_rot = old_qx.rotation
         new_rot = new_qx.rotation
-        if (old_rot is None) != (new_rot is None):
-            raise RuntimeError("rotation mismatch: one quantized tensor has rotation and the other does not")
-        if old_rot is not None and not torch.equal(old_rot, new_rot.to(old_rot.device, old_rot.dtype)):
+        if (
+            old_rot is not None
+            and new_rot is not None
+            and not torch.equal(old_rot, new_rot.to(old_rot.device, old_rot.dtype))
+        ):
             raise RuntimeError("rotation mismatch between quantized tensors")
 
     @staticmethod
@@ -687,7 +758,7 @@ class HAWPAttention(nn.Module):
                 shape_orig=(nkv * (old_T + new_T), dim),
                 bits=old_mse.bits,
                 group_size=old_mse.group_size,
-                rotation=old_mse.rotation,
+                rotation=old_mse.rotation if old_mse.rotation is not None else new_mse.rotation,
                 logical_shape=merged_logical_shape,
             )
             return TurboQuantProdResult(
@@ -714,7 +785,7 @@ class HAWPAttention(nn.Module):
                 shape_orig=(nkv * (old_T + new_T), dim),
                 bits=old_qx.bits,
                 group_size=old_qx.group_size,
-                rotation=old_qx.rotation,
+                rotation=old_qx.rotation if old_qx.rotation is not None else new_qx.rotation,
                 logical_shape=merged_logical_shape,
             )
 
@@ -929,6 +1000,7 @@ class HAWPAttention(nn.Module):
         bsz, q_len, _ = hidden_states.size()
         parent_use_cache = self._consume_opt_parent_use_cache()
         effective_use_cache = use_cache or parent_use_cache
+        low_rank_path = self._is_low_rank or self.use_cache_manager
 
         if self.is_opt:
             query_states = self.q_proj(hidden_states) * self.scaling
@@ -936,11 +1008,43 @@ class HAWPAttention(nn.Module):
             query_states = self.q_proj(hidden_states)
 
         key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        value_states = None
+        v_lat_fused = None
+        if (
+            low_rank_path
+            and self._calib_callback is None
+            and self.v_lat_proj is not None
+            and getattr(self, "use_prefill_fused_v_latent", True)
+            and not torch.is_grad_enabled()
+        ):
+            v_lat_fused = self._project_hidden_to_v_latent(hidden_states, q_len=q_len)
+        else:
+            value_states = self._project_hidden_to_full_v(hidden_states)
+        self._mark_memory(
+            "full_qkv.proj.after",
+            q_len=int(q_len),
+            q_shape=tuple(query_states.shape),
+            k_shape=tuple(key_states.shape),
+            v_shape=tuple(value_states.shape) if value_states is not None else None,
+            v_lat_shape=tuple(v_lat_fused.shape) if v_lat_fused is not None else None,
+            v_fused=bool(v_lat_fused is not None),
+            is_prefill=bool(q_len > 1),
+        )
 
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        if value_states is not None:
+            value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        self._mark_memory(
+            "full_qkv.view.after",
+            q_len=int(q_len),
+            q_shape=tuple(query_states.shape),
+            k_shape=tuple(key_states.shape),
+            v_shape=tuple(value_states.shape) if value_states is not None else None,
+            v_lat_shape=tuple(v_lat_fused.shape) if v_lat_fused is not None else None,
+            v_fused=bool(v_lat_fused is not None),
+            is_prefill=bool(q_len > 1),
+        )
 
         if self._use_rope:
             if position_embeddings is not None:
@@ -950,20 +1054,57 @@ class HAWPAttention(nn.Module):
                     seq_len_for_rope = position_ids.max().item() + 1
                 else:
                     seq_len_for_rope = q_len
-                cos, sin = self.rotary_emb(value_states, seq_len=seq_len_for_rope)
+                cos, sin = self.rotary_emb(key_states, seq_len=seq_len_for_rope)
                 if position_ids is not None:
                     cos = cos[position_ids].unsqueeze(1)
                     sin = sin[position_ids].unsqueeze(1)
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            self._mark_memory(
+                "full_qkv.rope.after",
+                q_len=int(q_len),
+                q_shape=tuple(query_states.shape),
+                k_shape=tuple(key_states.shape),
+                v_shape=tuple(value_states.shape) if value_states is not None else None,
+                v_lat_shape=tuple(v_lat_fused.shape) if v_lat_fused is not None else None,
+                v_fused=bool(v_lat_fused is not None),
+                is_prefill=bool(q_len > 1),
+            )
 
         if self._calib_callback is not None:
             self._calib_callback(self.layer_idx, query_states, key_states, value_states)
 
-        if self._is_low_rank or self.use_cache_manager:
+        if low_rank_path:
+            q_lat, k_lat, v_lat, pk_down, pv_down = self._project_full_qkv_to_latent(
+                query_states,
+                key_states,
+                value_states,
+                v_lat=v_lat_fused,
+                q_len=q_len,
+            )
+            query_dtype = query_states.dtype
+            kv_seq_len = key_states.shape[-2]
+            del query_states, key_states, value_states, v_lat_fused
+            self._mark_memory(
+                "low_rank.full_qkv.release.after",
+                q_len=int(q_len),
+                is_prefill=bool(q_len > 1),
+            )
             return self._forward_low_rank(
-                query_states, key_states, value_states,
+                None, None, None,
                 attention_mask, past_key_value, effective_use_cache,
-                cache_position, **kwargs,
+                cache_position,
+                precomputed_latents=(
+                    q_lat,
+                    k_lat,
+                    v_lat,
+                    pk_down,
+                    pv_down,
+                    bsz,
+                    q_len,
+                    kv_seq_len,
+                    query_dtype,
+                ),
+                **kwargs,
             )
 
         if past_key_value is not None:
@@ -1045,19 +1186,25 @@ class HAWPAttention(nn.Module):
         attn_output = torch.matmul(attn_weights, value)
         return attn_output, attn_weights
 
-    def _forward_low_rank(
+    def _project_full_qkv_to_latent(
         self,
         query_states: torch.Tensor,
         key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
-        past_key_value,
-        effective_use_cache: bool,
-        cache_position: Optional[torch.Tensor],
-        **kwargs,
-    ):
-        bsz = query_states.size(0)
-        q_len = query_states.size(2)
+        value_states: Optional[torch.Tensor],
+        *,
+        v_lat: Optional[torch.Tensor] = None,
+        q_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        self._mark_memory(
+            "low_rank.full_qkv.entry",
+            q_len=int(q_len),
+            q_shape=tuple(query_states.shape),
+            k_shape=tuple(key_states.shape),
+            v_shape=tuple(value_states.shape) if value_states is not None else None,
+            v_lat_shape=tuple(v_lat.shape) if v_lat is not None else None,
+            v_fused=bool(v_lat is not None),
+            is_prefill=bool(q_len > 1),
+        )
 
         pk_down = self.p_k[:, :self.r_k].to(device=query_states.device, dtype=query_states.dtype)
         pv_down = self.p_v[:, :self.r_v].to(device=query_states.device, dtype=query_states.dtype)
@@ -1071,8 +1218,163 @@ class HAWPAttention(nn.Module):
         self._mark_memory("low_rank.q_lat.after", q_len=int(q_len), shape=tuple(q_lat.shape))
         k_lat = key_states @ pk_down
         self._mark_memory("low_rank.k_lat.after", q_len=int(q_len), shape=tuple(k_lat.shape))
-        v_lat = value_states @ pv_down
-        self._mark_memory("low_rank.v_lat.after", q_len=int(q_len), shape=tuple(v_lat.shape))
+        if v_lat is None:
+            if value_states is None:
+                raise RuntimeError("full V tensor is required when fused v_lat is not provided")
+            v_lat = value_states @ pv_down
+            self._mark_memory("low_rank.v_lat.after", q_len=int(q_len), shape=tuple(v_lat.shape), fused=False)
+        else:
+            self._mark_memory("low_rank.v_lat.after", q_len=int(q_len), shape=tuple(v_lat.shape), fused=True)
+        self._mark_memory(
+            "low_rank.latent_qkv.after",
+            q_len=int(q_len),
+            q_shape=tuple(q_lat.shape),
+            k_shape=tuple(k_lat.shape),
+            v_shape=tuple(v_lat.shape),
+            is_prefill=bool(q_len > 1),
+        )
+        return q_lat, k_lat, v_lat, pk_down, pv_down
+
+    def _project_hidden_to_v_latent(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        q_len: int,
+    ) -> torch.Tensor:
+        if self.v_lat_proj is None:
+            fused_weight, fused_bias = self._get_fused_v_latent_params(hidden_states)
+            v_lat = F.linear(hidden_states, fused_weight, fused_bias)
+            source = "cached_weight"
+        else:
+            if self.v_lat_proj.weight.device != hidden_states.device:
+                self.v_lat_proj.to(device=hidden_states.device, dtype=hidden_states.dtype)
+            v_lat = self.v_lat_proj(hidden_states)
+            source = "v_lat_proj"
+        v_lat = v_lat.view(
+            hidden_states.shape[0],
+            q_len,
+            self.num_key_value_heads,
+            self.r_v,
+        ).transpose(1, 2)
+        self._mark_memory(
+            "low_rank.v_lat.fused.after",
+            q_len=int(q_len),
+            shape=tuple(v_lat.shape),
+            source=source,
+        )
+        return v_lat
+
+    def _project_hidden_to_full_v(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.v_proj is None:
+            raise RuntimeError("full V projection is unavailable; v_lat_proj inference path is required")
+        if self.v_proj.weight.device != hidden_states.device:
+            self.v_proj.to(device=hidden_states.device, dtype=hidden_states.dtype)
+            self._full_v_proj_offloaded = False
+        return self.v_proj(hidden_states)
+
+    def _get_fused_v_latent_params(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        weight = self.v_proj.weight
+        bias = getattr(self.v_proj, "bias", None)
+        cache_key = (
+            weight.data_ptr(),
+            getattr(weight, "_version", 0),
+            None if bias is None else bias.data_ptr(),
+            None if bias is None else getattr(bias, "_version", 0),
+            self.p_v.data_ptr(),
+            getattr(self.p_v, "_version", 0),
+            hidden_states.device,
+            hidden_states.dtype,
+            self.num_key_value_heads,
+            self.head_dim,
+            self.hidden_size,
+            self.r_v,
+        )
+        if (
+            self._fused_v_lat_cache_key == cache_key
+            and self._fused_v_lat_weight is not None
+            and self._fused_v_lat_weight.device == hidden_states.device
+            and self._fused_v_lat_weight.dtype == hidden_states.dtype
+        ):
+            return self._fused_v_lat_weight, self._fused_v_lat_bias
+
+        with torch.no_grad():
+            v_weight = weight.detach().to(device=hidden_states.device, dtype=hidden_states.dtype)
+            v_weight = v_weight.view(self.num_key_value_heads, self.head_dim, self.hidden_size)
+            pv_down = self.p_v.detach()[:, :self.r_v].to(
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+            fused_weight = torch.einsum("odh,dr->orh", v_weight, pv_down).reshape(
+                self.num_key_value_heads * self.r_v,
+                self.hidden_size,
+            ).contiguous()
+
+            fused_bias = None
+            if bias is not None:
+                v_bias = bias.detach().to(device=hidden_states.device, dtype=hidden_states.dtype).view(
+                    self.num_key_value_heads,
+                    self.head_dim,
+                )
+                fused_bias = torch.einsum("od,dr->or", v_bias, pv_down).reshape(
+                    self.num_key_value_heads * self.r_v,
+                ).contiguous()
+
+        self._fused_v_lat_weight = fused_weight
+        self._fused_v_lat_bias = fused_bias
+        self._fused_v_lat_cache_key = cache_key
+        self._mark_memory(
+            "low_rank.v_lat.fused_weight.cache_update.after",
+            shape=tuple(fused_weight.shape),
+            has_bias=bool(fused_bias is not None),
+        )
+        return fused_weight, fused_bias
+
+    def _forward_low_rank(
+        self,
+        query_states: Optional[torch.Tensor],
+        key_states: Optional[torch.Tensor],
+        value_states: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_value,
+        effective_use_cache: bool,
+        cache_position: Optional[torch.Tensor],
+        precomputed_latents: Optional[tuple] = None,
+        **kwargs,
+    ):
+        if precomputed_latents is None:
+            if query_states is None or key_states is None or value_states is None:
+                raise RuntimeError("full Q/K/V tensors are required when latents are not precomputed")
+            bsz = query_states.size(0)
+            q_len = query_states.size(2)
+            kv_seq_len = key_states.shape[-2]
+            query_dtype = query_states.dtype
+            q_lat, k_lat, v_lat, pk_down, pv_down = self._project_full_qkv_to_latent(
+                query_states,
+                key_states,
+                value_states,
+                q_len=q_len,
+            )
+            del query_states, key_states, value_states
+            self._mark_memory(
+                "low_rank.full_qkv.release.after",
+                q_len=int(q_len),
+                is_prefill=bool(q_len > 1),
+            )
+        else:
+            (
+                q_lat,
+                k_lat,
+                v_lat,
+                pk_down,
+                pv_down,
+                bsz,
+                q_len,
+                kv_seq_len,
+                query_dtype,
+            ) = precomputed_latents
 
         use_internal_quant_cache = (
             self.use_cache_manager
@@ -1094,7 +1396,7 @@ class HAWPAttention(nn.Module):
                 and not has_archive
                 and not has_recent
                 and q_len > 1
-                and _attention_mask_is_fully_visible(attention_mask, key_states.shape[-2])
+                and _attention_mask_is_fully_visible(attention_mask, kv_seq_len)
             ):
                 if (
                     getattr(self, "use_prefill_grouped_attention", True)
@@ -1186,6 +1488,7 @@ class HAWPAttention(nn.Module):
                 self._quant_cache_append_latent(k_lat, v_lat)
                 self._mark_memory("prefill.fast_path.cache_append.after", q_len=int(q_len))
                 del q_lat, k_lat, v_lat
+                self._mark_memory("prefill.fast_path.latent_qkv.release.after", q_len=int(q_len))
 
                 cache_passthrough = _cache_passthrough(past_key_value)
                 return self._format_attn_output(attn_output, None, cache_passthrough)
@@ -1207,7 +1510,7 @@ class HAWPAttention(nn.Module):
                     logit_scale,
                 )
 
-                attn_output = self._decode_value_latent(attn_output_lat.to(query_states.dtype), pv_down)
+                attn_output = self._decode_value_latent(attn_output_lat.to(query_dtype), pv_down)
                 attn_output = attn_output.transpose(1, 2).contiguous()
                 attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
                 attn_output = self.o_proj(attn_output)
@@ -1250,7 +1553,7 @@ class HAWPAttention(nn.Module):
             if causal_mask is not None:
                 attn_weights = attn_weights + causal_mask
 
-            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_dtype)
             attn_output_lat = torch.matmul(attn_weights, v_full_expanded)
 
             attn_output = self._decode_value_latent(attn_output_lat, pv_down)
@@ -1307,7 +1610,7 @@ class HAWPAttention(nn.Module):
         if causal_mask is not None:
             attn_weights = attn_weights + causal_mask
 
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_dtype)
         attn_output_lat = torch.matmul(attn_weights, v_lat_expanded)
 
         attn_output = self._decode_value_latent(attn_output_lat, pv_down)

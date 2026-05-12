@@ -96,6 +96,8 @@ class CacheManager:
             )
 
         self._caches: list[LayerKVCache] = []
+        base_k_seed = int(getattr(k_quantizer, "rotation_seed", 0))
+        base_v_seed = int(getattr(v_quantizer, "rotation_seed", 0))
         for layer_idx in range(n_layers):
             from hawp_laq.runtime.turboquant import TurboQuantMSE, TurboQuantProd
             if isinstance(k_quantizer, TurboQuantProd):
@@ -103,17 +105,20 @@ class CacheManager:
                     dim=self.k_dim, bits=k_quantizer.bits,
                     use_rotation=k_quantizer.use_rotation,
                     group_size=k_quantizer.group_size,
+                    rotation_seed=base_k_seed + layer_idx,
                 )
             else:
                 kq = TurboQuantMSE(
                     dim=self.k_dim, bits=k_quantizer.bits,
                     use_rotation=k_quantizer.use_rotation,
                     group_size=k_quantizer.group_size,
+                    rotation_seed=base_k_seed + layer_idx,
                 )
             vq = TurboQuantMSE(
                 dim=self.v_dim, bits=v_quantizer.bits,
                 use_rotation=v_quantizer.use_rotation,
                 group_size=v_quantizer.group_size,
+                rotation_seed=base_v_seed + layer_idx,
             )
             self._caches.append(LayerKVCache(
                 n_heads, head_dim, kq, vq, dtype=dtype,

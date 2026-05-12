@@ -459,11 +459,27 @@ def _resolve_hawp_ranks(cfg: HAWPLAQConfig, model, mode: str) -> tuple[int, int,
 
 
 def _setup_quant_cache_per_layer(model, cfg: HAWPLAQConfig, recent_window: int) -> None:
+    base_seed = int(getattr(cfg.quant, "rotation_seed", 0))
+    layer_idx = 0
     for module in model.modules():
         if isinstance(module, HAWPAttention):
-            k_q = build_k_quantizer(cfg, r_k=module.r_k)
-            v_q = build_v_quantizer(cfg, r_v=module.r_v)
+            seed = base_seed + layer_idx
+            k_q = build_k_quantizer(cfg, r_k=module.r_k, rotation_seed=seed)
+            v_q = build_v_quantizer(cfg, r_v=module.r_v, rotation_seed=seed)
             module.setup_quant_cache(k_q, v_q, recent_window=recent_window)
+            layer_idx += 1
+
+
+def _setup_v_lat_projection_replacement(model, mode: str) -> int:
+    n_replaced = 0
+    for module in model.modules():
+        if isinstance(module, HAWPAttention):
+            if module.materialize_v_lat_proj(offload_full_v_proj=True):
+                n_replaced += 1
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print(f"[{mode}] v_lat_proj replacement: modules={n_replaced} full_v_proj=cpu_offload")
+    return n_replaced
 
 
 def _setup_prefill_mlp_chunking(model, cfg: HAWPLAQConfig, mode: str) -> int:
@@ -667,6 +683,7 @@ def _convert_and_load_projectors(model, cfg, device, mode: str):
 
 def _setup_hawp_quant_on_model(model, cfg, device):
     model, r_k, r_v = _convert_and_load_projectors(model, cfg, device, "hawp_quant")
+    _setup_v_lat_projection_replacement(model, "hawp_quant")
     _setup_quant_cache_per_layer(model, cfg, recent_window=cfg.sched.recent_window)
     _setup_prefill_mlp_chunking(model, cfg, "hawp_quant")
     print(f"[hawp_quant] recent_window={cfg.sched.recent_window}")
@@ -675,6 +692,7 @@ def _setup_hawp_quant_on_model(model, cfg, device):
 
 def _setup_hawp_quant_all_on_model(model, cfg, device):
     model, r_k, r_v = _convert_and_load_projectors(model, cfg, device, "hawp_quant_all")
+    _setup_v_lat_projection_replacement(model, "hawp_quant_all")
     _setup_quant_cache_per_layer(model, cfg, recent_window=0)
     _setup_prefill_mlp_chunking(model, cfg, "hawp_quant_all")
     print(f"[hawp_quant_all] recent_window=0 (all tokens quantized)")

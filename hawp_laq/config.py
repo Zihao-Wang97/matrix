@@ -195,6 +195,7 @@ class QuantConfig:
     k_group_size: int = 128
     v_group_size: int = 128
     outlier_threshold: Optional[float] = None
+    rotation_seed: int = 0
 
 
 @dataclass
@@ -424,6 +425,7 @@ def build_k_quantizer(
     cfg: HAWPLAQConfig,
     r_k: int,
     device: str | None = None,
+    rotation_seed: int | None = None,
 ):
     """Build the K quantizer from config.
 
@@ -442,6 +444,7 @@ def build_k_quantizer(
         ValueError: If ``cfg.quant.k_method`` is not supported.
     """
     _check_method(cfg.quant.k_method)
+    rotation_seed = cfg.quant.rotation_seed if rotation_seed is None else rotation_seed
     if cfg.quant.k_method == "turbo_prod":
         from hawp_laq.runtime.turboquant import TurboQuantProd
         return TurboQuantProd(
@@ -450,6 +453,7 @@ def build_k_quantizer(
             use_rotation=cfg.quant.use_rotation_for_k,
             group_size=cfg.quant.k_group_size,
             device=device,
+            rotation_seed=rotation_seed,
         )
     from hawp_laq.runtime.turboquant import TurboQuantMSE
     return TurboQuantMSE(
@@ -458,6 +462,7 @@ def build_k_quantizer(
         use_rotation=cfg.quant.use_rotation_for_k,
         group_size=cfg.quant.k_group_size,
         device=device,
+        rotation_seed=rotation_seed,
     )
 
 
@@ -465,6 +470,7 @@ def build_v_quantizer(
     cfg: HAWPLAQConfig,
     r_v: int,
     device: str | None = None,
+    rotation_seed: int | None = None,
 ):
     """Build the V quantizer from config.
 
@@ -483,6 +489,7 @@ def build_v_quantizer(
         ValueError: If ``cfg.quant.v_method`` is not supported.
     """
     _check_method(cfg.quant.v_method)
+    rotation_seed = cfg.quant.rotation_seed if rotation_seed is None else rotation_seed
     if cfg.quant.v_method == "turbo_prod":
         from hawp_laq.runtime.turboquant import TurboQuantProd
         return TurboQuantProd(
@@ -491,6 +498,7 @@ def build_v_quantizer(
             use_rotation=cfg.quant.use_rotation_for_v,
             group_size=cfg.quant.v_group_size,
             device=device,
+            rotation_seed=rotation_seed,
         )
     from hawp_laq.runtime.turboquant import TurboQuantMSE
     return TurboQuantMSE(
@@ -499,6 +507,7 @@ def build_v_quantizer(
         use_rotation=cfg.quant.use_rotation_for_v,
         group_size=cfg.quant.v_group_size,
         device=device,
+        rotation_seed=rotation_seed,
     )
 
 
