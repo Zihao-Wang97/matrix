@@ -22,11 +22,11 @@ def get_calib_dataloader(
         samples.append(input_ids)
         if len(samples) >= nsamples:
             break
-    if dataset_name == "wikitext2" and len(samples) < nsamples:
+    if len(samples) < nsamples:
         raise RuntimeError(
-            f"wikitext2 calibration data is too short: built {len(samples)} samples "
+            f"{dataset_name} calibration data is too short: built {len(samples)} samples "
             f"but requested {nsamples} with seq_len={seq_len}. "
-            f"Check that {Path(data_root) / 'wikitext2_train.txt'} exists and is the full file."
+            f"Check that the calibration text under {Path(data_root)} is large enough."
         )
     return DataLoader(samples, batch_size=1, shuffle=False)
 
@@ -37,8 +37,9 @@ def _load_dataset_tokens(
     seed: int,
     data_root: str | Path = Path("./data"),
 ) -> list[int]:
+    data_root = Path(data_root)
     if dataset_name == "wikitext2":
-        local_txt = Path(data_root) / "wikitext2_train.txt"
+        local_txt = data_root / "wikitext2_train.txt"
         if local_txt.exists():
             text = local_txt.read_text(encoding="utf-8")
             print(f"[data] loaded local wikitext2 train: {local_txt} ({local_txt.stat().st_size} bytes)")
@@ -55,7 +56,18 @@ def _load_dataset_tokens(
                     f"{local_txt}, and online datasets loading failed."
                 )
     else:
-        text = _fallback_text()
+        dataset_path = Path(dataset_name)
+        if dataset_path.exists():
+            local_txt = dataset_path
+        else:
+            local_txt = data_root / f"{dataset_name}_train.txt"
+        if not local_txt.exists():
+            raise RuntimeError(
+                f"Cannot load calibration dataset '{dataset_name}'. Expected local text file at "
+                f"{local_txt}, or pass calib.dataset as an existing .txt path."
+            )
+        text = local_txt.read_text(encoding="utf-8")
+        print(f"[data] loaded local calib text: {local_txt} ({local_txt.stat().st_size} bytes)")
 
     enc = tokenizer(text, return_tensors="pt")
     return enc["input_ids"][0].tolist()

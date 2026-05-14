@@ -21,6 +21,7 @@ import math
 import random
 import re
 import statistics
+import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,8 +31,11 @@ from xml.etree import ElementTree as ET
 import torch
 
 from hawp_laq.config import load_config
+from hawp_laq.modeling.attention_hawp import HAWPAttention
+from hawp_laq.runtime.cache_stats import collect_cache_stats, compute_baseline_kv_bytes
 from hawp_laq.runtime.generate import _resolve_device, load_baseline_model
 from hawp_laq.runtime.mode_runner import generate_by_mode, make_reset_fn, setup_mode
+from hawp_laq.utils.memory import format_nbytes
 
 
 _SUPPORTED_MODES = ("baseline", "quant_only", "hawp_quant")
@@ -348,6 +352,11 @@ def summarize_predictions(rows: list[dict[str, Any]]) -> dict[str, Any]:
     valid = [r for r in rows if r.get("pred_score") is not None]
     errors = [float(r["pred_score"]) - float(r["human_score"]) for r in valid]
     abs_errors = [abs(e) for e in errors]
+    norm_abs_errors = [
+        abs(float(r["pred_score"]) - float(r["human_score"])) / float(r["full_score"])
+        for r in valid
+        if float(r.get("full_score") or 0.0) > 0.0
+    ]
     pred = [float(r["pred_score"]) for r in valid]
     human = [float(r["human_score"]) for r in valid]
     n = len(rows)
@@ -357,6 +366,7 @@ def summarize_predictions(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "valid_n": nv,
         "parse_fail_n": n - nv,
         "mae": statistics.mean(abs_errors) if abs_errors else None,
+        "normalized_mae": statistics.mean(norm_abs_errors) if norm_abs_errors else None,
         "rmse": math.sqrt(statistics.mean([e * e for e in errors])) if errors else None,
         "bias": statistics.mean(errors) if errors else None,
         "within_0_5": sum(e <= 0.5 for e in abs_errors) / nv if nv else None,
@@ -396,6 +406,212 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+class MemoryRecorder:
+    def __init__(self, *, enabled: bool, detail: bool, detail_samples: int, synchronize: bool = True) -> None:
+        self.enabled = enabled
+        self.detail = detail
+        self.detail_samples = max(0, int(detail_samples))
+        self.synchronize = synchronize
+        self.records: list[dict[str, Any]] = []
+        self.t0 = time.perf_counter()
+        self.current_sample_i: int | None = None
+        self._last_allocated = 0
+        self._last_peak = 0
+
+    def detail_active(self) -> bool:
+        return (
+            self.enabled
+            and self.detail
+            and self.current_sample_i is not None
+            and self.current_sample_i <= self.detail_samples
+        )
+
+    def reset_delta_baseline(self) -> None:
+        self._last_allocated = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
+        self._last_peak = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
+
+    def record(self, label: str, *, detail_only: bool = False, **meta: Any) -> None:
+        if not self.enabled:
+            return
+        if detail_only and not self.detail_active():
+            return
+        if torch.cuda.is_available() and self.synchronize:
+            torch.cuda.synchronize()
+        allocated = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
+        reserved = torch.cuda.memory_reserved() if torch.cuda.is_available() else 0
+        peak = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
+        rec = {
+            "i": len(self.records),
+            "t_s": round(time.perf_counter() - self.t0, 6),
+            "sample_i": self.current_sample_i,
+            "label": label,
+            "allocated_bytes": int(allocated),
+            "allocated": format_nbytes(int(allocated)),
+            "reserved_bytes": int(reserved),
+            "reserved": format_nbytes(int(reserved)),
+            "peak_allocated_bytes": int(peak),
+            "peak_allocated": format_nbytes(int(peak)),
+            "delta_allocated_bytes": int(allocated - self._last_allocated),
+            "delta_peak_bytes": int(peak - self._last_peak),
+            **meta,
+        }
+        rec["delta_allocated"] = format_nbytes(abs(rec["delta_allocated_bytes"]))
+        if rec["delta_allocated_bytes"] < 0:
+            rec["delta_allocated"] = "-" + rec["delta_allocated"]
+        rec["delta_peak"] = format_nbytes(abs(rec["delta_peak_bytes"]))
+        if rec["delta_peak_bytes"] < 0:
+            rec["delta_peak"] = "-" + rec["delta_peak"]
+        self.records.append(rec)
+        self._last_allocated = int(allocated)
+        self._last_peak = int(peak)
+
+
+def _shape_meta(value: Any) -> dict[str, Any]:
+    if isinstance(value, torch.Tensor):
+        return {
+            "shape": tuple(value.shape),
+            "dtype": str(value.dtype).replace("torch.", ""),
+            "device": str(value.device),
+        }
+    return {}
+
+
+def _collect_tensor_shapes(value: Any, *, limit: int = 4) -> list[tuple[int, ...]]:
+    shapes: list[tuple[int, ...]] = []
+
+    def visit(obj: Any) -> None:
+        if len(shapes) >= limit:
+            return
+        if isinstance(obj, torch.Tensor):
+            shapes.append(tuple(obj.shape))
+        elif isinstance(obj, (tuple, list)):
+            for item in obj:
+                visit(item)
+                if len(shapes) >= limit:
+                    break
+        elif hasattr(obj, "logits") and isinstance(obj.logits, torch.Tensor):
+            visit(obj.logits)
+
+    visit(value)
+    return shapes
+
+
+def _io_meta(value: Any, *, prefix: str) -> dict[str, Any]:
+    if isinstance(value, torch.Tensor):
+        meta = _shape_meta(value)
+        return {f"{prefix}_{k}": v for k, v in meta.items()}
+    shapes = _collect_tensor_shapes(value)
+    if shapes:
+        return {f"{prefix}_shapes": shapes}
+    return {}
+
+
+def _get_nested_attr(obj: Any, path: str) -> Any:
+    cur = obj
+    for part in path.split("."):
+        if cur is None or not hasattr(cur, part):
+            return None
+        cur = getattr(cur, part)
+    return cur
+
+
+def _find_transformer_layers(model) -> Any:
+    for path in ("model.layers", "model.decoder.layers", "transformer.h", "gpt_neox.layers"):
+        layers = _get_nested_attr(model, path)
+        if layers is not None:
+            return layers
+    return None
+
+
+def _find_final_norm(model) -> tuple[str, Any] | tuple[None, None]:
+    for path in (
+        "model.norm",
+        "model.decoder.final_layer_norm",
+        "model.final_layer_norm",
+        "transformer.ln_f",
+        "gpt_neox.final_layer_norm",
+    ):
+        mod = _get_nested_attr(model, path)
+        if mod is not None:
+            return path, mod
+    return None, None
+
+
+def install_memory_detail_probes(model, recorder: MemoryRecorder) -> int:
+    n_hooks = 0
+
+    def add_hooks(module, label: str, **meta: Any) -> None:
+        nonlocal n_hooks
+
+        def pre_hook(_module, args):
+            recorder.record(f"{label}.before", detail_only=True, **meta, **_io_meta(args, prefix="input"))
+
+        def post_hook(_module, args, output):
+            recorder.record(f"{label}.after", detail_only=True, **meta, **_io_meta(output, prefix="output"))
+
+        module.register_forward_pre_hook(pre_hook)
+        module.register_forward_hook(post_hook)
+        n_hooks += 2
+
+    layers = _find_transformer_layers(model)
+    if layers is not None:
+        for layer_idx, layer in enumerate(layers):
+            add_hooks(layer, f"model.layer{layer_idx}.block", layer=layer_idx, block_part="block")
+            self_attn = getattr(layer, "self_attn", None) or getattr(layer, "attention", None) or getattr(layer, "attn", None)
+            if self_attn is not None:
+                add_hooks(self_attn, f"model.layer{layer_idx}.self_attn", layer=layer_idx, block_part="self_attn")
+            mlp = getattr(layer, "mlp", None) or getattr(layer, "feed_forward", None) or getattr(layer, "ffn", None)
+            if mlp is not None:
+                add_hooks(mlp, f"model.layer{layer_idx}.mlp", layer=layer_idx, block_part="mlp")
+
+    norm_path, final_norm = _find_final_norm(model)
+    if final_norm is not None:
+        add_hooks(final_norm, "model.final_norm", module_path=norm_path, block_part="final_norm")
+
+    lm_head = getattr(model, "lm_head", None)
+    if lm_head is not None:
+        add_hooks(lm_head, "model.lm_head", block_part="lm_head")
+
+    for mod in model.modules():
+        if not isinstance(mod, HAWPAttention):
+            continue
+        layer_idx = getattr(mod, "layer_idx", None)
+
+        def marker_callback(_module, name, meta, __layer=layer_idx):
+            recorder.record(
+                f"hawp.layer{__layer}.marker.{name}",
+                detail_only=True,
+                layer=__layer,
+                block_part="hawp_marker",
+                marker=name,
+                **meta,
+            )
+
+        mod._memory_marker_callback = marker_callback
+        n_hooks += 1
+
+    return n_hooks
+
+
+def _cache_stats_dict(model, kv_manager, peak_gpu_bytes: int, baseline_kv_bytes: int) -> dict[str, Any]:
+    stats = collect_cache_stats(model, kv_manager, peak_gpu_bytes=peak_gpu_bytes)
+    stats.baseline_kv_bytes = int(baseline_kv_bytes)
+    return {
+        "cache_impl": stats.impl,
+        "cache_tokens_total": stats.cache_tokens_total,
+        "cache_runtime_bytes": stats.cache_runtime_bytes,
+        "cache_runtime": format_nbytes(stats.cache_runtime_bytes),
+        "cache_compressed_bytes": stats.cache_compressed_bytes,
+        "cache_compressed": format_nbytes(stats.cache_compressed_bytes),
+        "baseline_kv_bytes": stats.baseline_kv_bytes,
+        "baseline_kv": format_nbytes(stats.baseline_kv_bytes),
+        "kv_compression_ratio": stats.kv_compression_ratio,
+        "recent_tokens": stats.recent_tokens,
+        "archive_tokens": stats.archive_tokens,
+        "meta_bytes": stats.meta_bytes,
+    }
+
+
 @torch.inference_mode()
 def run_mode(
     cfg,
@@ -406,14 +622,30 @@ def run_mode(
     max_question_chars: int,
     max_ref_chars: int,
     max_answer_chars: int,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    profile_memory: bool,
+    profile_memory_detail: bool,
+    profile_memory_detail_samples: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any] | None]:
     print(f"\n[{mode}] loading model")
+    recorder = MemoryRecorder(
+        enabled=profile_memory,
+        detail=profile_memory_detail,
+        detail_samples=profile_memory_detail_samples,
+    )
+    if torch.cuda.is_available() and profile_memory:
+        torch.cuda.reset_peak_memory_stats()
+    recorder.record(f"{mode}.start")
     model, tokenizer, _ = load_baseline_model(cfg)
+    recorder.record(f"{mode}.model_load.after")
     model, coordinator, kv_manager = setup_mode(model, cfg, device, mode)
     model.eval()
     reset_fn = make_reset_fn(model, coordinator, kv_manager)
+    n_detail_hooks = install_memory_detail_probes(model, recorder) if profile_memory_detail else 0
+    recorder.record(f"{mode}.setup.after", n_detail_hooks=n_detail_hooks)
+    setup_allocated = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
 
     rows: list[dict[str, Any]] = []
+    memory_samples: list[dict[str, Any]] = []
     for i, sample in enumerate(samples, start=1):
         reset_fn()
         prompt = format_model_prompt(
@@ -425,7 +657,41 @@ def run_mode(
                 max_answer_chars=max_answer_chars,
             ),
         )
+        prompt_len = tokenizer(prompt, return_tensors="pt").input_ids.shape[1]
+        total_tokens_estimate = int(prompt_len + cfg.generation.max_new_tokens)
+        baseline_kv_bytes = compute_baseline_kv_bytes(model, total_tokens_estimate)
+        recorder.current_sample_i = i
+        if torch.cuda.is_available() and profile_memory:
+            torch.cuda.reset_peak_memory_stats()
+            recorder.reset_delta_baseline()
+        recorder.record(f"{mode}.sample{i}.generate.before", prompt_tokens=int(prompt_len))
         output = generate_by_mode(model, tokenizer, [prompt], cfg, mode, coordinator=coordinator, kv_manager=kv_manager)[0]
+        peak_gpu_bytes = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
+        allocated_after = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
+        reserved_after = torch.cuda.memory_reserved() if torch.cuda.is_available() else 0
+        cache_info = _cache_stats_dict(model, kv_manager, int(peak_gpu_bytes), int(baseline_kv_bytes)) if profile_memory else {}
+        memory_sample = {
+            "mode": mode,
+            "sample_i": i,
+            "excel_row": sample.row_index,
+            "prompt_tokens": int(prompt_len),
+            "max_new_tokens": int(cfg.generation.max_new_tokens),
+            "total_tokens_estimate": total_tokens_estimate,
+            "setup_allocated_bytes": int(setup_allocated),
+            "setup_allocated": format_nbytes(int(setup_allocated)),
+            "peak_gpu_bytes": int(peak_gpu_bytes),
+            "peak_gpu": format_nbytes(int(peak_gpu_bytes)),
+            "peak_over_setup_bytes": int(peak_gpu_bytes - setup_allocated),
+            "peak_over_setup": format_nbytes(max(0, int(peak_gpu_bytes - setup_allocated))),
+            "allocated_after_bytes": int(allocated_after),
+            "allocated_after": format_nbytes(int(allocated_after)),
+            "reserved_after_bytes": int(reserved_after),
+            "reserved_after": format_nbytes(int(reserved_after)),
+            **cache_info,
+        }
+        memory_samples.append(memory_sample)
+        recorder.record(f"{mode}.sample{i}.generate.after", **memory_sample)
+        recorder.current_sample_i = None
         pred_score, reason, parsed_json = parse_score_response(output, sample.full_score)
         row = {
             "mode": mode,
@@ -443,6 +709,8 @@ def run_mode(
             "raw_output": output,
             "student_answer": sample.student_answer,
         }
+        if profile_memory:
+            row.update(memory_sample)
         rows.append(row)
         if i == 1 or i % 10 == 0 or i == len(samples):
             print(
@@ -451,11 +719,39 @@ def run_mode(
             )
 
     summary = summarize_predictions(rows)
+    memory_profile = None
+    if profile_memory:
+        peak_values = [int(item["peak_gpu_bytes"]) for item in memory_samples]
+        over_setup_values = [int(item["peak_over_setup_bytes"]) for item in memory_samples]
+        cache_values = [int(item.get("cache_runtime_bytes") or 0) for item in memory_samples]
+        baseline_kv_values = [int(item.get("baseline_kv_bytes") or 0) for item in memory_samples]
+        memory_summary = {
+            "mode": mode,
+            "n_samples": len(memory_samples),
+            "setup_allocated_bytes": int(setup_allocated),
+            "setup_allocated": format_nbytes(int(setup_allocated)),
+            "peak_gpu_max_bytes": max(peak_values) if peak_values else 0,
+            "peak_gpu_max": format_nbytes(max(peak_values) if peak_values else 0),
+            "peak_over_setup_max_bytes": max(over_setup_values) if over_setup_values else 0,
+            "peak_over_setup_max": format_nbytes(max(over_setup_values) if over_setup_values else 0),
+            "cache_runtime_max_bytes": max(cache_values) if cache_values else 0,
+            "cache_runtime_max": format_nbytes(max(cache_values) if cache_values else 0),
+            "baseline_kv_max_bytes": max(baseline_kv_values) if baseline_kv_values else 0,
+            "baseline_kv_max": format_nbytes(max(baseline_kv_values) if baseline_kv_values else 0),
+            "n_detail_hooks": n_detail_hooks,
+            "n_memory_records": len(recorder.records),
+        }
+        summary.update(memory_summary)
+        memory_profile = {
+            "summary": memory_summary,
+            "samples": memory_samples,
+            "records": recorder.records,
+        }
     del model, tokenizer
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    return rows, summary
+    return rows, summary, memory_profile
 
 
 def main() -> None:
@@ -476,6 +772,9 @@ def main() -> None:
     parser.add_argument("--max-question-chars", type=int, default=6000)
     parser.add_argument("--max-ref-chars", type=int, default=4000)
     parser.add_argument("--max-answer-chars", type=int, default=4000)
+    parser.add_argument("--profile-memory", action="store_true", help="Record CUDA allocated/reserved/peak memory per mode and sample.")
+    parser.add_argument("--profile-memory-detail", action="store_true", help="Also record model block and HAWP internal memory markers for the first N samples.")
+    parser.add_argument("--profile-memory-detail-samples", type=int, default=1, help="Number of samples with detailed block/HAWP memory records.")
     parser.add_argument("--dry-run", action="store_true", help="Only load data and write prompt preview.")
     args = parser.parse_args()
 
@@ -541,7 +840,7 @@ def main() -> None:
     summary_rows: list[dict[str, Any]] = []
     all_predictions: list[dict[str, Any]] = []
     for mode in args.modes:
-        predictions, summary = run_mode(
+        predictions, summary, memory_profile = run_mode(
             cfg,
             mode,
             samples,
@@ -549,11 +848,17 @@ def main() -> None:
             max_question_chars=args.max_question_chars,
             max_ref_chars=args.max_ref_chars,
             max_answer_chars=args.max_answer_chars,
+            profile_memory=args.profile_memory,
+            profile_memory_detail=args.profile_memory_detail,
+            profile_memory_detail_samples=args.profile_memory_detail_samples,
         )
         mode_dir = output_dir / mode
         _write_jsonl(mode_dir / "predictions.jsonl", predictions)
         _write_csv(mode_dir / "predictions.csv", predictions)
         _write_json(mode_dir / "summary.json", summary)
+        if memory_profile is not None:
+            _write_json(mode_dir / "memory_profile.json", memory_profile)
+            _write_csv(mode_dir / "memory_samples.csv", memory_profile["samples"])
         summary_rows.append({"mode": mode, **summary})
         all_predictions.extend(predictions)
 
@@ -563,10 +868,19 @@ def main() -> None:
 
     print("\n[scoring] summary")
     for row in summary_rows:
+        mem_part = ""
+        if args.profile_memory:
+            mem_part = (
+                f" peak={row.get('peak_gpu_max')} "
+                f"peak-extra={row.get('peak_over_setup_max')} "
+                f"cache={row.get('cache_runtime_max')}"
+            )
         print(
             f"{row['mode']:>10} n={row['valid_n']}/{row['n']} "
-            f"MAE={row['mae']} within1={row['within_1']} within2={row['within_2']} "
+            f"MAE={row['mae']} normMAE={row['normalized_mae']} "
+            f"within1={row['within_1']} within2={row['within_2']} "
             f"within3={row['within_3']} parse_fail={row['parse_fail_n']} pearson={row['pearson']}"
+            f"{mem_part}"
         )
     print(f"[scoring] wrote {output_dir}")
 
