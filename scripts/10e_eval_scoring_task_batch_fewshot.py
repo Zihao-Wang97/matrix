@@ -22,7 +22,7 @@ import torch
 
 from hawp_laq.config import load_config
 from hawp_laq.runtime.generate import _resolve_device, load_baseline_model
-from hawp_laq.runtime.mode_runner import generate_by_mode, make_reset_fn, setup_mode
+from hawp_laq.runtime.mode_runner import make_reset_fn, setup_mode
 
 
 def _load_module(script_name: str, module_name: str):
@@ -180,9 +180,10 @@ def build_fewshot_batch_prompt(
         )
 
     target_blocks = []
-    for sample in target_samples:
+    for answer_id, sample in enumerate(target_samples, start=1):
         target_blocks.append(
-            f"### excel_row: {sample.row_index}\n"
+            f"### answer_id: {answer_id}\n"
+            f"excel_row: {sample.row_index}\n"
             f"{scoring._truncate(sample.student_answer, max_answer_chars)}"
         )
 
@@ -198,13 +199,14 @@ Rules:
 6. Do not compare target students with each other.
 7. Return only a valid JSON array. Do not output Markdown.
 8. Put the JSON array between <RESULT_JSON> and </RESULT_JSON>.
-9. The array must contain exactly {len(target_samples)} objects, one for each target excel_row.
-10. Each object must have: "excel_row", "score", and "reason". Keep each reason concise.
+9. The array must contain exactly {len(target_samples)} objects, one for each target answer_id from 1 to {len(target_samples)}.
+10. Each object must have: "answer_id", "score", and "reason". Keep each reason concise.
+11. Copy answer_id exactly from the target answer block. Do not skip, repeat, or renumber answer_id values.
 
 JSON format:
 <RESULT_JSON>
 [
-  {{"excel_row": "<excel_row>", "score": <number>, "reason": "<short reason>"}}
+  {{"answer_id": 1, "score": <number>, "reason": "<short reason>"}}
 ]
 </RESULT_JSON>
 
@@ -264,6 +266,9 @@ def run_mode(
     profile_memory: bool,
     profile_memory_detail: bool,
     profile_memory_detail_samples: int,
+    retry_missing: bool,
+    retry_missing_attempts: int,
+    retry_missing_batch_size: int,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any] | None]:
     print(f"\n[{mode}] loading model")
     recorder = scoring.MemoryRecorder(
@@ -285,6 +290,12 @@ def run_mode(
 
     rows: list[dict[str, Any]] = []
     memory_batches: list[dict[str, Any]] = []
+    retry_stats_total = {
+        "retry_missing_initial_n": 0,
+        "retry_attempted_n": 0,
+        "retry_recovered_n": 0,
+        "retry_failed_n": 0,
+    }
     sample_i_by_row = {int(sample.row_index): i for i, sample in enumerate(samples, start=1)}
     batches = batch_eval._chunks(samples, batch_size)
 
@@ -317,7 +328,45 @@ def run_mode(
             fewshot_rows=[int(sample.row_index) for sample in fewshot_examples],
             prompt_tokens=int(prompt_len),
         )
-        output = generate_by_mode(model, tokenizer, [prompt], cfg, mode, coordinator=coordinator, kv_manager=kv_manager)[0]
+        output = batch_eval.generate_by_mode_until_result(
+            model,
+            tokenizer,
+            [prompt],
+            cfg,
+            mode,
+            coordinator=coordinator,
+            kv_manager=kv_manager,
+        )[0]
+        parsed = batch_eval.parse_batch_response(output, target_batch)
+        initial_pred_by_row = {
+            int(sample.row_index): parsed[int(sample.row_index)]["pred_score"]
+            for sample in target_batch
+        }
+        parsed, retry_info_by_row, retry_stats = batch_eval.retry_missing_predictions(
+            model,
+            tokenizer,
+            cfg,
+            mode,
+            parsed,
+            target_batch,
+            attempts=retry_missing_attempts if retry_missing else 0,
+            retry_batch_size=retry_missing_batch_size,
+            reset_fn=reset_fn,
+            prompt_builder=lambda retry_batch: build_fewshot_batch_prompt(
+                retry_batch,
+                fewshot_examples,
+                max_question_chars=max_question_chars,
+                max_ref_chars=max_ref_chars,
+                max_answer_chars=max_answer_chars,
+                max_example_answer_chars=max_example_answer_chars,
+            ),
+            prompt_formatter=format_model_prompt,
+            log_prefix=f"[{mode}] batch {batch_i}/{len(batches)}",
+            coordinator=coordinator,
+            kv_manager=kv_manager,
+        )
+        for key, value in retry_stats.items():
+            retry_stats_total[key] += int(value)
         peak_gpu_bytes = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
         allocated_after = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
         reserved_after = torch.cuda.memory_reserved() if torch.cuda.is_available() else 0
@@ -352,9 +401,9 @@ def run_mode(
         recorder.record(f"{mode}.batch{batch_i}.generate.after", **memory_batch)
         recorder.current_sample_i = None
 
-        parsed = batch_eval.parse_batch_response(output, target_batch)
         for item_i, sample in enumerate(target_batch, start=1):
             info = parsed[int(sample.row_index)]
+            retry_info = retry_info_by_row[int(sample.row_index)]
             pred_score = info["pred_score"]
             row = {
                 "mode": mode,
@@ -370,11 +419,15 @@ def run_mode(
                 "question_type": sample.question_type,
                 "full_score": sample.full_score,
                 "human_score": sample.human_score,
+                "initial_pred_score": initial_pred_by_row[int(sample.row_index)],
                 "pred_score": pred_score,
                 "abs_error": None if pred_score is None else abs(pred_score - sample.human_score),
                 "parsed_json": info["parsed_json"],
                 "reason": info["reason"],
                 "raw_output": output,
+                "retry_attempts": retry_info["retry_attempts"],
+                "retry_success": retry_info["retry_success"],
+                "retry_raw_output": retry_info["retry_raw_output"],
                 "student_answer": sample.student_answer,
             }
             if profile_memory:
@@ -394,6 +447,7 @@ def run_mode(
             "n_batches": len(batches),
             "fewshot_n": len(fewshot_examples),
             "fewshot_rows": ",".join(str(int(s.row_index)) for s in fewshot_examples),
+            **retry_stats_total,
         }
     )
 
@@ -488,6 +542,10 @@ def main() -> None:
     parser.add_argument("--profile-memory", action="store_true")
     parser.add_argument("--profile-memory-detail", action="store_true")
     parser.add_argument("--profile-memory-detail-samples", type=int, default=1)
+    parser.add_argument("--no-retry-missing", dest="retry_missing", action="store_false", help="Disable retry for rows missing from the first batch response.")
+    parser.set_defaults(retry_missing=True)
+    parser.add_argument("--retry-missing-attempts", type=int, default=1, help="Retry rounds for rows without a parsed score.")
+    parser.add_argument("--retry-missing-batch-size", type=int, default=1, help="Answers per prompt when retrying missing rows.")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -501,6 +559,10 @@ def main() -> None:
         raise ValueError("--max-example-candidate-chars must be positive")
     if not (0.0 <= args.min_example_informative_ratio <= 1.0):
         raise ValueError("--min-example-informative-ratio must be between 0 and 1")
+    if args.retry_missing_attempts < 0:
+        raise ValueError("--retry-missing-attempts must be non-negative")
+    if args.retry_missing_batch_size <= 0:
+        raise ValueError("--retry-missing-batch-size must be positive")
 
     cfg = load_config(args.config)
     cfg.generation.max_new_tokens = int(args.max_new_tokens)
@@ -585,6 +647,9 @@ def main() -> None:
             "min_example_chars": args.min_example_chars,
             "max_example_candidate_chars": args.max_example_candidate_chars,
             "min_example_informative_ratio": args.min_example_informative_ratio,
+            "retry_missing": args.retry_missing,
+            "retry_missing_attempts": args.retry_missing_attempts,
+            "retry_missing_batch_size": args.retry_missing_batch_size,
         },
     )
     scoring._write_json(output_dir / "fewshot_band_report.json", fewshot_report)
@@ -622,6 +687,9 @@ def main() -> None:
             profile_memory=args.profile_memory,
             profile_memory_detail=args.profile_memory_detail,
             profile_memory_detail_samples=args.profile_memory_detail_samples,
+            retry_missing=args.retry_missing,
+            retry_missing_attempts=args.retry_missing_attempts,
+            retry_missing_batch_size=args.retry_missing_batch_size,
         )
         mode_dir = output_dir / mode
         scoring._write_jsonl(mode_dir / "predictions.jsonl", predictions)

@@ -31,8 +31,12 @@ from typing import Any
 import torch
 
 from hawp_laq.config import load_config
-from hawp_laq.runtime.generate import _resolve_device, load_baseline_model
+from hawp_laq.runtime.forward_utils import prefill_forward_last_logits
+from hawp_laq.runtime.generate import _has_real_past_key_values, _resolve_device, load_baseline_model
 from hawp_laq.runtime.mode_runner import generate_by_mode, make_reset_fn, setup_mode
+
+
+_STOP_TEXT = "</RESULT_JSON>"
 
 
 def _load_scoring_module():
@@ -78,7 +82,14 @@ def _score_from_obj(obj: dict[str, Any]) -> float:
 
 
 def _row_from_obj(obj: dict[str, Any]) -> int | None:
-    for key in ("excel_row", "row", "row_index", "id", "answer_id"):
+    for key in ("excel_row", "row", "row_index"):
+        if key in obj:
+            return _to_int(obj.get(key))
+    return None
+
+
+def _answer_id_from_obj(obj: dict[str, Any]) -> int | None:
+    for key in ("answer_id", "id"):
         if key in obj:
             return _to_int(obj.get(key))
     return None
@@ -153,7 +164,10 @@ def parse_batch_response(
     for idx, entry in enumerate(entries):
         if not isinstance(entry, dict):
             continue
-        row = _row_from_obj(entry)
+        answer_id = _answer_id_from_obj(entry)
+        row = expected_rows[answer_id - 1] if answer_id is not None and 1 <= answer_id <= len(expected_rows) else None
+        if row is None:
+            row = _row_from_obj(entry)
         if row is None and idx < len(expected_rows):
             row = expected_rows[idx]
         if row not in full_score_by_row:
@@ -171,7 +185,7 @@ def parse_batch_response(
     if not parsed:
         # Last-resort regex fallback for outputs that are almost JSON but broken.
         pattern = re.compile(
-            r"(?:excel_row|row|id|answer_id)\D*(?P<row>\d+).*?"
+            r"(?:excel_row|row|row_index)\D*(?P<row>\d+).*?"
             r"(?:score|pred_score|points|grade)\D*(?P<score>-?\d+(?:\.\d+)?)",
             flags=re.IGNORECASE | re.DOTALL,
         )
@@ -185,6 +199,23 @@ def parse_batch_response(
                 "reason": _clean_one_line(raw),
                 "parsed_json": False,
             }
+        if not parsed:
+            id_pattern = re.compile(
+                r"(?:answer_id|id)\D*(?P<answer_id>\d+).*?"
+                r"(?:score|pred_score|points|grade)\D*(?P<score>-?\d+(?:\.\d+)?)",
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            for match in id_pattern.finditer(raw):
+                answer_id = int(match.group("answer_id"))
+                if not (1 <= answer_id <= len(expected_rows)):
+                    continue
+                row = expected_rows[answer_id - 1]
+                score = float(match.group("score"))
+                parsed[row] = {
+                    "pred_score": min(max(score, 0.0), full_score_by_row[row]),
+                    "reason": _clean_one_line(raw),
+                    "parsed_json": False,
+                }
 
     for row in expected_rows:
         parsed.setdefault(
@@ -212,9 +243,10 @@ def build_batch_prompt(
     subject = first.subject or "unknown subject"
     role = f"{subject}{first.question_type} grading expert" if first.question_type else f"{subject} grading expert"
     answer_blocks = []
-    for sample in samples:
+    for answer_id, sample in enumerate(samples, start=1):
         answer_blocks.append(
-            f"### excel_row: {sample.row_index}\n"
+            f"### answer_id: {answer_id}\n"
+            f"excel_row: {sample.row_index}\n"
             f"{scoring._truncate(sample.student_answer, max_answer_chars)}"
         )
 
@@ -226,13 +258,14 @@ Rules:
 3. Do not compare students with each other; grade each answer independently.
 4. Return only a valid JSON array. Do not output Markdown.
 5. Put the JSON array between <RESULT_JSON> and </RESULT_JSON>.
-6. The array must contain exactly {len(samples)} objects, one for each input excel_row.
-7. Each object must have: "excel_row", "score", and "reason". Keep each reason concise.
+6. The array must contain exactly {len(samples)} objects, one for each input answer_id from 1 to {len(samples)}.
+7. Each object must have: "answer_id", "score", and "reason". Keep each reason concise.
+8. Copy answer_id exactly from the target answer block. Do not skip, repeat, or renumber answer_id values.
 
 JSON format:
 <RESULT_JSON>
 [
-  {{"excel_row": "<excel_row>", "score": <number>, "reason": "<short reason>"}}
+  {{"answer_id": 1, "score": <number>, "reason": "<short reason>"}}
 ]
 </RESULT_JSON>
 
@@ -266,6 +299,187 @@ def format_batch_model_prompt(tokenizer, prompt: str) -> str:
     return messages[0]["content"] + "\n\n" + messages[1]["content"]
 
 
+def _eos_token_ids(tokenizer) -> set[int]:
+    ids: set[int] = set()
+    for value in (
+        getattr(tokenizer, "eos_token_id", None),
+        getattr(tokenizer, "pad_token_id", None),
+    ):
+        if isinstance(value, int):
+            ids.add(value)
+        elif isinstance(value, (list, tuple)):
+            ids.update(int(item) for item in value if isinstance(item, int))
+    return ids
+
+
+def _should_stop_generated(tokenizer, generated_ids: torch.Tensor, eos_ids: set[int]) -> bool:
+    last_id = int(generated_ids[0, -1].item())
+    if last_id in eos_ids:
+        return True
+    generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+    return _STOP_TEXT in generated_text
+
+
+@torch.inference_mode()
+def generate_by_mode_until_result(
+    model,
+    tokenizer,
+    prompts: list[str],
+    cfg,
+    mode: str,
+    coordinator=None,
+    kv_manager=None,
+) -> list[str]:
+    """Generate scoring responses and stop once </RESULT_JSON> appears.
+
+    This is intentionally local to the scoring scripts. It mirrors the runtime
+    stepwise greedy loops, but returns only newly generated assistant text
+    rather than prompt + output.
+    """
+    if mode not in ("baseline", "hawp_only", "hawp_quant", "hawp_quant_all", "hawp_quant_sched", "quant_only"):
+        return generate_by_mode(model, tokenizer, prompts, cfg, mode, coordinator=coordinator, kv_manager=kv_manager)
+
+    max_new_tokens = int(cfg.generation.max_new_tokens)
+    eos_ids = _eos_token_ids(tokenizer)
+    use_external_past = mode in ("baseline", "hawp_only")
+    results: list[str] = []
+
+    for prompt in prompts:
+        input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(model.device)
+        bsz, prompt_len = input_ids.shape
+        prefill_mask = torch.ones(bsz, prompt_len, device=model.device, dtype=torch.long)
+        prefill_pos = torch.arange(prompt_len, device=model.device, dtype=torch.long).unsqueeze(0)
+
+        outputs = prefill_forward_last_logits(
+            model,
+            input_ids=input_ids,
+            attention_mask=prefill_mask,
+            position_ids=prefill_pos,
+            use_cache=True,
+        )
+        next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+        generated_ids = next_token
+
+        if coordinator is not None:
+            coordinator.on_prefill(prompt_len)
+
+        past_kv = outputs.past_key_values if use_external_past else None
+        cur_pos = prompt_len
+
+        if _should_stop_generated(tokenizer, generated_ids, eos_ids):
+            results.append(tokenizer.decode(generated_ids[0], skip_special_tokens=True))
+            continue
+
+        for _ in range(max_new_tokens - 1):
+            attention_mask = torch.ones(1, cur_pos + 1, device=model.device, dtype=torch.long)
+            position_ids = torch.tensor([[cur_pos]], device=model.device, dtype=torch.long)
+            fwd_kw: dict[str, Any] = {
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "use_cache": True,
+            }
+            if use_external_past and _has_real_past_key_values(past_kv):
+                fwd_kw["past_key_values"] = past_kv
+
+            outputs = model(input_ids=next_token, **fwd_kw)
+            past_kv = outputs.past_key_values if use_external_past else None
+            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+            generated_ids = torch.cat([generated_ids, next_token], dim=1)
+            cur_pos += 1
+
+            if coordinator is not None:
+                coordinator.on_new_token()
+
+            if _should_stop_generated(tokenizer, generated_ids, eos_ids):
+                break
+
+        results.append(tokenizer.decode(generated_ids[0], skip_special_tokens=True))
+
+    return results
+
+
+@torch.inference_mode()
+def retry_missing_predictions(
+    model,
+    tokenizer,
+    cfg,
+    mode: str,
+    parsed: dict[int, dict[str, Any]],
+    samples: list[Any],
+    *,
+    attempts: int,
+    retry_batch_size: int,
+    reset_fn,
+    prompt_builder,
+    prompt_formatter,
+    log_prefix: str,
+    coordinator=None,
+    kv_manager=None,
+) -> tuple[dict[int, dict[str, Any]], dict[int, dict[str, Any]], dict[str, int]]:
+    """Retry only rows that did not receive a parsed score."""
+    retry_info: dict[int, dict[str, Any]] = {
+        int(sample.row_index): {
+            "retry_attempts": 0,
+            "retry_success": False,
+            "retry_raw_output": "",
+        }
+        for sample in samples
+    }
+    missing = [sample for sample in samples if parsed[int(sample.row_index)]["pred_score"] is None]
+    stats = {
+        "retry_missing_initial_n": len(missing),
+        "retry_attempted_n": 0,
+        "retry_recovered_n": 0,
+        "retry_failed_n": len(missing),
+    }
+    if attempts <= 0 or retry_batch_size <= 0 or not missing:
+        return parsed, retry_info, stats
+
+    attempted_rows: set[int] = set()
+    recovered_rows: set[int] = set()
+    for attempt_i in range(1, attempts + 1):
+        if not missing:
+            break
+        next_missing: list[Any] = []
+        for retry_batch in _chunks(missing, retry_batch_size):
+            reset_fn()
+            prompt = prompt_formatter(tokenizer, prompt_builder(retry_batch))
+            output = generate_by_mode_until_result(
+                model,
+                tokenizer,
+                [prompt],
+                cfg,
+                mode,
+                coordinator=coordinator,
+                kv_manager=kv_manager,
+            )[0]
+            retry_parsed = parse_batch_response(output, retry_batch)
+            for sample in retry_batch:
+                row = int(sample.row_index)
+                attempted_rows.add(row)
+                info = retry_info[row]
+                info["retry_attempts"] = attempt_i
+                info["retry_raw_output"] = output
+                retry_score = retry_parsed[row]["pred_score"]
+                if retry_score is None:
+                    next_missing.append(sample)
+                    continue
+                parsed[row] = retry_parsed[row]
+                info["retry_success"] = True
+                recovered_rows.add(row)
+
+        print(
+            f"{log_prefix} retry {attempt_i}/{attempts} "
+            f"recovered={len(recovered_rows)}/{stats['retry_missing_initial_n']}"
+        )
+        missing = next_missing
+
+    stats["retry_attempted_n"] = len(attempted_rows)
+    stats["retry_recovered_n"] = len(recovered_rows)
+    stats["retry_failed_n"] = len(missing)
+    return parsed, retry_info, stats
+
+
 @torch.inference_mode()
 def run_mode(
     cfg,
@@ -280,6 +494,9 @@ def run_mode(
     profile_memory: bool,
     profile_memory_detail: bool,
     profile_memory_detail_samples: int,
+    retry_missing: bool,
+    retry_missing_attempts: int,
+    retry_missing_batch_size: int,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any] | None]:
     print(f"\n[{mode}] loading model")
     recorder = scoring.MemoryRecorder(
@@ -301,6 +518,12 @@ def run_mode(
 
     rows: list[dict[str, Any]] = []
     memory_samples: list[dict[str, Any]] = []
+    retry_stats_total = {
+        "retry_missing_initial_n": 0,
+        "retry_attempted_n": 0,
+        "retry_recovered_n": 0,
+        "retry_failed_n": 0,
+    }
     sample_i_by_row = {int(sample.row_index): i for i, sample in enumerate(samples, start=1)}
     batches = _chunks(samples, batch_size)
 
@@ -329,7 +552,32 @@ def run_mode(
             excel_rows=[int(sample.row_index) for sample in batch],
             prompt_tokens=int(prompt_len),
         )
-        output = generate_by_mode(model, tokenizer, [prompt], cfg, mode, coordinator=coordinator, kv_manager=kv_manager)[0]
+        output = generate_by_mode_until_result(model, tokenizer, [prompt], cfg, mode, coordinator=coordinator, kv_manager=kv_manager)[0]
+        parsed = parse_batch_response(output, batch)
+        initial_pred_by_row = {int(sample.row_index): parsed[int(sample.row_index)]["pred_score"] for sample in batch}
+        parsed, retry_info_by_row, retry_stats = retry_missing_predictions(
+            model,
+            tokenizer,
+            cfg,
+            mode,
+            parsed,
+            batch,
+            attempts=retry_missing_attempts if retry_missing else 0,
+            retry_batch_size=retry_missing_batch_size,
+            reset_fn=reset_fn,
+            coordinator=coordinator,
+            kv_manager=kv_manager,
+            prompt_builder=lambda retry_batch: build_batch_prompt(
+                retry_batch,
+                max_question_chars=max_question_chars,
+                max_ref_chars=max_ref_chars,
+                max_answer_chars=max_answer_chars,
+            ),
+            prompt_formatter=format_batch_model_prompt,
+            log_prefix=f"[{mode}] batch {batch_i}/{len(batches)}",
+        )
+        for key, value in retry_stats.items():
+            retry_stats_total[key] += int(value)
         peak_gpu_bytes = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
         allocated_after = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
         reserved_after = torch.cuda.memory_reserved() if torch.cuda.is_available() else 0
@@ -361,10 +609,10 @@ def run_mode(
         memory_samples.append(memory_sample)
         recorder.record(f"{mode}.batch{batch_i}.generate.after", **memory_sample)
         recorder.current_sample_i = None
-        parsed = parse_batch_response(output, batch)
 
         for item_i, sample in enumerate(batch, start=1):
             info = parsed[int(sample.row_index)]
+            retry_info = retry_info_by_row[int(sample.row_index)]
             pred_score = info["pred_score"]
             row = {
                 "mode": mode,
@@ -378,11 +626,15 @@ def run_mode(
                 "question_type": sample.question_type,
                 "full_score": sample.full_score,
                 "human_score": sample.human_score,
+                "initial_pred_score": initial_pred_by_row[int(sample.row_index)],
                 "pred_score": pred_score,
                 "abs_error": None if pred_score is None else abs(pred_score - sample.human_score),
                 "parsed_json": info["parsed_json"],
                 "reason": info["reason"],
                 "raw_output": output,
+                "retry_attempts": retry_info["retry_attempts"],
+                "retry_success": retry_info["retry_success"],
+                "retry_raw_output": retry_info["retry_raw_output"],
                 "student_answer": sample.student_answer,
             }
             if profile_memory:
@@ -393,7 +645,7 @@ def run_mode(
         print(f"[{mode}] batch {batch_i}/{len(batches)} rows={ [s.row_index for s in batch] } parsed={valid_n}/{len(batch)}")
 
     summary = scoring.summarize_predictions(rows)
-    summary.update({"answers_per_prompt": batch_size, "n_batches": len(batches)})
+    summary.update({"answers_per_prompt": batch_size, "n_batches": len(batches), **retry_stats_total})
     memory_profile = None
     if profile_memory:
         peak_values = [int(item["peak_gpu_bytes"]) for item in memory_samples]
@@ -455,11 +707,19 @@ def main() -> None:
     parser.add_argument("--profile-memory", action="store_true", help="Record CUDA allocated/reserved/peak memory per mode and batch.")
     parser.add_argument("--profile-memory-detail", action="store_true", help="Also record model block and HAWP internal memory markers for the first N batches.")
     parser.add_argument("--profile-memory-detail-samples", type=int, default=1, help="Number of batches with detailed block/HAWP memory records.")
+    parser.add_argument("--no-retry-missing", dest="retry_missing", action="store_false", help="Disable retry for rows missing from the first batch response.")
+    parser.set_defaults(retry_missing=True)
+    parser.add_argument("--retry-missing-attempts", type=int, default=1, help="Retry rounds for rows without a parsed score.")
+    parser.add_argument("--retry-missing-batch-size", type=int, default=1, help="Answers per prompt when retrying missing rows.")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be positive")
+    if args.retry_missing_attempts < 0:
+        raise ValueError("--retry-missing-attempts must be non-negative")
+    if args.retry_missing_batch_size <= 0:
+        raise ValueError("--retry-missing-batch-size must be positive")
 
     cfg = load_config(args.config)
     cfg.generation.max_new_tokens = int(args.max_new_tokens)
@@ -507,6 +767,9 @@ def main() -> None:
             "sample_size": args.sample_size,
             "seed": args.seed,
             "batch_size": args.batch_size,
+            "retry_missing": args.retry_missing,
+            "retry_missing_attempts": args.retry_missing_attempts,
+            "retry_missing_batch_size": args.retry_missing_batch_size,
         },
     )
     preview_prompt = build_batch_prompt(
@@ -536,6 +799,9 @@ def main() -> None:
             profile_memory=args.profile_memory,
             profile_memory_detail=args.profile_memory_detail,
             profile_memory_detail_samples=args.profile_memory_detail_samples,
+            retry_missing=args.retry_missing,
+            retry_missing_attempts=args.retry_missing_attempts,
+            retry_missing_batch_size=args.retry_missing_batch_size,
         )
         mode_dir = output_dir / mode
         scoring._write_jsonl(mode_dir / "predictions.jsonl", predictions)
